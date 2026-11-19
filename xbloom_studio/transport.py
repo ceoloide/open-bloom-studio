@@ -113,7 +113,8 @@ class CommandHooks(Protocol):
     command guard and the first byte; raising prevents the write, except for
     stop commands, which wait at most ``STOP_HOOK_TIMEOUT`` and then proceed
     without waiting for the cancelled hook to finish. Exactly one of
-    ``write_completed`` and ``write_failed`` follows a write attempt. Neither
+    ``write_completed`` and ``write_failed`` follows a write attempt, including
+    when ``before_write`` raises before any bytes are written. Neither
     may block; their exceptions, an explicit ``CancelledError`` included, are
     suppressed so an observer can never turn a sent frame into a failure or
     hide the original write error.
@@ -354,12 +355,12 @@ class BleakTransport:
 
     async def _send(self, frame: bytes, packet: Packet) -> None:
         hooks = self.hooks
-        if hooks is not None:
-            if packet.command in STOP_COMMANDS:
-                await self._journal_stop(hooks, packet, frame)
-            else:
-                await hooks.before_write(packet, frame)
         try:
+            if hooks is not None:
+                if packet.command in STOP_COMMANDS:
+                    await self._journal_stop(hooks, packet, frame)
+                else:
+                    await hooks.before_write(packet, frame)
             size = self._write_size
             for offset in range(0, len(frame), size):
                 chunk = frame[offset : offset + size]

@@ -1,0 +1,265 @@
+{
+  "version": 1,
+  "provenance": {
+    "kind": "project-authored",
+    "license": "MIT",
+    "derived_from": null,
+    "notes": "Original starting point written for this project; not taken from any app, service or recipe collection."
+  },
+  "snapshot_date": null,
+  "scope": "Original project-authored starter profiles, one per family, for a nominal two-steep ~240 ml serving.",
+  "limitations": [
+    "Nominal output is steep count ×120 ml, never physical yield.",
+    "Starter profiles are generic starting points, not validated taste recommendations.",
+    "No published source records are bundled; supply your own collection with the path argument.",
+    "Ranges summarize the loaded profiles only; they are not adjustable bounds."
+  ],
+  "records": [],
+  "profiles": [
+    {
+      "id": "green-starter",
+      "family": "green",
+      "style": "starter",
+      "serving_style": "hot draft",
+      "adaptations": [
+        "Project-authored starting point for a nominal 240 ml serving; adjust to taste. Not taste or yield validated."
+      ],
+      "document": {
+        "name": "Green – starter",
+        "mode": "tea",
+        "source": {
+          "provider": "open-bloom-studio",
+          "profile_id": "green-starter"
+        },
+        "tea": {
+          "dose_g": 3,
+          "steeps": [
+            {
+              "volume_ml": 90,
+              "temperature": 80,
+              "steep_seconds": 45,
+              "pattern": "spiral"
+            },
+            {
+              "volume_ml": 90,
+              "temperature": 80,
+              "steep_seconds": 60,
+              "pattern": "center"
+            }
+          ],
+          "siphon_trigger": "auto"
+        }
+      }
+    },
+    {
+      "id": "black-starter",
+      "family": "black",
+      "style": "starter",
+      "serving_style": "hot draft",
+      "adaptations": [
+        "Project-authored starting point for a nominal 240 ml serving; adjust to taste. Not taste or yield validated."
+      ],
+      "document": {
+        "name": "Black – starter",
+        "mode": "tea",
+        "source": {
+          "provider": "open-bloom-studio",
+          "profile_id": "black-starter"
+        },
+        "tea": {
+          "dose_g": 3,
+          "steeps": [
+            {
+              "volume_ml": 90,
+              "temperature": 95,
+              "steep_seconds": 150,
+              "pattern": "ring"
+            },
+            {
+              "volume_ml": 90,
+              "temperature": 95,
+              "steep_seconds": 120,
+              "pattern": "center"
+            }
+          ],
+          "siphon_trigger": "auto"
+        }
+      }
+    },
+    {
+      "id": "oolong-starter",
+      "family": "oolong",
+      "style": "starter",
+      "serving_style": "hot draft",
+      "adaptations": [
+        "Project-authored starting point for a nominal 240 ml serving; adjust to taste. Not taste or yield validated."
+      ],
+      "document": {
+        "name": "Oolong – starter",
+        "mode": "tea",
+        "source": {
+          "provider": "open-bloom-studio",
+          "profile_id": "oolong-starter"
+        },
+        "tea": {
+          "dose_g": 4,
+          "steeps": [
+            {
+              "volume_ml": 90,
+              "temperature": 93,
+              "steep_seconds": 60,
+              "pattern": "spiral"
+            },
+            {
+              "volume_ml": 90,
+              "temperature": "BP",
+              "steep_seconds": 75,
+              "pattern": "center"
+            }
+          ],
+          "siphon_trigger": "auto"
+        }
+      }
+    },
+    {
+      "id": "white-starter",
+      "family": "white",
+      "style": "starter",
+      "serving_style": "hot draft",
+      "adaptations": [
+        "Project-authored starting point for a nominal 240 ml serving; adjust to taste. Not taste or yield validated."
+      ],
+      "document": {
+        "name": "White – starter",
+        "mode": "tea",
+        "source": {
+          "provider": "open-bloom-studio",
+          "profile_id": "white-starter"
+        },
+        "tea": {
+          "dose_g": 4,
+          "steeps": [
+            {
+              "volume_ml": 90,
+              "temperature": 85,
+              "steep_seconds": 120,
+              "pattern": "ring"
+            },
+            {
+              "volume_ml": 90,
+              "temperature": 85,
+              "steep_seconds": 150,
+              "pattern": "center"
+            }
+          ],
+          "siphon_trigger": "auto"
+        }
+      }
+    },
+    {
+      "id": "pu-erh-starter",
+      "family": "pu-erh",
+      "style": "starter",
+      "serving_style": "hot draft",
+      "adaptations": [
+        "Project-authored starting point for a nominal 240 ml serving; adjust to taste. Not taste or yield validated."
+      ],
+      "document": {
+        "name": "Pu-erh – starter",
+        "mode": "tea",
+        "source": {
+          "provider": "open-bloom-studio",
+          "profile_id": "pu-erh-starter"
+        },
+        "tea": {
+          "dose_g": 4,
+          "steeps": [
+            {
+              "volume_ml": 90,
+              "temperature": "BP",
+              "steep_seconds": 30,
+              "pattern": "center"
+            },
+            {
+              "volume_ml": 90,
+              "temperature": "BP",
+              "steep_seconds": 45,
+              "pattern": "center"
+            }
+          ],
+          "siphon_trigger": "auto"
+        }
+      }
+    },
+    {
+      "id": "herbal-starter",
+      "family": "herbal",
+      "style": "starter",
+      "serving_style": "hot draft",
+      "adaptations": [
+        "Project-authored starting point for a nominal 240 ml serving; adjust to taste. Not taste or yield validated."
+      ],
+      "document": {
+        "name": "Herbal – starter",
+        "mode": "tea",
+        "source": {
+          "provider": "open-bloom-studio",
+          "profile_id": "herbal-starter"
+        },
+        "tea": {
+          "dose_g": 3,
+          "steeps": [
+            {
+              "volume_ml": 90,
+              "temperature": "BP",
+              "steep_seconds": 240,
+              "pattern": "ring"
+            },
+            {
+              "volume_ml": 90,
+              "temperature": "BP",
+              "steep_seconds": 180,
+              "pattern": "center"
+            }
+          ],
+          "siphon_trigger": "auto"
+        }
+      }
+    },
+    {
+      "id": "cascara-starter",
+      "family": "cascara",
+      "style": "starter",
+      "serving_style": "hot draft",
+      "adaptations": [
+        "Project-authored starting point for a nominal 240 ml serving; adjust to taste. Not taste or yield validated."
+      ],
+      "document": {
+        "name": "Cascara – starter",
+        "mode": "tea",
+        "source": {
+          "provider": "open-bloom-studio",
+          "profile_id": "cascara-starter"
+        },
+        "tea": {
+          "dose_g": 4,
+          "steeps": [
+            {
+              "volume_ml": 90,
+              "temperature": 93,
+              "steep_seconds": 180,
+              "pattern": "ring"
+            },
+            {
+              "volume_ml": 90,
+              "temperature": 93,
+              "steep_seconds": 150,
+              "pattern": "center"
+            }
+          ],
+          "siphon_trigger": "auto"
+        }
+      }
+    }
+  ]
+}

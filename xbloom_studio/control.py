@@ -19,6 +19,7 @@ from types import TracebackType
 from typing import Any
 
 from .client import ProtocolCommandError, ReadOnlyClient, SessionError
+from .command_schema import MAX_OPERATION_TIMEOUT, water_timeout
 from .connector import Connector
 from .events import decode_event, protocol_error
 from .machine_controls import (
@@ -714,7 +715,7 @@ class Interaction(MachineControls, ReadOnlyClient):
     async def wait_for_state(
         self, after_revision: int, *, timeout: float = 5.0
     ) -> dict[str, Any]:
-        _number("timeout", timeout, 0.001, 3600)
+        _number("timeout", timeout, 0.001, MAX_OPERATION_TIMEOUT)
         await self.wait_for_update(after_revision, timeout)
         return self.get_state()
 
@@ -1056,7 +1057,7 @@ class Interaction(MachineControls, ReadOnlyClient):
         if pattern not in PATTERNS:
             raise ValueError("pattern must be center, ring or spiral")
         pattern_code = PATTERNS[pattern]
-        limit = volume_ml / flow_ml_s + 45 if timeout is None else timeout
+        limit = water_timeout(volume_ml, flow_ml_s) if timeout is None else timeout
         async with self._lifecycle:
             self._require_idle()
             source = self._water_source()

@@ -5,12 +5,15 @@ Usage: python -m scripts.check_dist DIST_DIR
 DIST_DIR must hold exactly one sdist and one wheel of this project. The
 distributed package files must match the tracked files under PACKAGE exactly,
 so additions to the package extend the check without editing this script.
+After an isolated install, every package data file is read back through
+importlib.resources and compared with its source.
 """
 
 from __future__ import annotations
 
 import email.message
 import email.parser
+import hashlib
 import importlib.metadata
 import json
 import site
@@ -74,14 +77,27 @@ def egg_info_files(expected: Mapping[str, list[str]]) -> tuple[str, ...]:
 
 
 PROBE = """
-import importlib.metadata, json, sys
+import hashlib, importlib.metadata, importlib.resources, json, sys
 import {package}
 dist = importlib.metadata.distribution({project!r})
+
+def resources(node, prefix):
+    for child in node.iterdir():
+        name = prefix + child.name
+        if child.is_dir():
+            if child.name != "__pycache__":
+                yield from resources(child, name + "/")
+        elif not child.name.endswith((".py", ".pyc")):
+            yield name, hashlib.sha256(child.read_bytes()).hexdigest()
+
 print(json.dumps({{
     "module": {package}.__file__,
     "prefix": sys.prefix,
     "version": dist.version,
     "files": sorted(str(f) for f in dist.files or ()),
+    "resources": dict(resources(
+        importlib.resources.files({package!r}), {package!r} + "/"
+    )),
 }}))
 """
 
@@ -282,6 +298,25 @@ def check_install(
         problems.append(f"installed version is {result['version']}")
     installed = {name for name in result["files"] if name.startswith(f"{PACKAGE}/")}
     problems += compare_names("installed", installed, set(package_files))
+    problems += check_resources(result["resources"], package_files)
+    return problems
+
+
+def check_resources(
+    loaded: Mapping[str, str], package_files: Mapping[str, bytes]
+) -> list[str]:
+    """Package data read back through importlib.resources must match the source."""
+    expected = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in package_files.items()
+        if not name.endswith(".py")
+    }
+    problems = compare_names("installed resource", set(loaded), set(expected))
+    problems += [
+        f"installed resource differs from source: {name}"
+        for name in sorted(loaded.keys() & expected.keys())
+        if loaded[name] != expected[name]
+    ]
     return problems
 
 
