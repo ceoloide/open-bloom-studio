@@ -194,6 +194,66 @@ class FailureTest(JournalTestCase):
         with self.assertRaisesRegex(RuntimeError, "disk full"):
             await self.recorder.flush()
 
+    async def test_cancelled_flush_records_the_write_outcome(self):
+        started, release = threading.Event(), threading.Event()
+        original = self.store.append
+
+        def blocked(kind, data, **context):
+            if kind == "command.intent":
+                started.set()
+                release.wait(5)
+            return original(kind, data, **context)
+
+        with mock.patch.object(self.store, "append", side_effect=blocked):
+            write = asyncio.create_task(self.transport._write_frame(frame(4506)))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                write.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await write
+            finally:
+                release.set()
+            await self.recorder.flush()
+        self.assertEqual(self.machine.codes(), [])
+        self.assertEqual(self.kinds(4506), ["command.intent", "command.write_failed"])
+
+    async def test_cancelled_gap_flush_does_not_duplicate_the_gap(self):
+        self.recorder.slots = threading.BoundedSemaphore(1)
+        started, release, gap_started = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        original = self.store.append
+
+        def blocked(kind, data, **context):
+            if kind == "hold":
+                started.set()
+                release.wait(5)
+            if kind == "capture.gap":
+                gap_started.set()
+                release.wait(5)
+            return original(kind, data, **context)
+
+        with mock.patch.object(self.store, "append", side_effect=blocked):
+            try:
+                self.recorder.emit("hold", {})
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                self.recorder.emit("overflow", {})
+                release.set()
+                await asyncio.wrap_future(self.recorder.last)
+                release.clear()
+                flush = asyncio.create_task(self.recorder.flush())
+                self.assertTrue(await asyncio.to_thread(gap_started.wait, 1))
+                flush.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await flush
+            finally:
+                release.set()
+            with self.assertRaisesRegex(RuntimeError, "queue full"):
+                await self.recorder.flush()
+        self.assertEqual(self.kinds().count("capture.gap"), 1)
+
     async def test_stalled_writer_and_full_queue_do_not_block_stop(self):
         self.recorder.slots = threading.BoundedSemaphore(2)
         started, release = threading.Event(), threading.Event()

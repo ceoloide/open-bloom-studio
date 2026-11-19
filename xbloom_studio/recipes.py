@@ -178,7 +178,7 @@ def validate_retained_plan(plan: dict[str, Any]) -> None:
         tea_encoder_version=version if mode == "tea" else TEA_ENCODER_VERSION,
     )
     for key, value in expected.items():
-        if plan.get(key) == value:
+        if key in plan and dumps(plan[key]) == dumps(value):
             continue
         if key == "limitations" and _recognized_limitations(plan, mode, version):
             continue

@@ -354,12 +354,12 @@ class BleakTransport:
 
     async def _send(self, frame: bytes, packet: Packet) -> None:
         hooks = self.hooks
-        if hooks is not None:
-            if packet.command in STOP_COMMANDS:
-                await self._journal_stop(hooks, packet, frame)
-            else:
-                await hooks.before_write(packet, frame)
         try:
+            if hooks is not None:
+                if packet.command in STOP_COMMANDS:
+                    await self._journal_stop(hooks, packet, frame)
+                else:
+                    await hooks.before_write(packet, frame)
             size = self._write_size
             for offset in range(0, len(frame), size):
                 chunk = frame[offset : offset + size]

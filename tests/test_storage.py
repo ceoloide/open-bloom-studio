@@ -217,7 +217,12 @@ class OperationStoreTest(StoreTestCase):
         for kwargs in ({"limit": 0}, {"after": -1}, {"limit": True}):
             with self.assertRaises(ValueError):
                 store.events(**kwargs)
-        for sql in ("UPDATE events SET kind='x'", "DELETE FROM events"):
+        for sql in (
+            "UPDATE events SET kind='x'",
+            "DELETE FROM events",
+            "INSERT OR REPLACE INTO events(event_id, kind, at, monotonic_ns, data) "
+            "SELECT event_id, kind, at, monotonic_ns, data FROM events LIMIT 1",
+        ):
             with self.assertRaises(sqlite3.IntegrityError):
                 store.db.execute(sql)
             store.db.rollback()

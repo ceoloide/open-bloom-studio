@@ -115,7 +115,10 @@ def read_export(
             return result
         if isinstance(value, list):
             return [clean(item) for item in value]
-        if isinstance(value, str) and value.startswith(("https://", "http://")):
+        if isinstance(value, str) and value.partition(":")[0].strip().lower() in (
+            "http",
+            "https",
+        ):
             try:
                 parsed = urlsplit(value)
                 sensitive = (

@@ -7,6 +7,8 @@ from copy import deepcopy
 from decimal import Decimal
 from typing import Any
 
+from .command_schema import MAX_OPERATION_TIMEOUT, water_timeout
+
 Rule = dict[str, Any]
 
 
@@ -48,7 +50,7 @@ HOST_STEPS: dict[str, dict[str, Rule]] = {
         "temperature_c": numeric(20, 99, required=True),
         "flow_ml_s": numeric(0.1, 10, default=3),
         "pattern": choice(*PATTERNS, default="center"),
-        "timeout": numeric(0.1, 3600),
+        "timeout": numeric(0.1, MAX_OPERATION_TIMEOUT),
     },
     "grind": {
         "size": numeric(1, 80, whole=True, required=True),
@@ -599,6 +601,25 @@ def _check_host(steps: Any, field: Any, obj: Any, issue: Any) -> None:
                 field(kind, choice(*HOST_STEPS), path + "/kind")
         else:
             obj(step, {"kind": choice(*HOST_STEPS, required=True), **rules}, path)
+            if kind == "water" and "timeout" not in step:
+                volume = step.get("volume_ml")
+                flow = step.get("flow_ml_s", rules["flow_ml_s"]["default"])
+                if (
+                    isinstance(volume, (int, float))
+                    and not isinstance(volume, bool)
+                    and isinstance(flow, (int, float))
+                    and not isinstance(flow, bool)
+                    and 1 <= volume <= 1000
+                    and 0.1 <= flow <= 10
+                    and water_timeout(volume, flow) > MAX_OPERATION_TIMEOUT
+                ):
+                    issue(
+                        path + "/timeout",
+                        "required_timeout",
+                        "Specify a timeout when the default exceeds the limit",
+                        rules["timeout"],
+                        missing=True,
+                    )
 
 
 def _check_native(native: Any, obj: Any, issue: Any) -> None:

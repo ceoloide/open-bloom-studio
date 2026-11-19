@@ -25,6 +25,7 @@ from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
+from functools import partial
 from typing import Any, Protocol
 
 from .protocol import Packet
@@ -90,6 +91,7 @@ class Recorder:
             max_workers=1, thread_name_prefix="bloom-journal"
         )
         self.last: Future[Any] | None = None
+        self._gap: Future[Any] | None = None
 
     def _fail(self, exc: BaseException) -> None:
         self.error = exc
@@ -155,18 +157,22 @@ class Recorder:
             except BaseException as exc:
                 self._fail(exc)
 
+    def _gap_finished(self, lost: int, future: Future[Any]) -> None:
+        with self.lock:
+            if future.exception() is None:
+                self.reported_lost = lost
+
     async def flush(self) -> None:
         """Wait until every queued event is committed; raise if any was not.
 
         Cancelling a flush never cancels queued appends.
         """
-        lost = 0
         try:
             if self.last is not None:
                 await asyncio.shield(asyncio.wrap_future(self.last))
             with self.lock:
-                future = None
-                if self.lost > self.reported_lost:
+                future = self._gap
+                if (future is None or future.done()) and self.lost > self.reported_lost:
                     self.sequence += 1
                     lost = self.lost
                     future = self.executor.submit(
@@ -178,10 +184,10 @@ class Recorder:
                         operation_id=self.operation_id,
                         device=self.device,
                     )
-                    self.last = future
+                    self.last = self._gap = future
+                    future.add_done_callback(partial(self._gap_finished, lost))
             if future is not None:
                 await asyncio.shield(asyncio.wrap_future(future))
-                self.reported_lost = lost
         except Exception as exc:
             self._fail(exc)
         if self.error is not None:

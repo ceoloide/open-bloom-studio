@@ -12,6 +12,11 @@ from copy import deepcopy
 from typing import Any
 
 Schema = dict[str, Any]
+MAX_OPERATION_TIMEOUT = 3600
+
+
+def water_timeout(volume_ml: float, flow_ml_s: float) -> float:
+    return volume_ml / flow_ml_s + 45
 
 
 def number(

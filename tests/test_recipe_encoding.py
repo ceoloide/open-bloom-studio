@@ -332,6 +332,28 @@ class PlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "version"):
             validate_retained_plan(missing)
 
+    def test_retained_execution_rejects_signed_zero_and_boolean_changes(self):
+        plan = compile_recipe(
+            {
+                "name": "Native",
+                "mode": "native",
+                "native": {
+                    "payload_hex": "ab",
+                    "dose_g": 1,
+                    "cup_limits": [0.0, 2.0],
+                },
+            }
+        )
+        validate_retained_plan(plan)
+        for patch in ({"cup_limits": [-0.0, 2.0]}, {"dose_g": True}):
+            changed = deepcopy(plan)
+            changed["execution"][0].update(patch)
+            with (
+                self.subTest(patch=patch),
+                self.assertRaisesRegex(ValueError, "modified"),
+            ):
+                validate_retained_plan(changed)
+
     def test_earlier_advisory_text_is_recognized_by_digest_only(self):
         """Synthetic stand-in for advisory text written by earlier versions."""
         plan = compile_recipe(tea())

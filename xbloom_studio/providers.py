@@ -251,7 +251,7 @@ class HubProviders:
                 raise ProviderError("Collective recipe rejected")
             source = {
                 "provider": "collective",
-                "url": url,
+                "url": f"https://collective.xbloom.com/recipe/{match[1]}?type={kind}",
                 "provider_id": match[1],
                 "raw": raw.get("data"),
             }
@@ -282,7 +282,7 @@ class HubProviders:
                 )
             source = {
                 "provider": "xrecipe",
-                "url": url,
+                "url": f"https://{parsed.hostname}/recipe/{ident}",
                 "provider_id": ident,
                 "raw_document": raw,
             }
@@ -475,8 +475,9 @@ class RecipeImports:
             document = self._convert(source, flow_ml_s, target)
         except (ValueError, KeyError, TypeError) as exc:
             return self.store.save_import(source, error=str(exc))
-        imported = self.store.save_import(source, document=document)
-        return {**imported, "recipe": self.store.create_recipe(document, temporary)}
+        return self.store.save_import(
+            source, document=document, recipe_temporary=temporary
+        )
 
     def refresh_recipe(
         self, reference: str, flow_ml_s: float | None = None, target: str | None = None

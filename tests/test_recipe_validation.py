@@ -70,6 +70,20 @@ class HostRecipeTest(unittest.TestCase):
                 self.assertIsNone(check_recipe(document)["normalized"])
         self.assertEqual(paths([]), {""})
 
+    def test_slow_water_step_requires_an_explicit_timeout(self):
+        step = {
+            "kind": "water",
+            "volume_ml": 500,
+            "temperature_c": 90,
+            "flow_ml_s": 0.1,
+        }
+        report = check_recipe({"name": "Slow", "steps": [step]})
+        self.assertEqual(
+            [(e["path"], e["code"]) for e in report["errors"]],
+            [("/steps/0/timeout", "required_timeout")],
+        )
+        self.assertEqual(validate_step({**step, "timeout": 3600})["timeout"], 3600)
+
     def test_json_metadata_must_serialize(self):
         cyclic = []
         cyclic.append(cyclic)

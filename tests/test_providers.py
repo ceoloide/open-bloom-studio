@@ -23,7 +23,7 @@ from xbloom_studio.providers import (
     ProviderError,
     RecipeImports,
 )
-from xbloom_studio.storage import Store
+from xbloom_studio.storage import ConflictError, Store
 
 HOST_RAW = {
     "recipeName": "Synthetic public recipe",
@@ -430,7 +430,7 @@ class ExportTest(unittest.TestCase):
             "stringValue": "https://example.com/i?token=never-retain-secret"
         }
         fields["login"] = {
-            "stringValue": "https://user:pw@example.com/never-retain-secret"
+            "stringValue": "HTTPS://user:pw@example.com/never-retain-secret"
         }
         fields["plain"] = {"stringValue": "https://example.com/plain"}
         fields["broken"] = {"stringValue": "http://[::1"}
@@ -526,6 +526,37 @@ class ImportServiceTest(unittest.TestCase):
         self.assertEqual(refused["blocked_import"]["source"]["raw"]["new"], 1)
         native = self.imports.import_recipe(url, target="coffee")
         self.assertIn("share links", native["error"])
+
+    def test_name_conflict_rolls_back_source_and_event(self):
+        local = self.store.create_recipe({"name": "Local", "steps": [{"kind": "tare"}]})
+        self.store.alias(local["id"], HOST_RAW["recipeName"])
+        events = self.store.events()
+        with self.assertRaises(ConflictError):
+            self.imports.import_recipe(
+                "https://collective.xbloom.com/recipe/12", flow_ml_s=3
+            )
+        self.assertEqual(self.store.events(), events)
+        self.assertEqual(
+            self.store.db.execute("SELECT count(*) FROM imports").fetchone()[0], 0
+        )
+
+    def test_provenance_keeps_only_lookup_fields(self):
+        imported = self.imports.import_recipe(
+            "https://collective.xbloom.com:443/recipe/12/?type=2&access_token=synthetic"
+            "#private-fragment",
+            flow_ml_s=3,
+        )
+        url = "https://collective.xbloom.com/recipe/12?type=2"
+        self.assertEqual(imported["source"]["url"], url)
+        self.assertEqual(imported["recipe"]["document"]["source"]["url"], url)
+        self.assertEqual(self.store.events()[-1]["data"]["source_url"], url)
+        writer = HubProviders(Stub({"firestore": xrecipe_document()}))
+        self.assertEqual(
+            writer.read("https://xbloom-app.vercel.app/recipe/synthetic-1/#private")[
+                "url"
+            ],
+            "https://xbloom-app.vercel.app/recipe/synthetic-1",
+        )
 
     def test_offline_export_import_and_refresh_without_upstream(self):
         imported = self.imports.import_export(xrecipe_document(), target="coffee")

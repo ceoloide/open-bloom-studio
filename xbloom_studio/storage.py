@@ -66,6 +66,7 @@ class Store(Pagination):
         self.db.row_factory = sqlite3.Row
         try:
             self.db.execute("PRAGMA foreign_keys=ON")
+            self.db.execute("PRAGMA recursive_triggers=ON")
             migrate(self.db)
             deadline = time.monotonic() + WAL_BUSY_SECONDS
             while True:
@@ -134,19 +135,24 @@ class Store(Pagination):
         self, document: dict[str, Any], temporary: bool = False
     ) -> dict[str, Any]:
         document = validate_recipe(document)
-        ident = uuid.uuid4().hex
         with self.transaction() as db:
-            self._check_recipe_name(db, document["name"], ident)
-            db.execute(
-                "INSERT INTO recipes(id,name,head,temporary) VALUES(?,?,1,?)",
-                (ident, document["name"], int(temporary)),
-            )
-            db.execute(
-                "INSERT INTO revisions(recipe_id,revision,created_at,document,sha256) "
-                "VALUES(?,1,?,?,?)",
-                (ident, now(), dumps(document), digest(document)),
-            )
-            return self.get_recipe(ident)
+            return self._insert_recipe(db, document, temporary)
+
+    def _insert_recipe(
+        self, db: sqlite3.Connection, document: dict[str, Any], temporary: bool
+    ) -> dict[str, Any]:
+        ident = uuid.uuid4().hex
+        self._check_recipe_name(db, document["name"], ident)
+        db.execute(
+            "INSERT INTO recipes(id,name,head,temporary) VALUES(?,?,1,?)",
+            (ident, document["name"], int(temporary)),
+        )
+        db.execute(
+            "INSERT INTO revisions(recipe_id,revision,created_at,document,sha256) "
+            "VALUES(?,1,?,?,?)",
+            (ident, now(), dumps(document), digest(document)),
+        )
+        return self.get_recipe(ident)
 
     def get_recipe(self, reference: str, revision: int | None = None) -> dict[str, Any]:
         """Resolve an ID, then a live alias, then a unique case-insensitive name."""
@@ -508,8 +514,14 @@ class Store(Pagination):
         source: dict[str, Any],
         document: dict[str, Any] | None = None,
         error: str | None = None,
+        *,
+        recipe_temporary: bool | None = None,
     ) -> dict[str, Any]:
-        """Retain an import's source, with its document or why it was blocked."""
+        """Retain the source and optionally create a recipe in the same transaction."""
+        if recipe_temporary is not None:
+            if document is None or error is not None:
+                raise ValueError("Recipe creation requires a successful import")
+            document = validate_recipe(document)
         ident = uuid.uuid4().hex
         with self.transaction() as db:
             db.execute(
@@ -532,7 +544,10 @@ class Store(Pagination):
                     "normalization_error": error,
                 },
             )
-        return self.get_import(ident)
+            imported = self.get_import(ident)
+            if recipe_temporary is not None and document is not None:
+                imported["recipe"] = self._insert_recipe(db, document, recipe_temporary)
+            return imported
 
     def get_import(self, ident: str) -> dict[str, Any]:
         with self.lock:
