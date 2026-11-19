@@ -7,6 +7,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -162,7 +163,9 @@ class ArtifactTest(unittest.TestCase):
     def test_metadata_must_match_source(self):
         changed = METADATA.replace("License-Expression: MIT", "License-Expression: X")
         problems = self.check(sdist=sdist_files(**{"PKG-INFO": changed.encode()}))
-        self.assertEqual(problems, ["sdist metadata License-Expression is ['X']"])
+        self.assertEqual(
+            problems, ["sdist metadata differs from source: License-Expression"]
+        )
         missing = wheel_files(**{f"{STEM}.dist-info/METADATA": None})
         self.assertEqual(
             self.check(wheel=missing),
@@ -180,6 +183,21 @@ class ArtifactTest(unittest.TestCase):
             with self.subTest(**kwargs):
                 with self.assertRaisesRegex(check_dist.DistError, "unexpected sdist"):
                     check_dist.read_sdist(path, STEM)
+
+    def test_duplicate_archive_members_are_rejected(self):
+        wheel = write_wheel(self.dir, wheel_files())
+        with warnings.catch_warnings(), zipfile.ZipFile(wheel, "a") as archive:
+            warnings.simplefilter("ignore", UserWarning)
+            archive.writestr("xbloom_studio/py.typed", b"other")
+        with self.assertRaisesRegex(check_dist.DistError, "duplicate wheel member"):
+            check_dist.read_wheel(wheel)
+
+        sdist = self.dir / "duplicate.tar.gz"
+        with tarfile.open(sdist, "w:gz") as archive:
+            for _ in range(2):
+                archive.addfile(tarfile.TarInfo(f"{STEM}/README.md"))
+        with self.assertRaisesRegex(check_dist.DistError, "duplicate sdist member"):
+            check_dist.read_sdist(sdist, STEM)
 
     def test_source_metadata_policy(self):
         self.assertEqual(expected()["Version"], [VERSION])
@@ -296,6 +314,12 @@ class MainTest(unittest.TestCase):
                 status, out, _ = self.run_main([directory])
                 self.assertEqual(status, 0)
                 self.assertIn("distribution checks passed", out)
+
+                install.reset_mock()
+                write_sdist(directory, sdist_files(**{"setup.cfg": b"\x00"}))
+                self.assertEqual(self.run_main([directory])[0], 1)
+                install.assert_not_called()
+                write_sdist(directory, sdist_files())
 
                 install.return_value = ["installed version is 0"]
                 self.assertEqual(self.run_main([directory])[0], 1)

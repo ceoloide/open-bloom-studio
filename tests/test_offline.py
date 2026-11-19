@@ -20,6 +20,25 @@ class OfflineGuardTest(unittest.TestCase):
         with self.assertRaises(offline.NetworkBlocked):
             socket.create_connection((DOCUMENTATION_HOST, 9), timeout=1)
 
+    def test_remote_datagram_is_blocked(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            with self.assertRaises(offline.NetworkBlocked):
+                client.sendto(b"test", (DOCUMENTATION_HOST, 9))
+
+    def test_other_remote_dns_entry_points_are_blocked(self):
+        for lookup, address in (
+            (socket.gethostbyname, "example.com"),
+            (socket.gethostbyname_ex, "example.com"),
+            (socket.gethostbyaddr, DOCUMENTATION_HOST),
+            (socket.getnameinfo, (DOCUMENTATION_HOST, 9)),
+        ):
+            with self.subTest(lookup=lookup.__name__):
+                with self.assertRaises(offline.NetworkBlocked):
+                    if lookup is socket.getnameinfo:
+                        lookup(address, 0)
+                    else:
+                        lookup(address)
+
     def test_remote_connect_is_blocked(self):
         for family, address in (
             (socket.AF_INET, (DOCUMENTATION_HOST, 9)),

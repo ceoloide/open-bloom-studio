@@ -2,7 +2,8 @@
 
 Name lookups for anything but local names fail, other address families
 (for example Bluetooth) cannot connect, and Unix sockets cannot reach the
-D-Bus system bus that local Bluetooth stacks are controlled through.
+D-Bus system bus that local Bluetooth stacks are controlled through. This
+guards audited socket operations in the test process.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
+import sys
 from typing import Any
 
 LOCAL_NAMES = frozenset({None, "", "localhost", "localhost.localdomain"})
@@ -23,9 +25,6 @@ class NetworkBlocked(OSError):
 
 
 _installed = False
-_real_connect = socket.socket.connect
-_real_connect_ex = socket.socket.connect_ex
-_real_getaddrinfo = socket.getaddrinfo
 
 
 def _is_local_host(host: Any) -> bool:
@@ -62,35 +61,29 @@ def check_address(family: int, address: Any) -> None:
     raise NetworkBlocked(f"tests may not connect to {family!r} {address!r}")
 
 
-def _connect(self: socket.socket, address: Any) -> None:
-    check_address(self.family, address)
-    _real_connect(self, address)
-
-
-def _connect_ex(self: socket.socket, address: Any) -> int:
-    check_address(self.family, address)
-    return _real_connect_ex(self, address)
-
-
-def _getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
-    if not _is_local_host(host):
-        raise NetworkBlocked(f"tests may not resolve {host!r}")
-    return _real_getaddrinfo(host, *args, **kwargs)
+def _audit_socket(event: str, args: tuple[Any, ...]) -> None:
+    if event in {"socket.connect", "socket.sendto", "socket.sendmsg"}:
+        sock, address = args
+        if address is not None:
+            check_address(sock.family, address)
+    elif event in {
+        "socket.getaddrinfo",
+        "socket.gethostbyname",
+        "socket.gethostbyaddr",
+    }:
+        if not _is_local_host(args[0]):
+            raise NetworkBlocked("tests may only resolve local hosts")
+    elif event == "socket.getnameinfo" and not _is_local_host(args[0][0]):
+        raise NetworkBlocked("tests may only resolve local hosts")
 
 
 def install() -> None:
     global _installed
     if _installed:
         return
-    socket.socket.connect = _connect  # type: ignore[method-assign]
-    socket.socket.connect_ex = _connect_ex  # type: ignore[method-assign]
-    socket.getaddrinfo = _getaddrinfo
+    sys.addaudithook(_audit_socket)
     _installed = True
 
 
 def installed() -> bool:
-    return (
-        _installed
-        and socket.socket.connect is _connect
-        and socket.getaddrinfo is _getaddrinfo
-    )
+    return _installed

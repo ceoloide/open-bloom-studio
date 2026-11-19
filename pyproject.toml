@@ -50,4 +50,5 @@ branch = true
 source = ["xbloom_studio", "scripts"]
 
 [tool.coverage.report]
+include_namespace_packages = true
 exclude_also = ['if __name__ == "__main__":']

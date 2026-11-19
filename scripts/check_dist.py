@@ -106,12 +106,15 @@ def metadata_fields(message: email.message.Message) -> dict[str, list[str]]:
 
 
 def read_wheel(path: Path) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
     with zipfile.ZipFile(path) as archive:
-        return {
-            info.filename: archive.read(info)
-            for info in archive.infolist()
-            if not info.is_dir()
-        }
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            if info.filename in files:
+                raise DistError("duplicate wheel member")
+            files[info.filename] = archive.read(info)
+    return files
 
 
 def read_sdist(path: Path, stem: str) -> dict[str, bytes]:
@@ -124,6 +127,8 @@ def read_sdist(path: Path, stem: str) -> dict[str, bytes]:
             extracted = archive.extractfile(member) if member.isfile() else None
             if prefix != stem or not name or extracted is None:
                 raise DistError(f"unexpected sdist member: {member.name}")
+            if name in files:
+                raise DistError("duplicate sdist member")
             files[name] = extracted.read()
     return files
 
@@ -185,7 +190,7 @@ def check_artifacts(
         fields = metadata_fields(parse_metadata(raw))
         for field, value in expected.items():
             if fields[field] != value:
-                problems.append(f"{kind} metadata {field} is {fields[field]}")
+                problems.append(f"{kind} metadata differs from source: {field}")
 
     findings = publication_policy.check_files(
         [(f"wheel:{name}", data) for name, data in sorted(wheel_files.items())]
@@ -200,11 +205,11 @@ def expected_metadata(source: email.message.Message) -> dict[str, list[str]]:
     expected = metadata_fields(source)
     problems = []
     if expected["Name"] != [PROJECT]:
-        problems.append(f"source project is {expected['Name']}")
+        problems.append("source project name differs from policy")
     if expected["License-Expression"] != [LICENSE_EXPRESSION]:
-        problems.append(f"source license is {expected['License-Expression']}")
+        problems.append("source license differs from policy")
     if expected["Requires-Python"] != [REQUIRES_PYTHON]:
-        problems.append(f"source Requires-Python is {expected['Requires-Python']}")
+        problems.append("source Requires-Python differs from policy")
     if len(expected["Version"]) != 1:
         problems.append("source version is missing")
     if problems:
@@ -295,10 +300,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected = expected_metadata(source_metadata())
         sources = source_files(Path.cwd())
         problems = check_artifacts(sdist, wheel, sources, expected)
-        with tempfile.TemporaryDirectory() as workdir:
-            problems += check_install(
-                wheel, Path(workdir), package_only(sources), expected["Version"][0]
-            )
+        if not problems:
+            with tempfile.TemporaryDirectory() as workdir:
+                problems = check_install(
+                    wheel, Path(workdir), package_only(sources), expected["Version"][0]
+                )
     except DistError as error:
         problems = [str(error)]
     except subprocess.CalledProcessError as error:
