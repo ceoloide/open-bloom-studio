@@ -1306,6 +1306,265 @@ async def _emit(machine, code):
     machine.emit(code)
 
 
+def _start_source(m):
+    """Water source field of the transmitted start-water command."""
+    return struct.unpack("<fffII", m.payloads(4506)[-1])[3]
+
+
+class LifecycleRoundTwoTests(unittest.IsolatedAsyncioTestCase):
+    async def held_start(self, m, during):
+        """Run start_water while its start journal hook injects ``during``."""
+        gate = Gate(4506, action=during)
+        gate.release.set()
+        async with interaction(m, command_hooks=gate) as session:
+            op = await session.start_water(volume_ml=10)
+            result = await asyncio.wait_for(op.wait(), 2)
+            return result, session.get_state()
+
+    async def test_fault_after_admission_survives_history_eviction(self):
+        # S2: a fault followed by more than 256 benign notifications still
+        # blocks the start; history eviction cannot hide it.
+        m = Machine()
+
+        def during():
+            m.emit(40517)
+            for _ in range(300):
+                m.state(1)
+
+        result, state = await self.held_start(m, during)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("fault before start", result["error"])
+        self.assertNotIn(4506, m.codes())
+        self.assertTrue(state["recovery_required"])
+
+    async def test_external_motion_after_admission_blocks_start(self):
+        # S2: motion reported between admission and the start is not owned.
+        for during in (lambda m: m.state(0x23), lambda m: m.emit(9003)):
+            m = Machine()
+            result, state = await self.held_start(m, lambda m=m, d=during: d(m))
+            self.assertIn("motion before start", result["error"])
+            self.assertNotIn(4506, m.codes())
+            self.assertTrue(state["recovery_required"])
+
+    async def test_water_source_change_after_admission_blocks_encoded_start(self):
+        # S2: the start encodes the admitted source; a confirmed change makes
+        # it stale. Nothing is sent and nothing is uncertain.
+        m = Machine()
+        result, state = await self.held_start(
+            m, lambda: m.emit(40521, identity_block(source=1, size=63))
+        )
+        self.assertIn("Water source changed", result["error"])
+        self.assertNotIn(4506, m.codes())
+        self.assertEqual(result["cleanup_status"], "completed")
+        self.assertFalse(state["recovery_required"])
+
+    async def test_selected_source_override_and_preparation_states_still_start(
+        self,
+    ):
+        # S2: an acknowledged selection keeps overriding reported identity,
+        # and non-motion preparation states do not block the start.
+        m = Machine()
+        m.studio.auto_complete = True
+
+        def during():
+            m.emit(40521, identity_block(source=0, size=63))
+            for state in (0x0A, 0x41, 4):
+                m.state(state)
+
+        gate = Gate(4506, action=during)
+        gate.release.set()
+        async with interaction(m, command_hooks=gate) as session:
+            session._selected_water_source = 1
+            result = await (await session.start_water(volume_ml=10)).wait()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(_start_source(m), 1)
+
+    async def test_observer_update_cannot_satisfy_ack_or_pass_low_water(self):
+        # S6: notifications caused by the transcript observer are seen by the
+        # start guard and never satisfy a not-yet-armed ACK.
+        m = Machine()
+        m.studio.silent.add(8022)
+
+        def stale_ack(kind, data):
+            raw = bytes.fromhex(data["hex"])
+            if kind == "ble.outgoing_chunk" and raw[3:5] == (8022).to_bytes(
+                2, "little"
+            ):
+                m.emit(8022)
+
+        async with interaction(m) as session:
+            session.transport.event_sink = stale_ack
+            with self.assertRaises(asyncio.TimeoutError):
+                await session._command(8022)
+            self.assertEqual(m.codes()[-1], 8022)
+
+        m = Machine()
+        events = []
+
+        def low_water(kind, data):
+            events.append(kind)
+            raw = bytes.fromhex(data["hex"])
+            if kind == "ble.outgoing_chunk" and raw[3:5] == (4506).to_bytes(
+                2, "little"
+            ):
+                m.emit(40522, u32(0))
+
+        async with interaction(m) as session:
+            session.transport.event_sink = low_water
+            result = await (await session.start_water(volume_ml=10)).wait()
+        self.assertIn("Water sufficiency", result["error"])
+        self.assertNotIn(4506, m.codes())
+        self.assertFalse(any(w[3:5] == (4506).to_bytes(2, "little") for w in m.writes))
+        self.assertIn("ble.outgoing_chunk_withheld", events)
+
+    async def test_observer_cancelled_error_never_strands_stop_or_result(self):
+        # S5: explicit CancelledError from synchronous observers is suppressed.
+        class Cancelling(Hooks):
+            def write_completed(self, packet):
+                raise asyncio.CancelledError()
+
+        def sink(kind, data):
+            raise asyncio.CancelledError()
+
+        m = Machine()
+        async with interaction(m, command_hooks=Cancelling()) as session:
+            session.transport.event_sink = sink
+            await session.start_water(volume_ml=10)
+            await transmitted(m, 4506)
+            result = await asyncio.wait_for(session.stop(), 1)
+            self.assertEqual(result["status"], "stopped")
+            self.assertTrue(result["stop_acknowledged"])
+            self.assertTrue(result["stop_observed"])
+            self.assertEqual(result["cleanup_status"], "completed")
+
+    async def test_worker_cancelled_during_stop_write_still_leaves_final_result(
+        self,
+    ):
+        # S5: a real cancellation at awaited I/O propagates out of the worker,
+        # yet waiters still get a final, conservative result.
+        m = Machine()
+        m.block_code = 4507
+        async with interaction(m) as session:
+            op = await session.start_water(volume_ml=10)
+            await transmitted(m, 4506)
+            stopping = asyncio.create_task(session.stop())
+            await blocked_write(m, op._task)
+            op._task.cancel()
+            await asyncio.sleep(0)
+            m.release.set()
+            result = await asyncio.wait_for(stopping, 1)
+            self.assertTrue(op._task.cancelled())
+            self.assertEqual(result["status"], "unknown")
+            self.assertFalse(result["stop_acknowledged"])
+            self.assertEqual(result["cleanup_status"], "skipped_uncertain")
+            self.assertIsNotNone(result["state"])
+            self.assertTrue(session.get_state()["recovery_required"])
+        # Cancelled after the stop ACK: the acknowledgment and evidence stay.
+        m = Machine()
+        async with interaction(m, transition_delay=0.05) as session:
+            op = await session.start_water(volume_ml=10)
+            await transmitted(m, 4506)
+            stopping = asyncio.create_task(session.stop())
+            await until(lambda: op.stop_acknowledged)
+            op._task.cancel()
+            result = await asyncio.wait_for(stopping, 1)
+            self.assertEqual(result["status"], "stopped")
+            self.assertTrue(result["stop_acknowledged"])
+            self.assertTrue(result["stop_observed"])
+            self.assertEqual(result["cleanup_status"], "skipped_uncertain")
+
+    async def test_newer_motion_voids_prior_completion_even_with_stop_ack(self):
+        # S11: completion before the stop is the starting observation, but
+        # newer motion clears it even though the stop was acknowledged.
+        m = Machine()
+        m.overrides[4507] = lambda p: [reply(4507)]
+        gate = Gate(4507, action=lambda: m.state(0x23))
+        gate.release.set()
+        async with interaction(m, command_hooks=gate) as session:
+            op = await session.start_water(volume_ml=10)
+            await transmitted(m, 4506)
+            m.emit(40511)
+            result = await op.wait()
+            self.assertTrue(result["stop_acknowledged"])
+            self.assertFalse(result["stop_observed"])
+            self.assertEqual(result["status"], "unknown")
+            self.assertTrue(session.get_state()["recovery_required"])
+
+    async def test_unconfirmed_stop_is_not_terminal_while_motion_is_known(self):
+        # S11: an acknowledged but unobserved stop during motion is unknown.
+        m = Machine()
+        m.overrides[4507] = lambda p: [reply(4507)]
+        async with interaction(m) as session:
+            await session.start_water(volume_ml=10)
+            await transmitted(m, 4506)
+            result = await session.stop()
+            self.assertTrue(result["stop_acknowledged"])
+            self.assertFalse(result["stop_observed"])
+            self.assertEqual(result["status"], "unknown")
+            self.assertIn("motion", result["error"])
+            self.assertEqual(result["cleanup_status"], "skipped_uncertain")
+
+    async def test_grinder_deadline_bounds_a_suspended_final_start_write(self):
+        # A4: the connector delivers (and the machine ACKs) the final start
+        # chunk immediately but its write call does not return. The pulse
+        # deadline cancels the suspended write, then the stop follows on the
+        # same link; nothing overlaps, nothing is retried.
+        class Suspending(Machine):
+            resist = 0.0
+            active = 0
+            overlap = False
+
+            async def write(self, data):
+                self.active += 1
+                self.overlap = self.overlap or self.active > 1
+                try:
+                    sent = len(self.sent)
+                    await super().write(data)
+                    if len(self.sent) > sent and self.sent[-1].command == 3500:
+                        try:  # final start chunk delivered; return suspends
+                            await asyncio.sleep(10)
+                        except asyncio.CancelledError:
+                            if not self.resist:
+                                raise
+                            await asyncio.sleep(self.resist)
+                finally:
+                    self.active -= 1
+
+        for acked, resist in ((True, 0.0), (False, 0.0), (True, 0.3)):
+            m = Suspending()
+            m.resist = resist
+            if not acked:
+                m.studio.silent.add(3500)
+            times = {}
+            m.overrides[3505] = lambda p, m=m, t=times: (
+                t.setdefault(3505, time.monotonic()),
+                m.studio(p),
+            )[1]
+            async with interaction(m, ack_timeout=1, write_timeout=5) as session:
+                started = time.monotonic()
+                op = await session.start_grinder(size=5, rpm=80, duration_s=0.1)
+                result = await asyncio.wait_for(op.wait(), 3)
+                elapsed = times[3505] - started
+                self.assertFalse(m.overlap)
+                self.assertEqual(m.codes().count(3500), 1)
+                self.assertTrue(result["stop_acknowledged"])
+                if resist:
+                    # Documented connector limit: a write that ignores
+                    # cancellation holds the link until it returns.
+                    self.assertGreaterEqual(elapsed, 0.1 + resist)
+                    self.assertLess(elapsed, 0.1 + resist + 0.3)
+                else:
+                    self.assertLess(elapsed, 0.1 + 0.3)
+                if acked:
+                    self.assertEqual(result["status"], "completed")
+                    self.assertTrue(result["start_observed"])
+                    self.assertFalse(session.get_state()["recovery_required"])
+                else:
+                    self.assertEqual(result["status"], "failed")
+                    self.assertIn("budget expired during its write", result["error"])
+                    self.assertTrue(session.get_state()["recovery_required"])
+
+
 class EncodedRecipeTests(unittest.TestCase):
     def test_validation_and_settings_bytes(self):
         for kwargs in (

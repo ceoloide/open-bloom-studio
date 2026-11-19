@@ -15,7 +15,13 @@ from .events import protocol_error
 from .ownership import AddressLease
 from .protocol import FrameBuffer, FrameError, Packet
 from .telemetry import DeviceState, decode_values
-from .transport import BleakTransport, CommandHooks, EventSink, Transport
+from .transport import (
+    OBSERVER_ERRORS,
+    BleakTransport,
+    CommandHooks,
+    EventSink,
+    Transport,
+)
 
 T = TypeVar("T")
 C = TypeVar("C", bound="ReadOnlyClient")
@@ -195,13 +201,13 @@ class ReadOnlyClient:
         accepts = getattr(owner, "accepts", None)
         try:
             return True if accepts is None else bool(accepts(kind))
-        except Exception:
+        except OBSERVER_ERRORS:
             return False
 
     def _emit(self, kind: str, details: dict[str, Any]) -> None:
         # A transcript observer must never drop telemetry or acknowledgments.
         if self.event_sink is not None and self._wants_event(kind):
-            with suppress(Exception):
+            with suppress(*OBSERVER_ERRORS):
                 self.event_sink(kind, details)
 
     def _notification(self, data: bytes) -> None:
@@ -268,6 +274,19 @@ class ReadOnlyClient:
     def _owns(self) -> bool:
         return _owners.get(self.address) is self and self._lease.held
 
+    def _link_notifications(self, link: _Link) -> Callable[[bytes], None]:
+        """Deliver notifications only while ``link`` is the current connection.
+
+        A callback queued by an earlier connection must not reach the next
+        handshake or its cache.
+        """
+
+        def notification(data: bytes) -> None:
+            if self._link is link and not link.lost:
+                self._notification(data)
+
+        return notification
+
     def _link_callback(self, link: _Link) -> Callable[[], None]:
         def lost() -> None:
             if self._link is link and not link.lost:
@@ -310,7 +329,9 @@ class ReadOnlyClient:
             if not self.state.connected:
                 raise SessionError("Connect before subscribing")
             if not self._subscribed:
-                await self._call(self.transport.subscribe(self._notification))
+                assert self._link is not None  # set whenever connected
+                callback = self._link_notifications(self._link)
+                await self._call(self.transport.subscribe(callback))
                 self._subscribed = True
 
     async def open_session(self) -> None:
@@ -399,11 +420,15 @@ class ReadOnlyClient:
 
     async def unsubscribe(self) -> None:
         async with self._lock:
-            if self._subscribed:
-                await self._call(self.transport.unsubscribe())
-                self._subscribed = False
+            # No command may rely on notifications once disabling has begun,
+            # even if the call below fails or its caller is cancelled. The next
+            # subscribe re-registers, and open_session handshakes again.
+            if self.state.session_ready:
                 self.state.session_ready = False
                 self._signal()
+            if self._subscribed:
+                self._subscribed = False
+                await self._call(self.transport.unsubscribe())
 
     async def _cleanup(self) -> None:
         try:

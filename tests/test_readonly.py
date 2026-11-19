@@ -625,6 +625,97 @@ class OwnershipBoundaryTests(unittest.IsolatedAsyncioTestCase):
         lease.release()
 
 
+class LifecycleRoundTwoTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unsubscribe_clears_readiness_first_and_resubscribe_recovers(
+        self,
+    ):
+        # S3: readiness is cleared before stop_notify starts, even when it
+        # fails or its caller is cancelled; subscribe and handshake recover.
+        class Stuck(ScriptedConnector):
+            mode = None
+
+            async def stop_notify(self):
+                self.calls.append("stop_notify")
+                if self.mode == "fail":
+                    raise OSError("radio")
+                if self.mode == "hang":
+                    await asyncio.sleep(10)
+                self._callback = None
+
+        link = Stuck("sim-unsubscribe")
+        c = ReadOnlyClient(connector=link, settle=0, subscription_settle=0)
+        async with c:
+            link.mode = "fail"
+            with self.assertRaisesRegex(SessionError, "radio"):
+                await c.unsubscribe()
+            self.assertFalse(c.snapshot()["session_ready"])
+            link.mode = None
+            await c.subscribe()
+            await c.open_session()
+            self.assertTrue(c.snapshot()["session_ready"])
+            self.assertEqual(
+                link.calls[-3:], ["stop_notify", "stop_notify", "start_notify"]
+            )
+            link.mode = "hang"
+            calls = len(link.calls)
+            unsubscribing = asyncio.create_task(c.unsubscribe())
+            while len(link.calls) == calls:
+                await asyncio.sleep(0)
+            self.assertFalse(c.snapshot()["session_ready"])
+            unsubscribing.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await unsubscribing
+            self.assertFalse(c.snapshot()["session_ready"])
+            link.mode = None
+            await c.subscribe()
+            await c.open_session()
+            self.assertTrue(c.snapshot()["session_ready"])
+
+    async def test_stale_notification_callback_is_ignored_after_reconnect(self):
+        # S9: callbacks are bound to their connection; a callback from before
+        # the reconnect cannot feed the cache or acknowledge the handshake.
+        link, c = scripted("sim-generation")
+        c.handshake_timeout = 0.05
+        async with c:
+            stale = link._callback
+            link.drop()
+            await c.connect()
+            await c.subscribe()
+            stale(reply(8023, u32(0x22)))
+            self.assertEqual(len(c.packets), 0)
+            link.responder = lambda packet: (stale(ACK), [])[1]
+            with self.assertRaisesRegex(SessionError, "No handshake acknowledgment"):
+                await c.open_session()
+            self.assertFalse(c.snapshot()["session_ready"])
+            self.assertEqual(len(c.packets), 0)
+
+    async def test_incoming_observer_cancelled_error_never_drops_notifications(
+        self,
+    ):
+        # S5: an explicit CancelledError from a synchronous observer or filter
+        # is suppressed like any other observer failure.
+        class Picky:
+            def accepts(self, kind):
+                raise asyncio.CancelledError()
+
+            def emit(self, kind, details):
+                raise AssertionError("filtered out")
+
+        def sink(kind, details):
+            raise asyncio.CancelledError()
+
+        for event_sink in (sink, Picky().emit):
+            c = ReadOnlyClient(
+                connector=ScriptedConnector(),
+                event_sink=event_sink,
+                settle=0,
+                subscription_settle=0,
+            )
+            async with c:
+                self.assertTrue(c.snapshot()["session_ready"])
+                self.assertIn("serial_number", c.snapshot()["fields"])
+
+
 class BoundedWaitTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_racing_completion_still_propagates(self):
         async def instant():

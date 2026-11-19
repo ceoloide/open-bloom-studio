@@ -52,6 +52,9 @@ CONTROL_COMMANDS = FUNCTION_2_COMMANDS | frozenset(
 # prevent a bounded attempt to stop the machine.
 STOP_COMMANDS = frozenset({3505, 4507, 40519})
 STOP_HOOK_TIMEOUT = 0.05
+# Synchronous observers cannot receive a task cancellation, so a
+# CancelledError they raise is their own and is suppressed like any failure.
+OBSERVER_ERRORS = (Exception, asyncio.CancelledError)
 
 EventSink = Callable[[str, dict[str, Any]], None]
 
@@ -111,8 +114,9 @@ class CommandHooks(Protocol):
     stop commands, which wait at most ``STOP_HOOK_TIMEOUT`` and then proceed
     without waiting for the cancelled hook to finish. Exactly one of
     ``write_completed`` and ``write_failed`` follows a write attempt. Neither
-    may block; their exceptions are suppressed so an observer can never turn a
-    sent frame into a failure or hide the original write error.
+    may block; their exceptions, an explicit ``CancelledError`` included, are
+    suppressed so an observer can never turn a sent frame into a failure or
+    hide the original write error.
     """
 
     async def before_write(self, packet: Packet, frame: bytes) -> None: ...
@@ -242,6 +246,10 @@ class BleakTransport:
     Pass an address or platform device to use the local Bleak connector, or
     ``connector=`` for any other link. A session may make the machine announce
     a pairing even though no operating-system bonding takes place.
+
+    ``event_sink`` sees each chunk as ``ble.outgoing_chunk`` before its guard,
+    ACK arming and write; a chunk then refused before its write is followed
+    by ``ble.outgoing_chunk_withheld`` with the same bytes.
     """
 
     command_guard_after_journal = True
@@ -267,12 +275,16 @@ class BleakTransport:
         self.timeout = timeout
         self.hooks = hooks
         self.event_sink: EventSink | None = None
-        # Runs after hooks.before_write and immediately before the first byte.
+        # Runs after hooks.before_write and the first chunk's transcript
+        # observer, immediately before the first byte.
         self.command_guard: Callable[[], None] | None = None
-        # Runs immediately before the chunk that completes the frame: the
-        # earliest moment the machine can act on, or acknowledge, the command.
+        # Runs after the final chunk's observer, immediately before the chunk
+        # that completes the frame: the earliest moment the machine can act
+        # on, or acknowledge, the command.
         self.on_transmit: Callable[[], None] | None = None
         self._subscribed = False
+        # True while an interrupted stop_notify leaves notifications unknown.
+        self._notify_unknown = False
         self._journals: set[asyncio.Future[None]] = set()
 
     @property
@@ -280,18 +292,26 @@ class BleakTransport:
         return self.connector.identity
 
     async def connect(self, on_disconnect: Callable[[], None]) -> None:
-        self._subscribed = False
+        self._subscribed = self._notify_unknown = False
         await self.connector.connect(on_disconnect)
 
     async def subscribe(self, callback: Callable[[bytes], None]) -> None:
         if not self._subscribed:
+            if self._notify_unknown and self.connector.is_connected:
+                # An interrupted unsubscribe may have left the old callback
+                # registered; end it before registering the new one.
+                with suppress(Exception):
+                    await self.connector.stop_notify()
             await self.connector.start_notify(callback)
-            self._subscribed = True
+            self._subscribed, self._notify_unknown = True, False
 
     async def unsubscribe(self) -> None:
-        if self._subscribed and self.connector.is_connected:
+        # Writes stop being admitted before stop_notify is even attempted.
+        subscribed, self._subscribed = self._subscribed, False
+        if subscribed and self.connector.is_connected:
+            self._notify_unknown = True
             await self.connector.stop_notify()
-        self._subscribed = False
+            self._notify_unknown = False
 
     async def open_session(self) -> None:
         if not self._subscribed:
@@ -337,29 +357,44 @@ class BleakTransport:
             else:
                 await hooks.before_write(packet, frame)
         try:
-            if self.command_guard is not None:
-                self.command_guard()
-            if not self._subscribed or not self.connector.is_connected:
-                raise ConnectionError("No subscribed control connection")
-            for offset in range(0, len(frame), self._write_size):
-                if offset + self._write_size >= len(frame) and self.on_transmit:
-                    self.on_transmit()
-                await self._write_bytes(frame[offset : offset + self._write_size])
+            size = self._write_size
+            for offset in range(0, len(frame), size):
+                chunk = frame[offset : offset + size]
+                # The observer runs first, so a notification it causes is seen
+                # by the guard and can never satisfy a not-yet-armed ACK.
+                self._observe("ble.outgoing_chunk", chunk)
+                try:
+                    if offset == 0:
+                        if self.command_guard is not None:
+                            self.command_guard()
+                        if not self._subscribed or not self.connector.is_connected:
+                            raise ConnectionError("No subscribed control connection")
+                    if offset + size >= len(frame) and self.on_transmit:
+                        self.on_transmit()
+                except BaseException as exc:
+                    # Keep the transcript exact: the observed chunk was withheld.
+                    self._observe("ble.outgoing_chunk_withheld", chunk, exc)
+                    raise
+                await self.connector.write(chunk)
         except BaseException as exc:
             if hooks is not None:
-                with suppress(Exception):
+                with suppress(*OBSERVER_ERRORS):
                     hooks.write_failed(packet, exc)
             raise
         if hooks is not None:
-            with suppress(Exception):
+            with suppress(*OBSERVER_ERRORS):
                 hooks.write_completed(packet)
 
-    async def _write_bytes(self, data: bytes) -> None:
+    def _observe(
+        self, kind: str, data: bytes, error: BaseException | None = None
+    ) -> None:
         if self.event_sink is not None:
+            details = {"hex": bytes(data).hex()}
+            if error is not None:
+                details["error"] = f"{type(error).__name__}: {error}"
             # A transcript observer must never prevent or fail a write.
-            with suppress(Exception):
-                self.event_sink("ble.outgoing_chunk", {"hex": bytes(data).hex()})
-        await self.connector.write(data)
+            with suppress(*OBSERVER_ERRORS):
+                self.event_sink(kind, details)
 
 
 class ControlTransport(BleakTransport):

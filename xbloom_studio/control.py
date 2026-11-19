@@ -44,6 +44,15 @@ MOTION_STATES = (0x22, 0x23)
 SCALE_STATES = (4, 5)
 CONTEXT_STATES = (1, 0x0A, 0x41, 0x24, 4, 5)
 FAULT_EVENTS = (40517, 40522, 8203, 8204)
+# Keys of Interaction._seen: (command, None), and (8023, state) for states.
+SeenKey = tuple[int, "int | None"]
+FAULT_KEYS: tuple[SeenKey, ...] = tuple((code, None) for code in FAULT_EVENTS)
+MOTION_KEYS: tuple[SeenKey, ...] = (
+    (8023, MOTION_STATES[0]),
+    (8023, MOTION_STATES[1]),
+    (9003, None),
+    (9005, None),
+)
 WATER_KINDS = ("water", "recipe", "tea")
 MEASUREMENTS = (20501, 40523, 40521)
 STOP_CODES = {
@@ -197,8 +206,10 @@ class Operation:
     _stop_requested: bool = field(default=False, repr=False)
     _paused: bool = field(default=False, repr=False)
     _final: dict[str, Any] | None = field(default=None, repr=False)
-    # Event revision at launch: faults after it block the start frame.
+    # Event revision at launch: faults or motion after it block the start.
     _since: int = field(default=0, repr=False)
+    # Water source encoded in the start command, when it carries one.
+    _source: int | None = field(default=None, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -226,8 +237,11 @@ class Operation:
     async def wait(self) -> dict[str, Any]:
         if self._task is None:
             raise RuntimeError("Operation has not started")
-        # Cancelling a consumer does not silently cancel the machine operation.
-        await asyncio.shield(self._task)
+        # Cancelling a consumer does not silently cancel the machine operation,
+        # and a worker cancelled during cleanup still leaves its final result.
+        await asyncio.wait({self._task})
+        if not self._task.cancelled():
+            self._task.result()
         return {**self.snapshot(), "state": self._final}
 
 
@@ -239,6 +253,7 @@ class _Progress:
 
     rejected = False
     transmitted_at: float | None = None
+    expiry: asyncio.TimerHandle | None = None
 
 
 def _confirmed(future: asyncio.Future[Packet]) -> bool:
@@ -299,6 +314,9 @@ class Interaction(MachineControls, ReadOnlyClient):
         self._uncertain = False
         self._event_revision = 0
         self._received_events: deque[tuple[int, Packet]] = deque(maxlen=256)
+        # Latest revision per event (and per reported state), kept apart from
+        # the bounded history so benign traffic can never evict a fault.
+        self._seen: dict[SeenKey, int] = {}
         self._preset_write_used = False
         self._last_preset_write: dict[str, Any] | None = None
         self._selected_water_source: int | None = None
@@ -395,6 +413,10 @@ class Interaction(MachineControls, ReadOnlyClient):
         if self._prepared is not None:
             self._check_preparation(packet)
         self._event_revision += 1
+        self._seen[(packet.command, None)] = self._event_revision
+        if packet.command == 8023 and len(packet.payload) >= 4:
+            state = int.from_bytes(packet.payload[:4], "little")
+            self._seen[(8023, state)] = self._event_revision
         if packet.command not in MEASUREMENTS:
             self._received_events.append((self._event_revision, packet))
         op = self.operation
@@ -673,6 +695,7 @@ class Interaction(MachineControls, ReadOnlyClient):
             expected = payload if code == 11511 else ack_payload
             key = (code, 0xC2 if function == 2 else 0xC1, expected)
             progress = _Progress()
+            loop = asyncio.get_running_loop()
             guard: Callable[[], None] | None = None
             if before_write is not None:
                 admit = before_write
@@ -684,10 +707,19 @@ class Interaction(MachineControls, ReadOnlyClient):
                         progress.rejected = True
                         raise
 
+            def expire() -> None:
+                # Cancels a write still suspended at the budget, if the
+                # connector honors cancellation; the next write still waits
+                # for it to return.
+                if not write.done():
+                    write.cancel()
+
             def transmit() -> None:
                 # A matching notification before this point is stale.
                 progress.transmitted_at = time.monotonic()
                 self._waiter = (key, future)
+                if ack_budget is not None:
+                    progress.expiry = loop.call_later(ack_budget, expire)
                 if on_transmit is not None:
                     on_transmit()
 
@@ -700,10 +732,20 @@ class Interaction(MachineControls, ReadOnlyClient):
             )
             try:
                 try:
-                    await asyncio.shield(write)
+                    await asyncio.wait({write})
                 except asyncio.CancelledError:
                     await write
                     raise
+                if write.cancelled():
+                    # Only the budget cancels the write itself. An ACK proves
+                    # delivery; otherwise the outcome is unknown.
+                    if not _confirmed(future):
+                        raise TimeoutError(
+                            "Command budget expired during its write; "
+                            "delivery unconfirmed"
+                        )
+                    return future.result()
+                write.result()
                 wait, budgeted = self.ack_timeout, False
                 if ack_budget is not None and progress.transmitted_at is not None:
                     left = progress.transmitted_at + ack_budget - time.monotonic()
@@ -731,6 +773,8 @@ class Interaction(MachineControls, ReadOnlyClient):
                     self._uncertain = True
                 raise
             finally:
+                if progress.expiry is not None:
+                    progress.expiry.cancel()
                 self._waiter = None
                 if not future.done():
                     future.cancel()
@@ -821,7 +865,7 @@ class Interaction(MachineControls, ReadOnlyClient):
                 source,
                 pattern_code,
             )
-            return self._launch("water", configure, 4506, start, limit)
+            return self._launch("water", configure, 4506, start, limit, source=source)
 
     async def dispense_water(self, **kwargs: Any) -> dict[str, Any]:
         return await self._complete(self.start_water(**kwargs))
@@ -1039,9 +1083,10 @@ class Interaction(MachineControls, ReadOnlyClient):
         *,
         prepare: bool = True,
         before_start: Callable[[], None] | None = None,
+        source: int | None = None,
     ) -> Operation:
         _number("timeout", timeout, 0.1, 3600)
-        op = Operation(kind, _since=self._event_revision)
+        op = Operation(kind, _since=self._event_revision, _source=source)
         self.operation = op
         op._task = asyncio.create_task(
             self._run(
@@ -1068,17 +1113,21 @@ class Interaction(MachineControls, ReadOnlyClient):
                 raise SessionError("Machine ownership lost; start not sent")
             if op._stop_requested:
                 raise BusyError("Operation was stopped before its start was sent")
-            if claim is not None:
-                claim()
-                return
-            if op.kind in WATER_KINDS:
-                self._water_source()
-            if any(
-                revision > op._since and packet.command in FAULT_EVENTS
-                for revision, packet in self._received_events
-            ):
+            if claim is None and op.kind in WATER_KINDS:
+                # A selected source still overrides the reported one.
+                source = self._water_source()
+                if op._source is not None and source != op._source:
+                    raise SessionError(
+                        "Water source changed after admission; start not sent"
+                    )
+            if self._last(FAULT_KEYS) > op._since:
                 self._uncertain = True
                 raise SessionError("Machine reported a fault before start; not sent")
+            if self._last(MOTION_KEYS) > op._since:
+                self._uncertain = True
+                raise BusyError("Machine reported motion before start; not sent")
+            if claim is not None:
+                claim()
 
         return guard
 
@@ -1181,12 +1230,31 @@ class Interaction(MachineControls, ReadOnlyClient):
             await self._finish(op, success, before_start is not None)
 
     async def _finish(self, op: Operation, success: bool, claimed: bool) -> None:
+        try:
+            await self._cleanup_operation(op, success, claimed)
+        finally:
+            # Even an interrupted cleanup leaves a final result for waiters.
+            if op.cleanup_status == "pending":
+                op.cleanup_status = "skipped_uncertain"
+                self._uncertain = True
+            op.phase = op.status
+            op._final = self.snapshot()
+            self._signal()
+
+    async def _cleanup_operation(
+        self, op: Operation, success: bool, claimed: bool
+    ) -> None:
         if claimed and self._prepared is not None:
             self._invalidate_preparation("execution_not_transmitted")
             self._uncertain = True
         # Also stop after natural manual completion to make cleanup explicit.
         if op._armed and (not success or op.kind not in ("recipe", "tea")):
             await self._send_stop(op)
+        if op._armed and not op.stop_observed and self._moving(op):
+            # An unconfirmed operation is never terminal while motion is known.
+            op.status = "unknown"
+            op.error = op.error or "Stop not observed; machine reports motion"
+            self._uncertain = True
         if not self.state.connected:
             op.status = "unknown"
             self._uncertain = True
@@ -1206,28 +1274,23 @@ class Interaction(MachineControls, ReadOnlyClient):
                 op.cleanup_status = "failed"
         else:
             op.cleanup_status = "skipped_uncertain"
-        op.phase = op.status
-        op._final = self.snapshot()
-        self._signal()
 
-    def _stopped_since(self, revision: int, kind: str) -> bool:
-        """Stop evidence after the stop's write boundary; later motion voids it."""
+    def _last(self, keys: tuple[SeenKey, ...]) -> int:
+        return max(self._seen.get(key, 0) for key in keys)
+
+    def _rest_and_motion(self, kind: str) -> tuple[int, int]:
         stopped_code = 40507 if kind in ("grinder", "calibration") else 40511
-        stopped = False
-        for seen, packet in self._received_events:
-            if seen <= revision:
-                continue
-            payload = packet.payload
-            state = (
-                int.from_bytes(payload[:4], "little")
-                if packet.command == 8023 and len(payload) >= 4
-                else None
-            )
-            if packet.command == stopped_code or state == 1:
-                stopped = True
-            elif state in MOTION_STATES or packet.command in (9003, 9005):
-                stopped = False
-        return stopped
+        return self._last(((stopped_code, None), (8023, 1))), self._last(MOTION_KEYS)
+
+    def _stopped_since(self, revision: int, kind: str, stopped: bool) -> bool:
+        """The newest stop or motion evidence after ``revision`` decides;
+        without any, ``stopped`` (prior completion) stands."""
+        rest, motion = self._rest_and_motion(kind)
+        return rest > motion if max(rest, motion) > revision else stopped
+
+    def _moving(self, op: Operation) -> bool:
+        rest, motion = self._rest_and_motion(op.kind)
+        return motion > max(rest, op._since)
 
     async def _send_stop(self, op: Operation) -> None:
         boundary: list[int] = []
@@ -1238,15 +1301,22 @@ class Interaction(MachineControls, ReadOnlyClient):
             )
             op.stop_acknowledged = True
             await asyncio.sleep(self.transition_delay)
-            # Completion evidence observed before the stop is kept.
-            op.stop_observed = op.stop_observed or self._stopped_since(
-                boundary[0], op.kind
-            )
-        except Exception as exc:
-            op.stop_acknowledged = False
-            op.status = "unknown"
-            op.error = f"Stop unconfirmed: {type(exc).__name__}: {exc}"
-            self._uncertain = True
+        except BaseException as exc:
+            if not op.stop_acknowledged:
+                op.stop_acknowledged = False
+                op.status = "unknown"
+                op.error = f"Stop unconfirmed: {type(exc).__name__}: {exc}"
+                self._uncertain = True
+            if not isinstance(exc, Exception):
+                raise
+        finally:
+            # Completion observed before the stop (its own stop evidence) counts
+            # from launch; otherwise only evidence after the stop's write
+            # boundary counts. Either way newer motion voids it, even when the
+            # stop itself was only acknowledged.
+            since = op._since if op.stop_observed else boundary[0] if boundary else None
+            if since is not None:
+                op.stop_observed = self._stopped_since(since, op.kind, op.stop_observed)
 
     async def stop(self) -> dict[str, Any] | None:
         op = self.operation

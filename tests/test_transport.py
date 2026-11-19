@@ -363,8 +363,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             log,
             [
                 ("before", 8022, frame(8022)),
-                ("guard",),
                 ("ble.outgoing_chunk", frame(8022).hex()),
+                ("guard",),
                 ("write", frame(8022)),
                 ("completed", 8022),
             ],
@@ -545,6 +545,144 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         payload = struct.pack("<ff", 100.0, 5.0)
         await transport._write_frame(frame(8104, payload))
         self.assertEqual(link.writes[0][10:18].hex(), "0000c8420000a040")
+
+
+class LifecycleRoundTwoTests(unittest.IsolatedAsyncioTestCase):
+    async def connected(self, link, **kwargs):
+        transport = ControlTransport(connector=link, **kwargs)
+        await transport.connect(lambda: None)
+        await transport.subscribe(lambda data: None)
+        return transport
+
+    async def test_explicit_cancelled_error_from_observers_is_suppressed(self):
+        # S5: synchronous observers cannot receive a task cancellation, so a
+        # CancelledError they raise is their own and never fails a write.
+        class Cancelling(Hooks):
+            def write_completed(self, packet):
+                super().write_completed(packet)
+                raise asyncio.CancelledError()
+
+            def write_failed(self, packet, error):
+                super().write_failed(packet, error)
+                raise asyncio.CancelledError()
+
+        def sink(kind, data):
+            raise asyncio.CancelledError()
+
+        log = []
+        link = Recording(log)
+        transport = await self.connected(link, hooks=Cancelling(log))
+        transport.event_sink = sink
+        for code in (4507, 8022):
+            await transport._write_frame(frame(code))
+        link.fail_commands[8022] = TimeoutError("radio")
+        with self.assertRaisesRegex(TimeoutError, "radio"):
+            await transport._write_frame(frame(8022))
+        self.assertEqual([p.command for p in link.sent], [4507, 8022, 8022])
+        self.assertEqual(log[-1], ("failed", 8022, "TimeoutError"))
+
+    async def test_real_cancellation_at_awaited_write_still_propagates(self):
+        # S5: only synchronous observer errors are suppressed.
+        class Slow(Recording):
+            async def write(self, data):
+                await asyncio.sleep(10)
+
+        log = []
+        transport = await self.connected(Slow(log), hooks=Hooks(log))
+        writing = asyncio.create_task(transport._write_frame(frame(8022)))
+        await asyncio.sleep(0.01)
+        writing.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await writing
+        self.assertEqual(log[-1], ("failed", 8022, "CancelledError"))
+
+    async def test_observer_runs_before_guard_and_ack_arming(self):
+        # S6: each chunk's observer runs before the first-byte guard and the
+        # final-chunk arming, so neither can be invalidated by the observer;
+        # the transcript stays byte-for-byte identical to the writes.
+        log = []
+        link = Recording(log)
+        transport = await self.connected(link)
+        transport.event_sink = lambda kind, data: log.append((kind, data["hex"]))
+        transport.command_guard = lambda: log.append(("guard",))
+        transport.on_transmit = lambda: log.append(("arm",))
+        raw = frame(8004, bytes(range(20)))
+        await transport._write_frame(raw)
+        first, last = raw[:20], raw[20:]
+        self.assertEqual(
+            log,
+            [
+                ("ble.outgoing_chunk", first.hex()),
+                ("guard",),
+                ("write", first),
+                ("ble.outgoing_chunk", last.hex()),
+                ("arm",),
+                ("write", last),
+            ],
+        )
+        outgoing = [h for kind, *h in log if kind == "ble.outgoing_chunk"]
+        self.assertEqual(bytes.fromhex("".join(h[0] for h in outgoing)), raw)
+
+    async def test_guard_rejection_after_observer_marks_chunk_withheld(self):
+        # S6: an update during the observer is seen by the guard; the observed
+        # chunk is reported withheld, so the transcript never claims a write.
+        log = []
+        link = Recording(log)
+        transport = await self.connected(link, hooks=Hooks(log))
+        changed = []
+        transport.event_sink = lambda kind, data: (
+            log.append((kind, data["hex"], data.get("error"))),
+            changed.append(True),
+        )
+
+        def guard():
+            if changed:
+                raise RuntimeError("context changed")
+
+        transport.command_guard = guard
+        with self.assertRaisesRegex(RuntimeError, "context changed"):
+            await transport._write_frame(frame(8022))
+        self.assertEqual(link.writes, [])
+        self.assertEqual(
+            log[1:],
+            [
+                ("ble.outgoing_chunk", frame(8022).hex(), None),
+                (
+                    "ble.outgoing_chunk_withheld",
+                    frame(8022).hex(),
+                    "RuntimeError: context changed",
+                ),
+                ("failed", 8022, "RuntimeError"),
+            ],
+        )
+
+    async def test_interrupted_unsubscribe_blocks_writes_and_resubscribe_recovers(
+        self,
+    ):
+        # S3: writes stop being admitted before stop_notify; an interrupted
+        # stop_notify is retried before the next registration.
+        class Stuck(ScriptedConnector):
+            fail = True
+
+            async def stop_notify(self):
+                await super().stop_notify()
+                if self.fail:
+                    raise OSError("radio")
+
+        link = Stuck(responder=lambda packet: [])
+        transport = await self.connected(link)
+        with self.assertRaisesRegex(OSError, "radio"):
+            await transport.unsubscribe()
+        with self.assertRaisesRegex(ConnectionError, "subscribed"):
+            await transport._write_frame(frame(8022))
+        link.fail = False
+        await transport.subscribe(lambda data: None)
+        await transport._write_frame(frame(8022))
+        self.assertEqual(
+            link.calls,
+            ["connect", "start_notify", "stop_notify", "stop_notify", "start_notify"],
+        )
+        self.assertEqual([p.command for p in link.sent], [8022])
 
 
 if __name__ == "__main__":

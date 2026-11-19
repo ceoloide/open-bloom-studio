@@ -14,7 +14,11 @@ Lifecycle, for each session the library owns:
    as ``bytes`` on the event loop. Notifications may split or join frames.
 3. ``write(data)`` sends one chunk of at most ``write_size`` bytes as a write
    without response. The library never overlaps two writes on one link and
-   never retries a write; an exception means delivery is unknown.
+   never retries a write; an exception means delivery is unknown. A write
+   should end promptly when cancelled: a timed command, such as a grinder
+   pulse, cancels a final write still pending at its deadline and requests
+   stop once it returns. A write that ignores cancellation holds the link,
+   and delays that stop, until it returns.
 4. ``stop_notify()`` ends notifications; ``disconnect()`` closes the link and
    must be safe to call when already closed or after a failed connect.
 
