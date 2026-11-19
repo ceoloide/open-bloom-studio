@@ -791,6 +791,31 @@ class LifecycleRoundThreeTests(unittest.IsolatedAsyncioTestCase):
             await c.disconnect()
 
 
+class LifecycleRoundFourTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_registration_discards_an_old_fragment(self):
+        # S3: a frame begun under one registration is never completed by the
+        # next one's notifications; a fresh standalone ACK is decoded intact.
+        link = ScriptedConnector("sim-fragment")
+        c = ReadOnlyClient(
+            connector=link, settle=0, subscription_settle=0, handshake_timeout=0.2
+        )
+        async with c:
+            fragment = reply(8023, u32(0x22))[:10]
+            link._callback(fragment)
+            self.assertEqual(bytes(c._frames.buffer), fragment)
+            await c.unsubscribe()
+            await c.subscribe()
+            errors = c.snapshot()["decode_errors"]
+            packets = len(c.packets)
+            await c.open_session()
+            self.assertTrue(c.snapshot()["session_ready"])
+            self.assertEqual(c.snapshot()["decode_errors"], errors)
+            self.assertEqual(c.packets[packets].command, 8100)
+            self.assertNotEqual(
+                c.snapshot()["fields"]["machine_state_code"]["value"], 0x22
+            )
+
+
 class BoundedWaitTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_racing_completion_still_propagates(self):
         async def instant():

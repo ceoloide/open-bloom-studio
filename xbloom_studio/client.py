@@ -310,8 +310,11 @@ class ReadOnlyClient:
         return notification
 
     def _new_registration(self, link: _Link) -> _Registration:
-        """Start a registration whose handshake state owes nothing to earlier ones."""
+        """Start a registration whose handshake and framing state owe nothing
+        to earlier ones: bytes of a frame begun under an earlier registration
+        can never be completed by, or corrupt, this one's notifications."""
         registration = self._registration = _Registration(link)
+        self._frames = FrameBuffer()
         self._ack.clear()
         self._handshake_armed = False
         self._session_error = None

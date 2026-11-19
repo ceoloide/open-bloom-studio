@@ -17,6 +17,7 @@ from xbloom_studio import (
     UnsupportedStageError,
     UntestedOperationError,
 )
+from xbloom_studio.control import STOP_CODES
 from xbloom_studio.protocol import decode
 
 
@@ -1838,6 +1839,336 @@ class LifecycleRoundThreeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("budget", result["error"])
             self.assertTrue(result["stop_acknowledged"])
             self.assertTrue(session.get_state()["recovery_required"])
+
+
+def _split_start(code, inject):
+    """Transcript sink that runs ``inject`` after the first chunk of ``code``."""
+    start = code.to_bytes(2, "little")
+    chunks, kinds = [], []
+
+    def sink(kind, data):
+        kinds.append(kind)
+        raw = bytes.fromhex(data["hex"])
+        if kind != "ble.outgoing_chunk":
+            return
+        if raw[:1] == b"\x58" and raw[3:5] == start:
+            chunks.append(raw)
+        elif len(chunks) == 1:
+            chunks.append(raw)
+            inject()
+
+    return sink, chunks, kinds
+
+
+class LifecycleRoundFourTests(unittest.IsolatedAsyncioTestCase):
+    async def withheld_start(self, m, inject):
+        """Start water, run ``inject`` between its chunks; return the session."""
+        sink, chunks, kinds = _split_start(4506, inject)
+        session = interaction(m)
+        await session.__aenter__()
+        session.transport.event_sink = sink
+        op = await session.start_water(volume_ml=10)
+        result = await asyncio.wait_for(op.wait(), 2)
+        self.assertIn("ble.outgoing_chunk_withheld", kinds)
+        self.assertEqual(m.writes[-1], chunks[0])
+        self.assertNotIn(4506, m.codes())
+        return session, result
+
+    async def test_partial_frame_blocks_handshake_after_resubscribe(self):
+        # S2: the frame-boundary precondition is shared by the handshake. A
+        # new subscription does not reset the peripheral's parser, so the
+        # latch survives it and no handshake bytes complete the begun frame.
+        m = Machine()
+        session, result = await self.withheld_start(m, lambda: m.emit(40517))
+        try:
+            self.assertTrue(session._partial_frame)
+            writes = len(m.writes)
+            await session.unsubscribe()
+            await session.subscribe()
+            with self.assertRaisesRegex(SessionError, "partially written"):
+                await session.open_session()
+            self.assertEqual(len(m.writes), writes)
+            self.assertFalse(session.snapshot()["session_ready"])
+            self.assertTrue(session._partial_frame)
+        finally:
+            await session.disconnect()
+        self.assertEqual(len(m.writes), writes)
+
+    async def test_stale_water_or_source_at_final_chunk_withholds_it(self):
+        # S2: water sufficiency and the effective source are rechecked
+        # immediately before the final chunk, not only at byte one.
+        for inject, message in (
+            (lambda m: m.emit(8015, _units(1)), "Water source changed"),
+            (lambda m: m.emit(40521, identity_block(water=0)), "sufficiency"),
+            (lambda m: m.emit(8015, _units(7)), "configuration unknown"),
+        ):
+            m = Machine()
+            session, result = await self.withheld_start(
+                m, lambda m=m, inject=inject: inject(m)
+            )
+            try:
+                self.assertIn(message, result["error"])
+                self.assertTrue(session.get_state()["recovery_required"])
+                with self.assertRaisesRegex(SessionError, "partially written"):
+                    await session._command(8022)
+            finally:
+                await session.disconnect()
+
+    async def test_actionable_water_report_is_a_fault_before_the_source(self):
+        # S2: a 40522 other than the known low-water code requires recovery
+        # even when the source report is unknown at the same boundary, and
+        # stays a fault after benign telemetry. Known low water remains an
+        # ordinary refusal, also after a later refill report.
+        for during, fault in (
+            (lambda m: (m.emit(40522, u32(3)), m.emit(8015, _units(7))), True),
+            (lambda m: (m.emit(8015, _units(7)), m.emit(40522, u32(3))), True),
+            (lambda m: (m.emit(40522, b"\1"), m.emit(40521, identity_block())), True),
+            (lambda m: (m.emit(40522, u32(0)), m.emit(8015, _units(7))), False),
+            (lambda m: (m.emit(40522, u32(0)), m.emit(40521, identity_block())), False),
+        ):
+            m = Machine()
+            result, state = await _held_start(m, lambda m=m, d=during: d(m))
+            self.assertNotIn(4506, m.codes())
+            if fault:
+                self.assertIn("fault before start", result["error"])
+                self.assertTrue(state["recovery_required"])
+            else:
+                self.assertIn("Water", result["error"])
+                self.assertEqual(result["cleanup_status"], "completed")
+                self.assertFalse(state["recovery_required"])
+
+    async def test_selected_source_survives_unknown_report_only(self):
+        # S2: an acknowledged selection wins over an unknown source report,
+        # but not over insufficiency, an invalid identity shape or a fault.
+        m = Machine()
+        m.studio.auto_complete = True
+        async with interaction(m) as session:
+            session._selected_water_source = 1
+            m.emit(8015, _units(7))
+            result = await (await session.start_water(volume_ml=10)).wait()
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(_start_source(m), 1)
+            m.emit(40521, identity_block(water=0))
+            with self.assertRaisesRegex(SessionError, "sufficiency"):
+                await session.start_water(volume_ml=10)
+            m.emit(40521, identity_block(size=41))
+            with self.assertRaisesRegex(SessionError, "configuration unknown"):
+                await session.start_water(volume_ml=10)
+        self.assertEqual(m.codes().count(4506), 1)
+        m = Machine()
+
+        def during():
+            m.emit(8015, _units(7))
+            m.emit(40517)
+
+        gate = Gate(4506, action=during)
+        gate.release.set()
+        async with interaction(m, command_hooks=gate) as session:
+            session._selected_water_source = 1
+            result = await (await session.start_water(volume_ml=10)).wait()
+            self.assertIn("fault before start", result["error"])
+            self.assertTrue(session.get_state()["recovery_required"])
+        self.assertNotIn(4506, m.codes())
+
+    async def test_one_actuator_stop_never_ends_the_others_motion(self):
+        # S2: admission keeps grinder and brewer evidence apart; only each
+        # actuator's own stop, or a machine-wide state report, ends it.
+        for motion, wrong, right in (
+            ((9003, b""), 40511, 40507),
+            ((9005, u32(0) * 3), 40507, 40511),
+        ):
+            m = Machine()
+            async with interaction(m) as session:
+                m.emit(*motion)
+                m.emit(wrong)
+                with self.assertRaisesRegex(BusyError, "motion"):
+                    await session.start_water(volume_ml=10)
+                m.emit(right)
+                session._require_idle()
+                m.emit(*motion)
+                m.emit(wrong)
+                m.state(1)
+                session._require_idle()
+            self.assertEqual(m.codes(), [8100])
+        # Operation status: a grinder stop cannot confirm a grinder operation
+        # while brewer motion reported during it is outstanding.
+        m = Machine()
+        m.overrides[3505] = lambda p: [reply(3505), reply(40507)]
+        async with interaction(m) as session:
+            await session.start_grinder(size=5, rpm=80, duration_s=5)
+            await transmitted(m, 3500)
+            m.emit(9005, u32(0) * 3)
+            result = await session.stop()
+            self.assertTrue(result["stop_acknowledged"])
+            self.assertFalse(result["stop_observed"])
+            self.assertEqual(result["status"], "unknown")
+            self.assertTrue(session.get_state()["recovery_required"])
+
+    async def test_brewer_stop_cannot_revive_superseded_recipe_completion(self):
+        # S11: completion followed by newer motion stays superseded although
+        # a later brewer stop event (no idle) ends that motion.
+        m = Machine()
+        async with interaction(m) as session:
+            op = await session.start_recipe(EncodedRecipe(b"x", 10))
+            await transmitted(m, 8002)
+            m.state(0x24)
+            m.emit(9005, u32(0) * 3)
+            m.emit(40511)
+            await asyncio.sleep(0.15)
+            self.assertFalse(op.done)
+            result = await session.stop()
+            self.assertIn(40519, m.codes())
+            self.assertEqual(result["status"], "stopped")
+            self.assertTrue(result["stop_observed"])
+
+    async def test_alternate_recipe_completion_needs_the_current_interval(self):
+        # S11: an executed report and idle from before newer motion do not
+        # qualify after that motion ends; a fresh executed report does.
+        m = Machine()
+        async with interaction(m) as session:
+            op = await session.start_recipe(EncodedRecipe(b"x", 10))
+            await transmitted(m, 8002)
+            m.emit(40513)
+            m.state(1)
+            m.state(0x23)
+            m.state(1)
+            await asyncio.sleep(0.15)
+            self.assertFalse(op.done)
+            m.emit(40513)
+            result = await asyncio.wait_for(op.wait(), 1)
+            self.assertEqual(result["status"], "completed")
+            self.assertNotIn(40519, m.codes())
+
+    async def test_superseded_natural_completion_does_not_end_operation(self):
+        # S11: water, grinder and calibration completion followed by newer
+        # relevant motion neither ends the operation nor reports completion.
+        cases = (
+            ("water", 4506, (40511, b""), lambda m: m.state(0x23)),
+            ("grinder", 3500, (40507, b""), lambda m: m.emit(9003)),
+            ("calibration", 3502, (40526, u32(85)), lambda m: m.state(0x22)),
+        )
+        for kind, code, completion, motion in cases:
+            m = Machine()
+            async with interaction(m, allow_untested=True) as session:
+                if kind == "water":
+                    op = await session.start_water(volume_ml=10)
+                elif kind == "grinder":
+                    op = await session.start_grinder(size=5, rpm=80, duration_s=5)
+                else:
+                    op = await session.start_grinder_calibration()
+                await transmitted(m, code)
+                m.emit(*completion)
+                motion(m)
+                await asyncio.sleep(0.15)
+                self.assertFalse(op.done, kind)
+                result = await session.stop()
+                self.assertEqual(result["status"], "stopped", kind)
+                self.assertTrue(result["stop_observed"], kind)
+
+    async def test_rest_first_reported_during_cleanup_confirms_the_stop(self):
+        # S11: final reconciliation keeps the stop's write boundary, so rest
+        # first reported during later cleanup confirms the stop; a retained
+        # pre-stop rest report or another actuator's stop never does.
+        cases = (
+            ("water", 8013, [reply(40511)], True),
+            ("recipe", 8022, [reply(8023, u32(0x24))], True),
+            ("water", 8013, [reply(40507)], False),
+            ("water", None, [], False),
+        )
+        for kind, cleanup, rest, observed in cases:
+            m = Machine()
+            m.overrides[4506] = lambda p: [reply(4506)]
+            m.overrides[8002] = lambda p: [reply(8002)]
+            stop = STOP_CODES[kind]
+            m.overrides[stop] = lambda p, s=stop: [reply(s)]
+            m.overrides[8022] = lambda p: [reply(8022)]
+            async with interaction(m, start_timeout=5) as session:
+                if kind == "water":
+                    op = await session.start_water(volume_ml=10)
+                    await transmitted(m, 4506)
+                else:
+                    op = await session.start_recipe(EncodedRecipe(b"x", 10))
+                    await transmitted(m, 8002)
+                if cleanup is not None:
+                    m.overrides[cleanup] = lambda p, c=cleanup, r=rest: [reply(c), *r]
+                else:
+                    m.state(1)  # retained from before the stop
+                result = await session.stop()
+                self.assertTrue(result["stop_acknowledged"])
+                self.assertEqual(result["stop_observed"], observed, (kind, rest))
+                self.assertEqual(result["status"], "stopped")
+                self.assertEqual(result["cleanup_status"], "completed")
+                self.assertIsNotNone(op._stop_boundary)
+
+    async def test_write_timeout_before_pulse_deadline_cancels_once(self):
+        # A4: the write bound expires first and the connector drains its
+        # cancelled final start write past the pulse deadline too. One
+        # decision cancels the one write task once; the command keeps the
+        # lock and transport hooks until the connector returns; the stop
+        # follows strictly after, and nothing leaks or overlaps.
+        class Draining(Machine):
+            resist = 0.3
+            active = 0
+            overlap = False
+            cancels = 0
+            drained_at = None
+
+            async def write(self, data):
+                self.active += 1
+                self.overlap = self.overlap or self.active > 1
+                try:
+                    sent = len(self.sent)
+                    await super().write(data)
+                    if len(self.sent) > sent and self.sent[-1].command == 3500:
+                        await self.suspend()
+                finally:
+                    self.active -= 1
+
+            async def suspend(self):
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    self.cancels += 1
+                    end = time.monotonic() + self.resist
+                    while (left := end - time.monotonic()) > 0:
+                        try:
+                            await asyncio.sleep(left)
+                        except asyncio.CancelledError:
+                            self.cancels += 1  # never interrupts cleanup
+                    self.drained_at = time.monotonic()
+                    raise
+
+        for stop_while_draining in (False, True):
+            m = Draining()
+            times = {}
+            m.overrides[3505] = lambda p, m=m, t=times: (
+                t.setdefault(3505, time.monotonic()),
+                m.studio(p),
+            )[1]
+            async with interaction(m, ack_timeout=1, write_timeout=0.1) as session:
+                started = time.monotonic()
+                op = await session.start_grinder(size=5, rpm=80, duration_s=0.2)
+                if stop_while_draining:
+                    await until(lambda m=m: m.cancels > 0)
+                    stopping = asyncio.create_task(session.stop())
+                    await asyncio.sleep(0.15)  # past the pulse deadline
+                    self.assertFalse(stopping.done())
+                    result = await asyncio.wait_for(stopping, 3)
+                else:
+                    result = await asyncio.wait_for(op.wait(), 3)
+                self.assertEqual(m.cancels, 1)
+                self.assertFalse(m.overlap)
+                self.assertGreaterEqual(m.drained_at - started, 0.1 + m.resist)
+                self.assertGreaterEqual(times[3505], m.drained_at)
+                self.assertEqual(m.codes().count(3500), 1)
+                self.assertEqual(m.codes().count(3505), 1)
+                self.assertTrue(result["stop_acknowledged"])
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("write_timeout", result["error"])
+                self.assertTrue(session.get_state()["recovery_required"])
+                self.assertIsNone(session.transport.on_transmit)
+                self.assertIsNone(session.transport.command_guard)
+                self.assertFalse(session._commands.locked())
 
 
 class EncodedRecipeTests(unittest.TestCase):
