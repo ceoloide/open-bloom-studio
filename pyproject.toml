@@ -17,11 +17,15 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.optional-dependencies]
+ble = ["bleak>=1.0,<3"]
+
 [project.urls]
 Repository = "https://github.com/ceoloide/open-bloom-studio"
 
 [dependency-groups]
 dev = [
+    "bleak>=1.0,<3",
     "coverage>=7.10",
     "mypy>=2.4",
     "ruff>=0.17",
@@ -31,7 +35,7 @@ dev = [
 include = ["xbloom_studio*"]
 
 [tool.setuptools.package-data]
-xbloom_studio = ["py.typed"]
+xbloom_studio = ["commands.json", "py.typed"]
 
 [tool.uv]
 required-version = ">=0.11.28"
@@ -51,4 +55,4 @@ source = ["xbloom_studio", "scripts"]
 
 [tool.coverage.report]
 include_namespace_packages = true
-exclude_also = ['if __name__ == "__main__":']
+exclude_also = ['if __name__ == "__main__":', "if TYPE_CHECKING:"]

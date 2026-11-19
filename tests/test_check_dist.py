@@ -182,6 +182,43 @@ class ArtifactTest(unittest.TestCase):
         problems = self.check(sdist=sdist_files(**{".env.local": b"example"}))
         self.assertIn("sdist:.env.local:0: forbidden file type", problems)
 
+    def test_requires_file_follows_declared_dependencies(self):
+        egg = "open_bloom_studio.egg-info"
+        requires = {f"{egg}/requires.txt": b"[ble]\nexample\n"}
+        self.assertIn(
+            f"sdist unexpected file: {egg}/requires.txt",
+            self.check(sdist=sdist_files(**requires)),
+        )
+        declared = (
+            METADATA + 'Requires-Dist: example; extra == "ble"\nProvides-Extra: ble\n'
+        )
+        metadata = {f"{STEM}.dist-info/METADATA": declared.encode()}
+        sdist = sdist_files(
+            **requires,
+            **{"PKG-INFO": declared.encode(), f"{egg}/PKG-INFO": declared.encode()},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            wheel_path = write_wheel(Path(directory), wheel_files(**metadata))
+            sdist_path = write_sdist(Path(directory), sdist)
+            want = check_dist.expected_metadata(
+                check_dist.parse_metadata(declared.encode())
+            )
+            self.assertEqual(
+                check_dist.check_artifacts(sdist_path, wheel_path, SOURCES, want), []
+            )
+            missing = write_sdist(
+                Path(directory),
+                sdist_files(
+                    **{
+                        "PKG-INFO": declared.encode(),
+                        f"{egg}/PKG-INFO": declared.encode(),
+                    }
+                ),
+                name="other.tar.gz",
+            )
+            problems = check_dist.check_artifacts(missing, wheel_path, SOURCES, want)
+            self.assertIn(f"sdist missing file: {egg}/requires.txt", problems)
+
     def test_sdist_layout_is_strict(self):
         for kwargs in ({"prefix": "other"}, {"link": "alias"}):
             path = write_sdist(self.dir, sdist_files(), **kwargs)
