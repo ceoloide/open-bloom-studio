@@ -124,7 +124,11 @@ def read_export(
                 sensitive = (
                     parsed.username
                     or parsed.password
-                    or any(credential_key(k) for k, _ in parse_qsl(parsed.query))
+                    or any(
+                        credential_key(key)
+                        for params in (parsed.query, parsed.fragment)
+                        for key, _ in parse_qsl(params)
+                    )
                 )
             except ValueError:
                 sensitive = True

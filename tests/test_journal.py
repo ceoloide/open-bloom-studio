@@ -194,7 +194,8 @@ class FailureTest(JournalTestCase):
         with self.assertRaisesRegex(RuntimeError, "disk full"):
             await self.recorder.flush()
 
-    async def test_cancelled_flush_records_the_write_outcome(self):
+    async def test_cancelled_flush_records_the_write_outcome_at_capacity_one(self):
+        self.recorder.slots = threading.BoundedSemaphore(1)
         started, release = threading.Event(), threading.Event()
         original = self.store.append
 
@@ -214,8 +215,11 @@ class FailureTest(JournalTestCase):
             finally:
                 release.set()
             await self.recorder.flush()
+            self.recorder.emit("after", {})
+            await self.recorder.flush()
         self.assertEqual(self.machine.codes(), [])
         self.assertEqual(self.kinds(4506), ["command.intent", "command.write_failed"])
+        self.assertIn("after", self.kinds())
 
     async def test_cancelled_gap_flush_does_not_duplicate_the_gap(self):
         self.recorder.slots = threading.BoundedSemaphore(1)
@@ -225,6 +229,15 @@ class FailureTest(JournalTestCase):
             threading.Event(),
         )
         original = self.store.append
+        submit = self.recorder.executor.submit
+        reported_at_completion = []
+
+        def observe_submit(*args, **kwargs):
+            future = submit(*args, **kwargs)
+            future.add_done_callback(
+                lambda _: reported_at_completion.append(self.recorder.reported_lost)
+            )
+            return future
 
         def blocked(kind, data, **context):
             if kind == "hold":
@@ -235,7 +248,12 @@ class FailureTest(JournalTestCase):
                 release.wait(5)
             return original(kind, data, **context)
 
-        with mock.patch.object(self.store, "append", side_effect=blocked):
+        with (
+            mock.patch.object(self.store, "append", side_effect=blocked),
+            mock.patch.object(
+                self.recorder.executor, "submit", side_effect=observe_submit
+            ),
+        ):
             try:
                 self.recorder.emit("hold", {})
                 self.assertTrue(await asyncio.to_thread(started.wait, 1))
@@ -253,6 +271,7 @@ class FailureTest(JournalTestCase):
             with self.assertRaisesRegex(RuntimeError, "queue full"):
                 await self.recorder.flush()
         self.assertEqual(self.kinds().count("capture.gap"), 1)
+        self.assertEqual(reported_at_completion, [0, 1])
 
     async def test_stalled_writer_and_full_queue_do_not_block_stop(self):
         self.recorder.slots = threading.BoundedSemaphore(2)

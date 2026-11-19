@@ -123,16 +123,23 @@ class Recorder:
                 self._capture_depth -= 1
 
     def emit(self, kind: str, data: Any) -> None:
+        self._emit(kind, data)
+
+    def _emit(
+        self, kind: str, data: Any, *, reserved: bool = False, release: bool = True
+    ) -> bool:
         with self.lock:
             if self.closed:
+                if reserved:
+                    self.slots.release()
                 self._fail(RuntimeError("Event arrived after journal closed"))
-                return
+                return False
             if self._idle(kind):
-                return
-            if not self.slots.acquire(blocking=False):
+                return False
+            if not reserved and not self.slots.acquire(blocking=False):
                 self.lost += 1
                 self._fail(RuntimeError("Capture queue full; recording incomplete"))
-                return
+                return False
             self.sequence += 1
             context: dict[str, Any] = {
                 "session_id": self.session_id,
@@ -146,21 +153,25 @@ class Recorder:
             self.last = self.executor.submit(
                 self.store.append, kind, deepcopy(data), **context
             )
-            self.last.add_done_callback(self._finished)
+            self.last.add_done_callback(partial(self._finished, release))
+            return True
 
-    def _finished(self, future: Future[Any]) -> None:
+    def _finished(self, release: bool, future: Future[Any]) -> None:
         with self.lock:
             self.pending -= 1
-            self.slots.release()
+            if release:
+                self.slots.release()
             try:
                 future.result()
             except BaseException as exc:
                 self._fail(exc)
 
-    def _gap_finished(self, lost: int, future: Future[Any]) -> None:
+    def _append_gap(self, lost: int, **context: Any) -> None:
+        self.store.append(
+            "capture.gap", {"lost_events": lost, "reason": "queue_overflow"}, **context
+        )
         with self.lock:
-            if future.exception() is None:
-                self.reported_lost = lost
+            self.reported_lost = lost
 
     async def flush(self) -> None:
         """Wait until every queued event is committed; raise if any was not.
@@ -176,16 +187,14 @@ class Recorder:
                     self.sequence += 1
                     lost = self.lost
                     future = self.executor.submit(
-                        self.store.append,
-                        "capture.gap",
-                        {"lost_events": lost, "reason": "queue_overflow"},
+                        self._append_gap,
+                        lost,
                         session_id=self.session_id,
                         sequence=self.sequence,
                         operation_id=self.operation_id,
                         device=self.device,
                     )
                     self.last = self._gap = future
-                    future.add_done_callback(partial(self._gap_finished, lost))
             if future is not None:
                 await asyncio.shield(asyncio.wrap_future(future))
         except Exception as exc:
@@ -212,17 +221,29 @@ class JournalHooks:
 
     def __init__(self, recorder: Recorder) -> None:
         self.recorder = recorder
+        self._reserved: set[int] = set()
 
     async def before_write(self, packet: Packet, frame: bytes) -> None:
-        self.recorder.emit(
-            "command.intent", {"command": packet.command, "frame_hex": frame.hex()}
-        )
+        # One slot covers both halves of the attempt, even if cancellation
+        # queues the outcome before the intent has finished committing.
+        if self.recorder._emit(
+            "command.intent",
+            {"command": packet.command, "frame_hex": frame.hex()},
+            release=False,
+        ):
+            self._reserved.add(id(packet))
         await self.recorder.flush()
 
+    def _outcome(self, packet: Packet, kind: str, data: dict[str, Any]) -> None:
+        key = id(packet)
+        reserved = key in self._reserved
+        self._reserved.discard(key)
+        self.recorder._emit(
+            kind, {"command": packet.command, **data}, reserved=reserved
+        )
+
     def write_completed(self, packet: Packet) -> None:
-        self.recorder.emit("command.write_completed", {"command": packet.command})
+        self._outcome(packet, "command.write_completed", {})
 
     def write_failed(self, packet: Packet, error: BaseException) -> None:
-        self.recorder.emit(
-            "command.write_failed", {"command": packet.command, "error": repr(error)}
-        )
+        self._outcome(packet, "command.write_failed", {"error": repr(error)})
