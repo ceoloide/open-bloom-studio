@@ -151,8 +151,16 @@ class Studio:
         transport = self.client.transport
         device = getattr(transport, "device", self.client.address)
         connector = getattr(transport, "connector", None)
-        if "transport" not in kwargs and "connector" not in kwargs and connector:
-            kwargs["connector"] = connector
+        if "transport" not in kwargs:
+            if "connector" not in kwargs and connector:
+                kwargs["connector"] = connector
+            # The client's journal and transcript observer carry over, so a
+            # control context is never silently unjournaled.
+            hooks = getattr(transport, "hooks", None)
+            if "command_hooks" not in kwargs and hooks is not None:
+                kwargs["command_hooks"] = hooks
+        if "event_sink" not in kwargs and self.client.event_sink is not None:
+            kwargs["event_sink"] = self.client.event_sink
         return Interaction(device, allow_control=allow_control, **kwargs)
 
     async def read_state(

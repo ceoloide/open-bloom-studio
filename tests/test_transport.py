@@ -392,6 +392,84 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p.command for p in link.sent], [4507, 3505, 40519, 40519])
         self.assertEqual(log[-1], ("completed", 40519))
 
+    async def test_transmit_hook_runs_immediately_before_final_chunk(self):
+        # S6: the ACK boundary is the chunk that completes the frame.
+        for payload, expected in ((bytes(range(41)), [2]), (b"", [0])):
+            link = ScriptedConnector(responder=lambda packet: [])
+            transport = ControlTransport(connector=link)
+            seen = []
+            writes = link.writes
+            transport.command_guard = lambda s=seen, w=writes: s.append(
+                ("guard", len(w))
+            )
+            transport.on_transmit = lambda s=seen, w=writes: s.append(len(w))
+            await transport.connect(lambda: None)
+            await transport.subscribe(lambda data: None)
+            await transport._write_frame(frame(8004, payload))
+            self.assertEqual(seen, [("guard", 0), *expected])
+
+    async def test_stop_journal_deadline_never_waits_for_resisting_hook(self):
+        # S5: a hook that resists cancellation runs on detached; the stop is
+        # written within its own bound and the hook's late failure is retrieved.
+        finished = asyncio.Event()
+
+        class Resisting(Hooks):
+            async def before_write(self, packet, frame_bytes):
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.3)
+                    finished.set()
+                    raise OSError("late journal") from None
+
+        log = []
+        link = Recording(log)
+        transport = ControlTransport(connector=link, hooks=Resisting(log))
+        await transport.connect(lambda: None)
+        await transport.subscribe(lambda data: None)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await asyncio.wait_for(transport._write_frame(frame(4507)), 0.2)
+        self.assertLess(loop.time() - started, 0.2)
+        self.assertEqual([p.command for p in link.sent], [4507])
+        self.assertEqual(len(transport._journals), 1)
+        await asyncio.wait_for(finished.wait(), 1)
+        await asyncio.sleep(0)
+        self.assertEqual(transport._journals, set())
+
+        class Broken(Hooks):
+            def before_write(self, packet, frame_bytes):
+                raise OSError("not even a coroutine")
+
+        transport.hooks = Broken(log)
+        await transport._write_frame(frame(3505))
+        self.assertEqual([p.command for p in link.sent], [4507, 3505])
+
+    async def test_observer_and_post_write_hook_failures_never_fail_writes(self):
+        # S5: transcript observers and post-write hooks cannot drop a frame,
+        # turn a sent frame into a failure or hide the original write error.
+        class Faulty(Hooks):
+            def write_completed(self, packet):
+                raise RuntimeError("observer")
+
+            def write_failed(self, packet, error):
+                raise RuntimeError("observer")
+
+        def sink(kind, data):
+            raise RuntimeError("transcript")
+
+        link = Recording([])
+        transport = ControlTransport(connector=link, hooks=Faulty([]))
+        transport.event_sink = sink
+        await transport.connect(lambda: None)
+        await transport.subscribe(lambda data: None)
+        for code in (4507, 8022):
+            await transport._write_frame(frame(code))
+        link.fail_commands[8022] = TimeoutError("radio")
+        with self.assertRaisesRegex(TimeoutError, "radio"):
+            await transport._write_frame(frame(8022))
+        self.assertEqual([p.command for p in link.sent], [4507, 8022, 8022])
+
     async def test_guard_or_link_failure_reports_write_failed(self):
         log = []
         link = Recording(log)

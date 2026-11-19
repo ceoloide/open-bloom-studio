@@ -108,9 +108,11 @@ class CommandHooks(Protocol):
 
     ``before_write`` runs after the frame passed its gate and before the
     command guard and the first byte; raising prevents the write, except for
-    stop commands, which wait at most ``STOP_HOOK_TIMEOUT`` and then proceed.
-    Exactly one of ``write_completed`` and ``write_failed`` follows a write
-    attempt. Neither may block.
+    stop commands, which wait at most ``STOP_HOOK_TIMEOUT`` and then proceed
+    without waiting for the cancelled hook to finish. Exactly one of
+    ``write_completed`` and ``write_failed`` follows a write attempt. Neither
+    may block; their exceptions are suppressed so an observer can never turn a
+    sent frame into a failure or hide the original write error.
     """
 
     async def before_write(self, packet: Packet, frame: bytes) -> None: ...
@@ -229,6 +231,11 @@ class BleakConnector:
             self._client = None
 
 
+def _retrieve(task: asyncio.Future[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
 class BleakTransport:
     """Read-only session transport; its only write is the fixed handshake.
 
@@ -238,6 +245,7 @@ class BleakTransport:
     """
 
     command_guard_after_journal = True
+    transmit_hook_before_final_chunk = True
 
     def __init__(
         self,
@@ -261,7 +269,11 @@ class BleakTransport:
         self.event_sink: EventSink | None = None
         # Runs after hooks.before_write and immediately before the first byte.
         self.command_guard: Callable[[], None] | None = None
+        # Runs immediately before the chunk that completes the frame: the
+        # earliest moment the machine can act on, or acknowledge, the command.
+        self.on_transmit: Callable[[], None] | None = None
         self._subscribed = False
+        self._journals: set[asyncio.Future[None]] = set()
 
     @property
     def identity(self) -> str:
@@ -295,14 +307,33 @@ class BleakTransport:
         finally:
             self._subscribed = False
 
+    async def _journal_stop(
+        self, hooks: CommandHooks, packet: Packet, frame: bytes
+    ) -> None:
+        """Give a stop's journal a bounded head start; never wait past it.
+
+        A hook that ignores or resists cancellation keeps running detached, so
+        it can neither delay the stop beyond ``STOP_HOOK_TIMEOUT`` nor consume
+        the bounded write that follows.
+        """
+        try:
+            journal = asyncio.ensure_future(hooks.before_write(packet, frame))
+        except Exception:
+            return
+        try:
+            await asyncio.wait({journal}, timeout=STOP_HOOK_TIMEOUT)
+        finally:
+            if not journal.done():
+                journal.cancel()
+                self._journals.add(journal)
+                journal.add_done_callback(self._journals.discard)
+            journal.add_done_callback(_retrieve)
+
     async def _send(self, frame: bytes, packet: Packet) -> None:
         hooks = self.hooks
         if hooks is not None:
             if packet.command in STOP_COMMANDS:
-                with suppress(Exception):
-                    await asyncio.wait_for(
-                        hooks.before_write(packet, frame), STOP_HOOK_TIMEOUT
-                    )
+                await self._journal_stop(hooks, packet, frame)
             else:
                 await hooks.before_write(packet, frame)
         try:
@@ -311,17 +342,23 @@ class BleakTransport:
             if not self._subscribed or not self.connector.is_connected:
                 raise ConnectionError("No subscribed control connection")
             for offset in range(0, len(frame), self._write_size):
+                if offset + self._write_size >= len(frame) and self.on_transmit:
+                    self.on_transmit()
                 await self._write_bytes(frame[offset : offset + self._write_size])
         except BaseException as exc:
             if hooks is not None:
-                hooks.write_failed(packet, exc)
+                with suppress(Exception):
+                    hooks.write_failed(packet, exc)
             raise
         if hooks is not None:
-            hooks.write_completed(packet)
+            with suppress(Exception):
+                hooks.write_completed(packet)
 
     async def _write_bytes(self, data: bytes) -> None:
         if self.event_sink is not None:
-            self.event_sink("ble.outgoing_chunk", {"hex": bytes(data).hex()})
+            # A transcript observer must never prevent or fail a write.
+            with suppress(Exception):
+                self.event_sink("ble.outgoing_chunk", {"hex": bytes(data).hex()})
         await self.connector.write(data)
 
 

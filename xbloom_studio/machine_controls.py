@@ -239,6 +239,8 @@ class MachineControls:
             active_operation: Operation | None = None,
             ack_payload: bytes | None = None,
             before_write: Callable[[], None] | None = None,
+            on_transmit: Callable[[], None] | None = None,
+            ack_budget: float | None = None,
         ) -> Packet: ...
 
         def _require_idle(self, *, allow_no_water: bool = False) -> None: ...

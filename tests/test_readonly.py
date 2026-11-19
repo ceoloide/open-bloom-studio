@@ -7,7 +7,7 @@ from contextlib import aclosing
 from unittest import mock
 
 from tests import fake_bleak
-from tests.frames import ACK, frame, identity_block, reply, u32
+from tests.frames import ACK, f32, frame, identity_block, reply, u32
 from xbloom_studio import (
     ProtocolCommandError,
     ReadOnlyClient,
@@ -472,6 +472,157 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             for _ in range(1000):
                 c._notification(SCALE)
             self.assertEqual(len(c.packets), 128)
+
+
+class OwnershipBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejected_rival_never_closes_a_shared_or_unopened_link(self):
+        # S1: a rival over the same connector, or one refused a lease, never
+        # opened the link, so its cleanup must not close it.
+        link, incumbent = scripted("00:00:5E:00:53:02")
+        async with incumbent:
+            rival = ReadOnlyClient(connector=link, settle=0, subscription_settle=0)
+            with self.assertRaisesRegex(SessionError, "owns"):
+                async with rival:
+                    pass
+            self.assertTrue(link.is_connected)
+            self.assertTrue(incumbent.snapshot()["connected"])
+            self.assertNotIn("disconnect", link.calls)
+        lease = AddressLease("SIM-LEASED")
+        lease.acquire()
+        try:
+            leased, c = scripted("sim-leased")
+            with self.assertRaisesRegex(ConnectionError, "Another library process"):
+                async with c:
+                    pass
+            self.assertEqual(leased.calls, [])
+        finally:
+            lease.release()
+
+    def test_injected_transport_identity_is_compared_with_device(self):
+        # S1: an injected transport's identity is normalized and must match an
+        # explicit device; a legacy transport without one uses the device.
+        transport = BleakTransport(connector=ScriptedConnector("Sim-3"))
+        self.assertEqual(ReadOnlyClient("sim-3", transport=transport).address, "SIM-3")
+        with self.assertRaisesRegex(ValueError, "differ"):
+            ReadOnlyClient("other", transport=transport)
+        self.assertEqual(
+            ReadOnlyClient("legacy", transport=FakeTransport()).address, "LEGACY"
+        )
+
+    async def test_handshake_ack_before_its_write_boundary_is_stale(self):
+        # S6: an ACK during the subscription settle or the pre-write hook is
+        # not an acknowledgment of a handshake that was not yet sent.
+        link, c = scripted(responder=SimulatedStudio(silent={8100}))
+        c.handshake_timeout = 0.05
+        c.subscription_settle = 0.02
+        await c.connect()
+        await c.subscribe()
+        opening = asyncio.create_task(c.open_session())
+        await asyncio.sleep(0)
+        link.notify(ACK)
+        with self.assertRaisesRegex(SessionError, "No handshake acknowledgment"):
+            await opening
+        await c.disconnect()
+
+        class Echo:
+            async def before_write(self, packet, frame_bytes):
+                link.notify(ACK)
+
+            def write_completed(self, packet):
+                pass
+
+            def write_failed(self, packet, error):
+                pass
+
+        link = ScriptedConnector(responder=SimulatedStudio(silent={8100}))
+        c = ReadOnlyClient(
+            connector=link,
+            command_hooks=Echo(),
+            settle=0,
+            subscription_settle=0,
+            handshake_timeout=0.05,
+        )
+        with self.assertRaisesRegex(SessionError, "No handshake acknowledgment"):
+            async with c:
+                pass
+
+    async def test_frames_before_a_corrupt_suffix_are_kept_and_reported(self):
+        # S7: valid frames before corruption are delivered; the notification
+        # is still reported as corrupt.
+        events = []
+        c = client(event_sink=lambda kind, details: events.append(kind))
+        async with c:
+            c._notification(reply(20501, f32(12.5)) + b"\x00garbage")
+            snapshot = c.snapshot()
+            self.assertEqual(snapshot["fields"]["scale_weight"]["value"], 12.5)
+            self.assertEqual(snapshot["decode_errors"], 1)
+            self.assertIn("header", snapshot["last_error"])
+            self.assertEqual(events[-2:], ["ble.packet", "ble.decode_error"])
+            c._notification(SCALE)
+            self.assertEqual(c.snapshot()["fields"]["scale_weight"]["value"], 0)
+
+    async def test_failing_incoming_observer_cannot_drop_telemetry_or_ack(self):
+        # S5: transcript observer failures never drop a notification.
+        class Picky:
+            def accepts(self, kind):
+                raise RuntimeError("filter")
+
+            def emit(self, kind, details):
+                raise AssertionError("filtered out")
+
+        def sink(kind, details):
+            raise RuntimeError("observer")
+
+        for event_sink in (sink, Picky().emit):
+            link = ScriptedConnector()
+            c = ReadOnlyClient(
+                connector=link, event_sink=event_sink, settle=0, subscription_settle=0
+            )
+            async with c:
+                snapshot = c.snapshot()
+                self.assertTrue(snapshot["session_ready"])
+                self.assertIn("serial_number", snapshot["fields"])
+
+    async def test_link_lost_while_connect_is_pending_is_not_connected(self):
+        # S9: an early disconnect cannot be overwritten by connected=True.
+        class Dropping(ScriptedConnector):
+            async def connect(self, on_disconnect):
+                await super().connect(on_disconnect)
+                await asyncio.sleep(0)
+                self.drop()
+
+        link = Dropping("sim-dropping")
+        c = ReadOnlyClient(connector=link, settle=0, subscription_settle=0)
+        with self.assertRaisesRegex(SessionError, "lost while connecting"):
+            await c.connect()
+        self.assertFalse(c.snapshot()["connected"])
+        self.assertEqual(link.calls, ["connect", "disconnect"])
+        async with scripted("sim-dropping")[1] as other:
+            self.assertTrue(other.snapshot()["session_ready"])
+
+    async def test_explicit_reconnect_after_link_loss_reuses_the_held_lease(self):
+        # S10: the lost session keeps ownership, reconnects with the same
+        # lease and ignores late callbacks from the lost link.
+        link, c = scripted("sim-reconnect")
+        async with c:
+            handle = c._lease._file
+            stale = link._on_disconnect
+            link.drop()
+            self.assertFalse(c.snapshot()["connected"])
+            rival = ReadOnlyClient(connector=ScriptedConnector("sim-reconnect"))
+            with self.assertRaisesRegex(SessionError, "owns"):
+                await rival.connect()
+            await c.connect()
+            await c.subscribe()
+            await c.open_session()
+            self.assertTrue(c.snapshot()["session_ready"])
+            self.assertIs(c._lease._file, handle)
+            stale()
+            self.assertTrue(c.snapshot()["connected"])
+        self.assertFalse(c._lease.held)
+        lease = AddressLease(c.address)
+        lease.acquire()
+        lease.release()
 
 
 class BoundedWaitTests(unittest.IsolatedAsyncioTestCase):

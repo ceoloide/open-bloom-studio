@@ -29,6 +29,8 @@ from .machine_controls import (
 )
 from .protocol import Packet, encode
 from .transport import (
+    STOP_COMMANDS,
+    STOP_HOOK_TIMEOUT,
     CommandHooks,
     ControlTransport,
     FrameTransport,
@@ -42,6 +44,7 @@ MOTION_STATES = (0x22, 0x23)
 SCALE_STATES = (4, 5)
 CONTEXT_STATES = (1, 0x0A, 0x41, 0x24, 4, 5)
 FAULT_EVENTS = (40517, 40522, 8203, 8204)
+WATER_KINDS = ("water", "recipe", "tea")
 MEASUREMENTS = (20501, 40523, 40521)
 STOP_CODES = {
     "water": 4507,
@@ -194,6 +197,8 @@ class Operation:
     _stop_requested: bool = field(default=False, repr=False)
     _paused: bool = field(default=False, repr=False)
     _final: dict[str, Any] | None = field(default=None, repr=False)
+    # Event revision at launch: faults after it block the start frame.
+    _since: int = field(default=0, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -227,6 +232,17 @@ class Operation:
 
 
 Waiter = tuple[tuple[int, int, "bytes | None"], "asyncio.Future[Packet]"]
+
+
+class _Progress:
+    """How far one command got: rejected by its guard, or transmitted."""
+
+    rejected = False
+    transmitted_at: float | None = None
+
+
+def _confirmed(future: asyncio.Future[Packet]) -> bool:
+    return future.done() and not future.cancelled() and future.exception() is None
 
 
 class Interaction(MachineControls, ReadOnlyClient):
@@ -317,11 +333,14 @@ class Interaction(MachineControls, ReadOnlyClient):
         await self.disconnect()
 
     async def unsubscribe(self) -> None:
-        if self._prepared is not None:
-            raise BusyError("Cancel the prepared recipe before disabling telemetry")
-        if self.operation is not None and not self.operation.done:
-            raise BusyError("Stop the active operation before disabling telemetry")
-        await super().unsubscribe()
+        # Check and unsubscribe under the lifecycle lock, so no operation or
+        # preparation is admitted between the check and the call.
+        async with self._lifecycle:
+            if self._prepared is not None:
+                raise BusyError("Cancel the prepared recipe before disabling telemetry")
+            if self.operation is not None and not self.operation.done:
+                raise BusyError("Stop the active operation before disabling telemetry")
+            await super().unsubscribe()
 
     async def disconnect(self) -> None:
         self._closing = True
@@ -628,8 +647,17 @@ class Interaction(MachineControls, ReadOnlyClient):
         active_operation: Operation | None = None,
         ack_payload: bytes | None = None,
         before_write: Callable[[], None] | None = None,
+        on_transmit: Callable[[], None] | None = None,
+        ack_budget: float | None = None,
     ) -> Packet:
-        """Serialize frame+ACK; cancellation finishes the bounded frame first."""
+        """Serialize frame+ACK; cancellation finishes the bounded frame first.
+
+        ``before_write`` guards the first byte, after any journal hook; when it
+        rejects, nothing is sent. The ACK is armed, and ``on_transmit`` runs,
+        immediately before the frame can reach the machine: before its final
+        chunk, or before a legacy transport's call. ``ack_budget`` bounds the
+        ACK wait from that boundary.
+        """
         frame = encode(code, payload, function=function)
         # The gate runs above every transport, injected ones included, and a
         # rejected frame is never handed to a transport.
@@ -643,9 +671,32 @@ class Interaction(MachineControls, ReadOnlyClient):
                 raise SessionError("Control connection unavailable")
             future: asyncio.Future[Packet] = asyncio.get_running_loop().create_future()
             expected = payload if code == 11511 else ack_payload
-            self._waiter = ((code, 0xC2 if function == 2 else 0xC1, expected), future)
+            key = (code, 0xC2 if function == 2 else 0xC1, expected)
+            progress = _Progress()
+            guard: Callable[[], None] | None = None
+            if before_write is not None:
+                admit = before_write
+
+                def guard() -> None:
+                    try:
+                        admit()
+                    except BaseException:
+                        progress.rejected = True
+                        raise
+
+            def transmit() -> None:
+                # A matching notification before this point is stale.
+                progress.transmitted_at = time.monotonic()
+                self._waiter = (key, future)
+                if on_transmit is not None:
+                    on_transmit()
+
+            # A stop's bounded journal wait must not consume its write bound.
+            bound = self.write_timeout + (
+                STOP_HOOK_TIMEOUT if code in STOP_COMMANDS else 0
+            )
             write = asyncio.create_task(
-                asyncio.wait_for(self._write(frame, before_write), self.write_timeout)
+                asyncio.wait_for(self._write(frame, guard, transmit), bound)
             )
             try:
                 try:
@@ -653,16 +704,31 @@ class Interaction(MachineControls, ReadOnlyClient):
                 except asyncio.CancelledError:
                     await write
                     raise
+                wait, budgeted = self.ack_timeout, False
+                if ack_budget is not None and progress.transmitted_at is not None:
+                    left = progress.transmitted_at + ack_budget - time.monotonic()
+                    if left < wait:
+                        wait, budgeted = max(0.0, left), True
                 # wait_for can swallow cancellation racing with a completed ACK
                 # on Python 3.10/3.11. wait preserves it and leaves cleanup below
                 # responsible for the shared ACK future.
-                done, _ = await asyncio.wait({future}, timeout=self.ack_timeout)
+                done, _ = await asyncio.wait({future}, timeout=wait)
                 if not done:
+                    if budgeted:
+                        raise TimeoutError(
+                            "Acknowledgment not received within the command budget"
+                        )
                     raise asyncio.TimeoutError()
                 return future.result()
-            except Exception:
+            except BaseException as exc:
                 # A missing ACK leaves command effects uncertain; never retry.
-                self._uncertain = True
+                # A guard rejection sent nothing. A cancellation is uncertain
+                # once the frame could have reached the machine unacknowledged.
+                if isinstance(exc, Exception):
+                    if not progress.rejected:
+                        self._uncertain = True
+                elif progress.transmitted_at is not None and not _confirmed(future):
+                    self._uncertain = True
                 raise
             finally:
                 self._waiter = None
@@ -672,23 +738,32 @@ class Interaction(MachineControls, ReadOnlyClient):
                     future.exception()  # consume an error even if the write failed
 
     async def _write(
-        self, frame: bytes, before_write: Callable[[], None] | None
+        self,
+        frame: bytes,
+        guard: Callable[[], None] | None,
+        transmit: Callable[[], None],
     ) -> None:
         transport = self.transport
-        if before_write is not None and getattr(
+        saved: dict[str, Any] = {}
+        if guard is not None and getattr(
             transport, "command_guard_after_journal", False
         ):
             # The transport runs the guard after its hooks, before the first byte.
-            previous = getattr(transport, "command_guard", None)
-            setattr(transport, "command_guard", before_write)  # noqa: B010
-            try:
-                await transport._write_frame(frame)
-            finally:
-                setattr(transport, "command_guard", previous)  # noqa: B010
-            return
-        if before_write is not None:
-            before_write()
-        await transport._write_frame(frame)
+            saved["command_guard"] = getattr(transport, "command_guard", None)
+            setattr(transport, "command_guard", guard)  # noqa: B010
+            guard = None
+        if getattr(transport, "transmit_hook_before_final_chunk", False):
+            saved["on_transmit"] = getattr(transport, "on_transmit", None)
+            setattr(transport, "on_transmit", transmit)  # noqa: B010
+        try:
+            if guard is not None:
+                guard()
+            if "on_transmit" not in saved:
+                transmit()
+            await transport._write_frame(frame)
+        finally:
+            for name, value in saved.items():
+                setattr(transport, name, value)
 
     async def _prepare(self) -> None:
         if self._scale_mode:
@@ -920,15 +995,8 @@ class Interaction(MachineControls, ReadOnlyClient):
 
             def claim() -> None:
                 validate()
-                op = self.operation
-                assert op is not None
-                if op._stop_requested:
-                    raise BusyError(
-                        "Prepared execution was stopped before transmission"
-                    )
                 self._last_preparation = {**preparation, "status": "consumed"}
                 self._prepared = None
-                op._armed = True
 
             return self._launch(
                 kind,
@@ -973,7 +1041,7 @@ class Interaction(MachineControls, ReadOnlyClient):
         before_start: Callable[[], None] | None = None,
     ) -> Operation:
         _number("timeout", timeout, 0.1, 3600)
-        op = Operation(kind)
+        op = Operation(kind, _since=self._event_revision)
         self.operation = op
         op._task = asyncio.create_task(
             self._run(
@@ -988,6 +1056,31 @@ class Interaction(MachineControls, ReadOnlyClient):
         )
         self._signal()
         return op
+
+    def _start_guard(
+        self, op: Operation, claim: Callable[[], None] | None
+    ) -> Callable[[], None]:
+        """Recheck admission after configuration and hooks, before byte one."""
+
+        def guard() -> None:
+            self._require_session()
+            if not self._owns():
+                raise SessionError("Machine ownership lost; start not sent")
+            if op._stop_requested:
+                raise BusyError("Operation was stopped before its start was sent")
+            if claim is not None:
+                claim()
+                return
+            if op.kind in WATER_KINDS:
+                self._water_source()
+            if any(
+                revision > op._since and packet.command in FAULT_EVENTS
+                for revision, packet in self._received_events
+            ):
+                self._uncertain = True
+                raise SessionError("Machine reported a fault before start; not sent")
+
+        return guard
 
     def _completed(self, op: Operation) -> bool:
         events = list(op._events)
@@ -1031,12 +1124,25 @@ class Interaction(MachineControls, ReadOnlyClient):
             if prepare:
                 await self._prepare()
             await configure()
-            if before_start is None:
-                op._armed = True  # starts can take effect before their ACK
             op.phase = "awaiting_machine"
-            await self._command(start_code, payload, before_write=before_start)
+            boundary: list[float] = []
+
+            def transmitted() -> None:
+                op._armed = True  # starts can take effect before their ACK
+                boundary.append(time.monotonic())
+
+            grinder = op.kind == "grinder"
+            await self._command(
+                start_code,
+                payload,
+                before_write=self._start_guard(op, before_start),
+                on_transmit=transmitted,
+                # A grinder pulse is budgeted from its start frame, so a slow
+                # ACK cannot extend it; expiry before the ACK requests stop.
+                ack_budget=timeout if grinder else None,
+            )
             started_at = time.monotonic()
-            deadline = started_at + timeout
+            deadline = (boundary[0] if grinder else started_at) + timeout
             while True:
                 if not self.state.connected:
                     raise SessionError(
@@ -1104,15 +1210,37 @@ class Interaction(MachineControls, ReadOnlyClient):
         op._final = self.snapshot()
         self._signal()
 
+    def _stopped_since(self, revision: int, kind: str) -> bool:
+        """Stop evidence after the stop's write boundary; later motion voids it."""
+        stopped_code = 40507 if kind in ("grinder", "calibration") else 40511
+        stopped = False
+        for seen, packet in self._received_events:
+            if seen <= revision:
+                continue
+            payload = packet.payload
+            state = (
+                int.from_bytes(payload[:4], "little")
+                if packet.command == 8023 and len(payload) >= 4
+                else None
+            )
+            if packet.command == stopped_code or state == 1:
+                stopped = True
+            elif state in MOTION_STATES or packet.command in (9003, 9005):
+                stopped = False
+        return stopped
+
     async def _send_stop(self, op: Operation) -> None:
+        boundary: list[int] = []
         try:
-            await self._command(STOP_CODES[op.kind])
+            await self._command(
+                STOP_CODES[op.kind],
+                on_transmit=lambda: boundary.append(self._event_revision),
+            )
             op.stop_acknowledged = True
             await asyncio.sleep(self.transition_delay)
-            stopped = 40507 if op.kind in ("grinder", "calibration") else 40511
-            op.stop_observed = op.stop_observed or any(
-                code == stopped or (code == 8023 and data[:4] == b"\x01\0\0\0")
-                for code, data in op._events
+            # Completion evidence observed before the stop is kept.
+            op.stop_observed = op.stop_observed or self._stopped_since(
+                boundary[0], op.kind
             )
         except Exception as exc:
             op.stop_acknowledged = False
@@ -1126,11 +1254,17 @@ class Interaction(MachineControls, ReadOnlyClient):
             return None
         if op.status == "running" and not op._task.done() and not op._stop_requested:
             op._stop_requested = True
-            # Let a newly scheduled worker enter its try/finally before cancelling.
-            await asyncio.sleep(0)
-            if not op._task.done():
-                op._task.cancel()
+            # Scheduled on the loop, not in this coroutine: the request survives
+            # its caller's cancellation, and every later caller shares it. It
+            # runs after a newly scheduled worker has entered its try/finally.
+            asyncio.get_running_loop().call_soon(self._cancel_worker, op, op._task)
         return await op.wait()
+
+    @staticmethod
+    def _cancel_worker(op: Operation, task: asyncio.Task[None]) -> None:
+        # Never interrupt cleanup: the worker leaves "running" before it.
+        if not task.done() and op.status == "running":
+            task.cancel()
 
     async def _pause_resume(self, resume: bool) -> dict[str, Any]:
         self._require_session()

@@ -107,11 +107,21 @@ def decode(data: bytes) -> Packet:
     )
 
 
+class FrameError(ValueError):
+    """Corrupt stream input; ``packets`` are the frames validated before it."""
+
+    def __init__(self, message: str, packets: list[Packet]) -> None:
+        super().__init__(message)
+        self.packets = packets
+
+
 class FrameBuffer:
     """Reassemble split or joined frames; reject corrupt input explicitly.
 
     Deliberately does not resynchronize by guessing past malformed bytes.
     A transport must reset the buffer at disconnect and handle errors explicitly.
+    Corrupt input raises :class:`FrameError`, which keeps the frames that were
+    complete and valid before the corruption.
     """
 
     def __init__(self, max_frame_size: int = 65536) -> None:
@@ -134,7 +144,7 @@ class FrameBuffer:
                     break
                 result.append(decode(bytes(self.buffer[:size])))
                 del self.buffer[:size]
-        except ValueError:
+        except ValueError as exc:
             self.buffer.clear()
-            raise
+            raise FrameError(str(exc), result) from exc
         return result

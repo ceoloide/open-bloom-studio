@@ -5,14 +5,15 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from types import TracebackType
 from typing import Any, TypeVar
 
 from .connector import Connector, normalize_identity
 from .events import protocol_error
 from .ownership import AddressLease
-from .protocol import FrameBuffer, Packet
+from .protocol import FrameBuffer, FrameError, Packet
 from .telemetry import DeviceState, decode_values
 from .transport import BleakTransport, CommandHooks, EventSink, Transport
 
@@ -90,13 +91,22 @@ def _identity(device: object, transport: object, connector: Connector | None) ->
     sources = [] if device is None else [normalize_identity(device)]
     if connector is not None:
         sources.append(normalize_identity(connector.identity))
-    elif device is None and transport is not None:
-        sources.append(normalize_identity(getattr(transport, "identity", None)))
+    elif transport is not None:
+        # Legacy transports without an identity fall back to the device.
+        identity = getattr(transport, "identity", None)
+        if identity is not None or device is None:
+            sources.append(normalize_identity(identity))
     if not sources:
         raise ValueError("Provide a device address, a connector or a transport")
     if len(set(sources)) != 1:
         raise ValueError("Device address and connector identity differ")
     return sources[0]
+
+
+class _Link:
+    """One connection attempt; callbacks from an earlier link are ignored."""
+
+    lost = False
 
 
 class ReadOnlyClient:
@@ -148,6 +158,11 @@ class ReadOnlyClient:
         self._ack = asyncio.Event()
         self._lock = asyncio.Lock()
         self._subscribed = False
+        self._handshake_armed = False
+        self._link: _Link | None = None
+        # True once this client, as owner, asked the transport to connect;
+        # only then may cleanup close the (possibly shared) link.
+        self._opened = False
         self._lease = AddressLease(self.address)
         self._session_error: ProtocolCommandError | None = None
         self.event_sink = event_sink
@@ -178,22 +193,34 @@ class ReadOnlyClient:
             return False
         owner = getattr(self.event_sink, "__self__", None)
         accepts = getattr(owner, "accepts", None)
-        return True if accepts is None else bool(accepts(kind))
+        try:
+            return True if accepts is None else bool(accepts(kind))
+        except Exception:
+            return False
 
     def _emit(self, kind: str, details: dict[str, Any]) -> None:
+        # A transcript observer must never drop telemetry or acknowledgments.
         if self.event_sink is not None and self._wants_event(kind):
-            self.event_sink(kind, details)
+            with suppress(Exception):
+                self.event_sink(kind, details)
 
     def _notification(self, data: bytes) -> None:
         self._emit("ble.incoming_chunk", {"hex": bytes(data).hex()})
+        error: FrameError | None = None
         try:
             packets = self._frames.feed(data)
-        except ValueError as exc:
-            self._emit("ble.decode_error", {"error": str(exc)})
+        except FrameError as exc:
+            # Frames validated before the corruption are real observations;
+            # the corruption is still reported for this notification.
+            packets, error = exc.packets, exc
+        self._packets(packets)
+        if error is not None:
+            self._emit("ble.decode_error", {"error": str(error)})
             self.state.decode_errors += 1
-            self.state.last_error = str(exc)
+            self.state.last_error = str(error)
             self._signal()
-            return
+
+    def _packets(self, packets: list[Packet]) -> None:
         for packet in packets:
             self._record_packet(packet)
             self.packets.append(packet)
@@ -207,7 +234,8 @@ class ReadOnlyClient:
                 packet.command,
                 packet.marker,
                 packet.payload,
-            ) == (2, 7, 8100, 0xC1, b""):
+            ) == (2, 7, 8100, 0xC1, b"") and self._handshake_armed:
+                # Accepted only once the handshake can have reached the machine.
                 self._ack.set()
             try:
                 self.state.apply(packet)
@@ -237,6 +265,17 @@ class ReadOnlyClient:
     def _packet_received(self, packet: Packet) -> None:
         """Subclass hook after decoding; must not block notification delivery."""
 
+    def _owns(self) -> bool:
+        return _owners.get(self.address) is self and self._lease.held
+
+    def _link_callback(self, link: _Link) -> Callable[[], None]:
+        def lost() -> None:
+            if self._link is link and not link.lost:
+                link.lost = True
+                self._disconnected()
+
+        return lost
+
     async def connect(self) -> None:
         async with self._lock:
             if self.state.connected:
@@ -248,11 +287,18 @@ class ReadOnlyClient:
             self._frames = FrameBuffer()
             self.packets.clear()
             self._ack.clear()
+            self._handshake_armed = False
             self._session_error = None
             self._subscribed = False
+            link = self._link = _Link()
             try:
-                self._lease.acquire()
-                await self._call(self.transport.connect(self._disconnected))
+                # An explicit reconnect after link loss keeps its held lease.
+                if not self._lease.held:
+                    self._lease.acquire()
+                self._opened = True
+                await self._call(self.transport.connect(self._link_callback(link)))
+                if link.lost:
+                    raise SessionError("Connection lost while connecting")
                 self.state.connected = True
                 self._signal()
             except BaseException:
@@ -278,11 +324,12 @@ class ReadOnlyClient:
             if self.state.session_ready:
                 return
             self._ack.clear()
+            self._handshake_armed = False
             # Allow the peripheral to finish enabling its notification subscription.
             await asyncio.sleep(self.subscription_settle)
-            await self._call(self.transport.open_session())
+            await self._call(self._send_handshake())
             deadline = time.monotonic() + self.handshake_timeout
-            while not self._ack.is_set():
+            while not self._ack.is_set() and self._session_error is None:
                 if not self.state.connected:
                     raise SessionError("Disconnected during handshake")
                 remaining = deadline - time.monotonic()
@@ -300,6 +347,31 @@ class ReadOnlyClient:
                 raise SessionError("Disconnected during initialization")
             self.state.session_ready = True
             self._signal()
+
+    async def _send_handshake(self) -> None:
+        """Arm the handshake ACK only when the handshake can reach the machine.
+
+        A matching notification during the settle or a pre-write hook is
+        stale. Guarded transports arm before the final chunk, so an ACK
+        delivered synchronously by the write still counts; other transports
+        arm immediately before their call.
+        """
+
+        def arm() -> None:
+            self._ack.clear()
+            self._handshake_armed = True
+
+        transport = self.transport
+        if not getattr(transport, "transmit_hook_before_final_chunk", False):
+            arm()
+            await transport.open_session()
+            return
+        previous = getattr(transport, "on_transmit", None)
+        setattr(transport, "on_transmit", arm)  # noqa: B010
+        try:
+            await transport.open_session()
+        finally:
+            setattr(transport, "on_transmit", previous)  # noqa: B010
 
     async def read_information(self, name: str) -> str | None:
         async with self._lock:
@@ -335,8 +407,13 @@ class ReadOnlyClient:
 
     async def _cleanup(self) -> None:
         try:
-            await self._call(self.transport.disconnect())
+            # Never close a link this client did not open as owner: a rival
+            # rejected over a shared connector must not disturb the incumbent.
+            if self._opened:
+                await self._call(self.transport.disconnect())
         finally:
+            self._opened = False
+            self._link = None
             self._subscribed = False
             self._disconnected()
             if _owners.get(self.address) is self:
