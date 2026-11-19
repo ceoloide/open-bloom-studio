@@ -44,7 +44,10 @@ def _is_local_host(host: Any) -> bool:
 def _system_bus_paths() -> set[str]:
     paths = set(SYSTEM_BUS_PATHS)
     for part in os.environ.get("DBUS_SYSTEM_BUS_ADDRESS", "").split(";"):
-        for option in part.partition(":")[2].split(","):
+        transport, _, options = part.partition(":")
+        if transport != "unix":
+            continue
+        for option in options.split(","):
             key, _, value = option.partition("=")
             if key == "path":
                 paths.add(os.fsdecode(unquote_to_bytes(value)))
@@ -55,11 +58,19 @@ def _system_bus_paths() -> set[str]:
 
 def check_address(family: int, address: Any) -> None:
     if family == getattr(socket, "AF_UNIX", None):
-        path = os.fsdecode(address) if isinstance(address, (str, bytes)) else ""
+        try:
+            path = (
+                address
+                if isinstance(address, str)
+                else os.fsdecode(memoryview(address).tobytes())
+            )
+        except TypeError as error:
+            raise NetworkBlocked("tests require a Unix socket address") from error
         bus_paths = _system_bus_paths()
         if path.startswith("\0"):
             system_bus = path in bus_paths
         else:
+            path = path.partition("\0")[0]
             system_bus = bool(path) and os.path.realpath(path) in {
                 os.path.realpath(item)
                 for item in bus_paths
@@ -74,7 +85,7 @@ def check_address(family: int, address: Any) -> None:
 
 
 def _audit_socket(event: str, args: tuple[Any, ...]) -> None:
-    if event in {"socket.connect", "socket.sendto", "socket.sendmsg"}:
+    if event in {"socket.bind", "socket.connect", "socket.sendto", "socket.sendmsg"}:
         sock, address = args
         if address is not None:
             check_address(sock.family, address)
@@ -108,18 +119,15 @@ def install() -> None:
     if _installed:
         return
     # CPython may resolve hostnames before it emits a socket audit event.
-    for method, index in (
-        ("bind", 0),
-        ("connect", 0),
-        ("connect_ex", 0),
-        ("sendto", -1),
-    ):
-        operation = getattr(socket.socket, method)
-        setattr(socket.socket, method, _before_address_resolution(operation, index))
+    addresses = {"bind": 0, "connect": 0, "connect_ex": 0, "sendto": -1}
     if hasattr(socket.socket, "sendmsg"):
-        socket.socket.sendmsg = _before_address_resolution(
-            socket.socket.sendmsg, 3, optional=True
+        addresses["sendmsg"] = 3
+    for method, index in addresses.items():
+        operation = getattr(socket.socket, method)
+        guarded = _before_address_resolution(
+            operation, index, optional=method == "sendmsg"
         )
+        setattr(socket.socket, method, guarded)
     sys.addaudithook(_audit_socket)
     _installed = True
 

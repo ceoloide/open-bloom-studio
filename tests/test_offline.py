@@ -110,7 +110,14 @@ class OfflineGuardTest(unittest.TestCase):
             env = {"DBUS_SYSTEM_BUS_ADDRESS": f"unix:path={custom}%2dname,guid=0"}
             custom += "-name"
             with mock.patch.dict(os.environ, env):
-                for path in (*offline.SYSTEM_BUS_PATHS, custom, custom.encode()):
+                for path in (
+                    *offline.SYSTEM_BUS_PATHS,
+                    custom,
+                    custom.encode(),
+                    memoryview(custom.encode()),
+                    bytearray(custom.encode()),
+                    custom.encode() + b"\0padding",
+                ):
                     with socket.socket(socket.AF_UNIX) as client:
                         with self.assertRaises(offline.NetworkBlocked):
                             client.connect(path)

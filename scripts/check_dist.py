@@ -192,11 +192,11 @@ def check_artifacts(
             if fields[field] != value:
                 problems.append(f"{kind} metadata differs from source: {field}")
 
-    findings = publication_policy.check_files(
-        [(f"wheel:{name}", data) for name, data in sorted(wheel_files.items())]
-        + [(f"sdist:{name}", data) for name, data in sorted(sdist_files.items())]
-    )
-    problems += [str(finding) for finding in findings]
+    for kind, files in (("wheel", wheel_files), ("sdist", sdist_files)):
+        problems.extend(
+            f"{kind}:{finding}"
+            for finding in publication_policy.check_files(sorted(files.items()))
+        )
     return problems
 
 

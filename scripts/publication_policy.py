@@ -48,7 +48,10 @@ LINE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("API key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
     ("PyPI token", re.compile(r"\bpypi-AgEI[A-Za-z0-9_-]{20,}")),
     ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
-    ("home directory path", re.compile(r"(?:/home/|/Users/|\b[A-Za-z]:\\Users\\)\w")),
+    (
+        "home directory path",
+        re.compile(r"(?:/home/|/Users/|\b[A-Za-z]:(?:\\+|/)Users(?:\\+|/))\w"),
+    ),
 )
 
 EMAIL = re.compile(r"\b[\w.%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)")

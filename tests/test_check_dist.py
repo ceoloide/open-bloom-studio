@@ -178,6 +178,10 @@ class ArtifactTest(unittest.TestCase):
         problems = self.check(sdist=sdist_files(**{"setup.cfg": secret}))
         self.assertEqual(problems, ["sdist:setup.cfg:1: private key"])
 
+    def test_publication_checks_root_archive_names(self):
+        problems = self.check(sdist=sdist_files(**{".env.local": b"example"}))
+        self.assertIn("sdist:.env.local:0: forbidden file type", problems)
+
     def test_sdist_layout_is_strict(self):
         for kwargs in ({"prefix": "other"}, {"link": "alias"}):
             path = write_sdist(self.dir, sdist_files(), **kwargs)
