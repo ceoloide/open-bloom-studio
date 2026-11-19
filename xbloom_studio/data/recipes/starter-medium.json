@@ -1,0 +1,57 @@
+{
+  "id": "starter-medium",
+  "provenance": {
+    "kind": "project-authored",
+    "license": "MIT",
+    "derived_from": null,
+    "notes": "Original starting point written for this project; not taken from any app, service or recipe collection."
+  },
+  "document": {
+    "schema_version": 1,
+    "name": "Starter Medium Roast",
+    "mode": "coffee",
+    "description": "A balanced three-pour starting point for medium roasts.",
+    "source": {
+      "provider": "open-bloom-studio",
+      "template_id": "starter-medium"
+    },
+    "coffee_recipe": {
+      "cup_type": "xdripper",
+      "dose_g": 15,
+      "ratio": 16,
+      "grind_size": 54,
+      "rpm": 110,
+      "grinder_enabled": true,
+      "bypass": null,
+      "pours": [
+        {
+          "volume_ml": 40,
+          "temperature": 91,
+          "flow_ml_s": 3.0,
+          "pause_seconds": 30,
+          "pattern": "center",
+          "vibration_before": false,
+          "vibration_after": true
+        },
+        {
+          "volume_ml": 100,
+          "temperature": 91,
+          "flow_ml_s": 3.2,
+          "pause_seconds": 15,
+          "pattern": "ring",
+          "vibration_before": false,
+          "vibration_after": false
+        },
+        {
+          "volume_ml": 100,
+          "temperature": 90,
+          "flow_ml_s": 3.2,
+          "pause_seconds": 0,
+          "pattern": "spiral",
+          "vibration_before": false,
+          "vibration_after": false
+        }
+      ]
+    }
+  }
+}

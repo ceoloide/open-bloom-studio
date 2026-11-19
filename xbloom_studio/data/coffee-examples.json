@@ -1,0 +1,381 @@
+{
+  "version": 1,
+  "provenance": {
+    "kind": "project-authored",
+    "license": "MIT",
+    "derived_from": null,
+    "notes": "Original starting point written for this project; not taken from any app, service or recipe collection."
+  },
+  "snapshot_date": null,
+  "scope": "Original project-authored starter examples: 15 g dose, about 240 ml; for metadata-overlap ranking only.",
+  "records": [
+    {
+      "id": "starter-washed-highland",
+      "name": "Washed highland single origin",
+      "coffee": {
+        "origin": "Ethiopia",
+        "region": "",
+        "type": "Single Origin",
+        "variety": "Heirloom",
+        "process": "Washed",
+        "flavor": "Jasmine, lemon, black tea"
+      },
+      "roast": "Light",
+      "brew": {
+        "dose_g": 15,
+        "grind_size": 48,
+        "rpm": 110,
+        "water_ml": 240,
+        "ratio": 16.0,
+        "pours": [
+          {
+            "volume_ml": 45,
+            "temperature": 94,
+            "pause_seconds": 35,
+            "pattern": "center"
+          },
+          {
+            "volume_ml": 105,
+            "temperature": 94,
+            "pause_seconds": 20,
+            "pattern": "spiral"
+          },
+          {
+            "volume_ml": 90,
+            "temperature": 94,
+            "pause_seconds": 0,
+            "pattern": "spiral"
+          }
+        ]
+      },
+      "unknown_settings": [
+        "flow_ml_s",
+        "vibration_before",
+        "vibration_after",
+        "grinder_enabled"
+      ]
+    },
+    {
+      "id": "starter-natural-fruit",
+      "name": "Natural process fruit-forward",
+      "coffee": {
+        "origin": "Ethiopia",
+        "region": "",
+        "type": "Single Origin",
+        "variety": "Heirloom",
+        "process": "Natural",
+        "flavor": "Blueberry, strawberry, cocoa"
+      },
+      "roast": "Light",
+      "brew": {
+        "dose_g": 15,
+        "grind_size": 50,
+        "rpm": 110,
+        "water_ml": 240,
+        "ratio": 16.0,
+        "pours": [
+          {
+            "volume_ml": 45,
+            "temperature": 92,
+            "pause_seconds": 35,
+            "pattern": "center"
+          },
+          {
+            "volume_ml": 100,
+            "temperature": 92,
+            "pause_seconds": 20,
+            "pattern": "spiral"
+          },
+          {
+            "volume_ml": 95,
+            "temperature": 92,
+            "pause_seconds": 0,
+            "pattern": "ring"
+          }
+        ]
+      },
+      "unknown_settings": [
+        "flow_ml_s",
+        "vibration_before",
+        "vibration_after",
+        "grinder_enabled"
+      ]
+    },
+    {
+      "id": "starter-washed-central",
+      "name": "Washed central american",
+      "coffee": {
+        "origin": "Guatemala",
+        "region": "",
+        "type": "Single Origin",
+        "variety": "Bourbon, Caturra",
+        "process": "Washed",
+        "flavor": "Milk chocolate, red apple, caramel"
+      },
+      "roast": "Medium",
+      "brew": {
+        "dose_g": 15,
+        "grind_size": 54,
+        "rpm": 110,
+        "water_ml": 240,
+        "ratio": 16.0,
+        "pours": [
+          {
+            "volume_ml": 40,
+            "temperature": 91,
+            "pause_seconds": 30,
+            "pattern": "center"
+          },
+          {
+            "volume_ml": 100,
+            "temperature": 91,
+            "pause_seconds": 15,
+            "pattern": "ring"
+          },
+          {
+            "volume_ml": 100,
+            "temperature": 91,
+            "pause_seconds": 0,
+            "pattern": "spiral"
+          }
+        ]
+      },
+      "unknown_settings": [
+        "flow_ml_s",
+        "vibration_before",
+        "vibration_after",
+        "grinder_enabled"
+      ]
+    },
+    {
+      "id": "starter-honey-sweet",
+      "name": "Honey process sweet cup",
+      "coffee": {
+        "origin": "Costa Rica",
+        "region": "",
+        "type": "Single Origin",
+        "variety": "Catuai",
+        "process": "Honey",
+        "flavor": "Honey, peach, brown sugar"
+      },
+      "roast": "Medium",
+      "brew": {
+        "dose_g": 15,
+        "grind_size": 53,
+        "rpm": 110,
+        "water_ml": 240,
+        "ratio": 16.0,
+        "pours": [
+          {
+            "volume_ml": 40,
+            "temperature": 91,
+            "pause_seconds": 30,
+            "pattern": "center"
+          },
+          {
+            "volume_ml": 100,
+            "temperature": 91,
+            "pause_seconds": 15,
+            "pattern": "spiral"
+          },
+          {
+            "volume_ml": 100,
+            "temperature": 91,
+            "pause_seconds": 0,
+            "pattern": "spiral"
+          }
+        ]
+      },
+      "unknown_settings": [
+        "flow_ml_s",
+        "vibration_before",
+        "vibration_after",
+        "grinder_enabled"
+      ]
+    },
+    {
+      "id": "starter-anaerobic-natural",
+      "name": "Anaerobic natural experimental",
+      "coffee": {
+        "origin": "Colombia",
+        "region": "",
+        "type": "Single Origin",
+        "variety": "Castillo",
+        "process": "Anaerobic Natural",
+        "flavor": "Tropical fruit, wine, cinnamon"
+      },
+      "roast": "Light",
+      "brew": {
+        "dose_g": 15,
+        "grind_size": 52,
+        "rpm": 110,
+        "water_ml": 240,
+        "ratio": 16.0,
+        "pours": [
+          {
+            "volume_ml": 45,
+            "temperature": 90,
+            "pause_seconds": 40,
+            "pattern": "center"
+          },
+          {
+            "volume_ml": 95,
+            "temperature": 90,
+            "pause_seconds": 20,
+            "pattern": "ring"
+          },
+          {
+            "volume_ml": 100,
+            "temperature": 90,
+            "pause_seconds": 0,
+            "pattern": "ring"
+          }
+        ]
+      },
+      "unknown_settings": [
+        "flow_ml_s",
+        "vibration_before",
+        "vibration_after",
+        "grinder_enabled"
+      ]
+    },
+    {
+      "id": "starter-geisha-washed",
+      "name": "Washed Geisha delicate",
+      "coffee": {
+        "origin": "Panama",
+        "region": "",
+        "type": "Single Origin",
+        "variety": "Geisha",
+        "process": "Washed",
+        "flavor": "Bergamot, jasmine, apricot"
+      },
+      "roast": "Light",
+      "brew": {
+        "dose_g": 15,
+        "grind_size": 47,
+        "rpm": 110,
+        "water_ml": 240,
+        "ratio": 16.0,
+        "pours": [
+          {
+            "volume_ml": 45,
+            "temperature": 95,
+            "pause_seconds": 35,
+            "pattern": "center"
+          },
+          {
+            "volume_ml": 95,
+            "temperature": 95,
+            "pause_seconds": 20,
+            "pattern": "spiral"
+          },
+          {
+            "volume_ml": 100,
+            "temperature": 95,
+            "pause_seconds": 0,
+            "pattern": "spiral"
+          }
+        ]
+      },
+      "unknown_settings": [
+        "flow_ml_s",
+        "vibration_before",
+        "vibration_after",
+        "grinder_enabled"
+      ]
+    },
+    {
+      "id": "starter-sl-kenya",
+      "name": "Washed SL varieties bright",
+      "coffee": {
+        "origin": "Kenya",
+        "region": "",
+        "type": "Single Origin",
+        "variety": "SL28, SL34",
+        "process": "Washed",
+        "flavor": "Blackcurrant, grapefruit, tomato"
+      },
+      "roast": "Light",
+      "brew": {
+        "dose_g": 15,
+        "grind_size": 49,
+        "rpm": 110,
+        "water_ml": 240,
+        "ratio": 16.0,
+        "pours": [
+          {
+            "volume_ml": 45,
+            "temperature": 93,
+            "pause_seconds": 30,
+            "pattern": "center"
+          },
+          {
+            "volume_ml": 100,
+            "temperature": 93,
+            "pause_seconds": 20,
+            "pattern": "spiral"
+          },
+          {
+            "volume_ml": 95,
+            "temperature": 93,
+            "pause_seconds": 0,
+            "pattern": "spiral"
+          }
+        ]
+      },
+      "unknown_settings": [
+        "flow_ml_s",
+        "vibration_before",
+        "vibration_after",
+        "grinder_enabled"
+      ]
+    },
+    {
+      "id": "starter-blend-chocolate",
+      "name": "Comfort blend",
+      "coffee": {
+        "origin": "Brazil, Colombia",
+        "region": "",
+        "type": "Blend",
+        "variety": "Unknown",
+        "process": "Natural, Washed",
+        "flavor": "Chocolate, hazelnut, toffee"
+      },
+      "roast": "Medium-Dark",
+      "brew": {
+        "dose_g": 15,
+        "grind_size": 60,
+        "rpm": 110,
+        "water_ml": 240,
+        "ratio": 16.0,
+        "pours": [
+          {
+            "volume_ml": 40,
+            "temperature": 88,
+            "pause_seconds": 25,
+            "pattern": "center"
+          },
+          {
+            "volume_ml": 110,
+            "temperature": 88,
+            "pause_seconds": 10,
+            "pattern": "ring"
+          },
+          {
+            "volume_ml": 90,
+            "temperature": 88,
+            "pause_seconds": 0,
+            "pattern": "center"
+          }
+        ]
+      },
+      "unknown_settings": [
+        "flow_ml_s",
+        "vibration_before",
+        "vibration_after",
+        "grinder_enabled"
+      ]
+    }
+  ]
+}

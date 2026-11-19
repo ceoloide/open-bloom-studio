@@ -1,0 +1,57 @@
+{
+  "id": "starter-dark",
+  "provenance": {
+    "kind": "project-authored",
+    "license": "MIT",
+    "derived_from": null,
+    "notes": "Original starting point written for this project; not taken from any app, service or recipe collection."
+  },
+  "document": {
+    "schema_version": 1,
+    "name": "Starter Dark Roast",
+    "mode": "coffee",
+    "description": "Cooler water and a coarser grind to temper bitterness in dark roasts.",
+    "source": {
+      "provider": "open-bloom-studio",
+      "template_id": "starter-dark"
+    },
+    "coffee_recipe": {
+      "cup_type": "xdripper",
+      "dose_g": 15,
+      "ratio": 16,
+      "grind_size": 62,
+      "rpm": 110,
+      "grinder_enabled": true,
+      "bypass": null,
+      "pours": [
+        {
+          "volume_ml": 40,
+          "temperature": 87,
+          "flow_ml_s": 3.0,
+          "pause_seconds": 25,
+          "pattern": "center",
+          "vibration_before": false,
+          "vibration_after": true
+        },
+        {
+          "volume_ml": 110,
+          "temperature": 86,
+          "flow_ml_s": 3.0,
+          "pause_seconds": 10,
+          "pattern": "ring",
+          "vibration_before": false,
+          "vibration_after": false
+        },
+        {
+          "volume_ml": 90,
+          "temperature": 86,
+          "flow_ml_s": 3.0,
+          "pause_seconds": 0,
+          "pattern": "center",
+          "vibration_before": false,
+          "vibration_after": false
+        }
+      ]
+    }
+  }
+}

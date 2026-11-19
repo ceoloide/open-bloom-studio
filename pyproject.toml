@@ -35,7 +35,7 @@ dev = [
 include = ["xbloom_studio*"]
 
 [tool.setuptools.package-data]
-xbloom_studio = ["commands.json", "py.typed"]
+xbloom_studio = ["commands.json", "data/*.json", "data/recipes/*.json", "py.typed"]
 
 [tool.uv]
 required-version = ">=0.11.28"

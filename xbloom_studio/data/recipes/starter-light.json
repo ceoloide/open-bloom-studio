@@ -1,0 +1,57 @@
+{
+  "id": "starter-light",
+  "provenance": {
+    "kind": "project-authored",
+    "license": "MIT",
+    "derived_from": null,
+    "notes": "Original starting point written for this project; not taken from any app, service or recipe collection."
+  },
+  "document": {
+    "schema_version": 1,
+    "name": "Starter Light Roast",
+    "mode": "coffee",
+    "description": "Hotter water and a finer grind for dense, lightly roasted coffee.",
+    "source": {
+      "provider": "open-bloom-studio",
+      "template_id": "starter-light"
+    },
+    "coffee_recipe": {
+      "cup_type": "xdripper",
+      "dose_g": 15,
+      "ratio": 16,
+      "grind_size": 48,
+      "rpm": 110,
+      "grinder_enabled": true,
+      "bypass": null,
+      "pours": [
+        {
+          "volume_ml": 45,
+          "temperature": 94,
+          "flow_ml_s": 3.0,
+          "pause_seconds": 35,
+          "pattern": "center",
+          "vibration_before": false,
+          "vibration_after": true
+        },
+        {
+          "volume_ml": 95,
+          "temperature": 94,
+          "flow_ml_s": 3.5,
+          "pause_seconds": 20,
+          "pattern": "spiral",
+          "vibration_before": false,
+          "vibration_after": false
+        },
+        {
+          "volume_ml": 100,
+          "temperature": 93,
+          "flow_ml_s": 3.5,
+          "pause_seconds": 0,
+          "pattern": "spiral",
+          "vibration_before": false,
+          "vibration_after": false
+        }
+      ]
+    }
+  }
+}

@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -28,6 +29,7 @@ ROOT_FILES = {
     "pyproject.toml": b"",
 }
 SOURCES = {**PACKAGE_FILES, **ROOT_FILES}
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 METADATA = (
     "Metadata-Version: 2.4\n"
     "Name: open-bloom-studio\n"
@@ -258,6 +260,7 @@ class InstallTest(unittest.TestCase):
             "prefix": str(venv),
             "version": VERSION,
             "files": [*PACKAGE_FILES, f"{STEM}.dist-info/RECORD"],
+            "resources": {"xbloom_studio/py.typed": EMPTY_SHA256},
         }
         result.update(changes)
         commands = []
@@ -300,6 +303,53 @@ class InstallTest(unittest.TestCase):
         problems, _ = self.probe(workdir, module=str(Path.cwd() / "x.py"))
         self.assertEqual(
             problems, ["installed package was not imported from the new environment"]
+        )
+
+    def test_installed_resources_must_load_and_match(self):
+        workdir = Path(tempfile.gettempdir())
+        problems, _ = self.probe(
+            workdir,
+            resources={
+                "xbloom_studio/py.typed": "0" * 64,
+                "xbloom_studio/data/extra.json": EMPTY_SHA256,
+            },
+        )
+        self.assertEqual(
+            problems,
+            [
+                "installed resource unexpected file: xbloom_studio/data/extra.json",
+                "installed resource differs from source: xbloom_studio/py.typed",
+            ],
+        )
+        problems, _ = self.probe(workdir, resources={})
+        self.assertEqual(
+            problems, ["installed resource missing file: xbloom_studio/py.typed"]
+        )
+
+    def test_probe_reads_resources_through_importlib(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "xbloom_studio/data/__pycache__").mkdir(parents=True)
+        (root / "xbloom_studio/__init__.py").write_text("")
+        (root / "xbloom_studio/data/a.json").write_bytes(b"{}")
+        (root / "xbloom_studio/data/__pycache__/a.pyc").write_bytes(b"")
+        (root / f"{STEM}.dist-info").mkdir()
+        (root / f"{STEM}.dist-info/METADATA").write_text(METADATA)
+        probe = check_dist.PROBE.format(
+            package="xbloom_studio", project="open-bloom-studio"
+        )
+        output = subprocess.run(
+            [sys.executable, "-c", probe],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=root,
+            env={**os.environ, "PYTHONPATH": str(root)},
+        ).stdout
+        self.assertEqual(
+            json.loads(output)["resources"],
+            {"xbloom_studio/data/a.json": hashlib.sha256(b"{}").hexdigest()},
         )
 
     def test_run_command_returns_output(self):
