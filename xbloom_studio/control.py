@@ -28,6 +28,7 @@ from .machine_controls import (
     validate_cup_limits,
 )
 from .protocol import Packet, encode
+from .telemetry import WATER_SOURCES, decode_values
 from .transport import (
     STOP_COMMANDS,
     STOP_HOOK_TIMEOUT,
@@ -47,12 +48,20 @@ FAULT_EVENTS = (40517, 40522, 8203, 8204)
 # Keys of Interaction._seen: (command, None), and (8023, state) for states.
 SeenKey = tuple[int, "int | None"]
 FAULT_KEYS: tuple[SeenKey, ...] = tuple((code, None) for code in FAULT_EVENTS)
+# Faults other than the water report, which the water check classifies first.
+MACHINE_FAULT_KEYS = tuple(key for key in FAULT_KEYS if key[0] != 40522)
 MOTION_KEYS: tuple[SeenKey, ...] = (
     (8023, MOTION_STATES[0]),
     (8023, MOTION_STATES[1]),
     (9003, None),
     (9005, None),
+    (40502, None),
 )
+# Synthetic key: the latest reported state code that is not a motion state.
+STATE_AT_REST: SeenKey = (8023, -1)
+# Evidence that reported motion ended: a non-motion state or a stop event.
+REST_KEYS: tuple[SeenKey, ...] = (STATE_AT_REST, (40507, None), (40511, None))
+SOURCE_CODES = {label: code for code, label in WATER_SOURCES.items()}
 WATER_KINDS = ("water", "recipe", "tea")
 MEASUREMENTS = (20501, 40523, 40521)
 STOP_CODES = {
@@ -245,15 +254,22 @@ class Operation:
         return {**self.snapshot(), "state": self._final}
 
 
-Waiter = tuple[tuple[int, int, "bytes | None"], "asyncio.Future[Packet]"]
-
-
 class _Progress:
     """How far one command got: rejected by its guard, or transmitted."""
 
     rejected = False
+    # The frame was started but its final chunk withheld.
+    withheld = False
     transmitted_at: float | None = None
+    # Latest monotonic time at which an acknowledgment is accepted.
+    deadline: float | None = None
     expiry: asyncio.TimerHandle | None = None
+
+    def accepts_ack(self) -> bool:
+        return self.deadline is None or time.monotonic() <= self.deadline
+
+
+Waiter = tuple[tuple[int, int, "bytes | None"], "asyncio.Future[Packet]", _Progress]
 
 
 def _confirmed(future: asyncio.Future[Packet]) -> bool:
@@ -320,6 +336,11 @@ class Interaction(MachineControls, ReadOnlyClient):
         self._preset_write_used = False
         self._last_preset_write: dict[str, Any] | None = None
         self._selected_water_source: int | None = None
+        # Latest decoded source from an identity block or units/source event.
+        self._reported_source: int | None = None
+        # A frame was begun but not finished: later bytes would be appended
+        # to it, so nothing more is written on this link.
+        self._partial_frame = False
         self._prepared: dict[str, Any] | None = None
         self._last_preparation: dict[str, Any] | None = None
 
@@ -385,9 +406,10 @@ class Interaction(MachineControls, ReadOnlyClient):
 
     def _disconnected(self) -> None:
         self._invalidate_preparation("connection_lost")
+        self._reported_source = None
         super()._disconnected()
         if self._waiter is not None:
-            _, future = self._waiter
+            _, future, _ = self._waiter
             if not future.done():
                 future.set_exception(
                     SessionError("Connection lost; machine state is unknown")
@@ -401,15 +423,20 @@ class Interaction(MachineControls, ReadOnlyClient):
         if (packet.device, packet.function) != (2, 7):
             return
         if self._waiter is not None:
-            (code, marker, expected_payload), future = self._waiter
+            (code, marker, expected_payload), future, progress = self._waiter
             if (
                 (packet.command, packet.marker) == (code, marker)
                 and (expected_payload is None or packet.payload == expected_payload)
                 and not future.done()
+                # Judged by the clock at receipt: an ACK after its deadline is
+                # never accepted, however late cleanup inspects the future.
+                and progress.accepts_ack()
             ):
                 future.set_result(packet)
         if packet.marker != 0xC1:
             return
+        if packet.command in (40521, 8015):
+            self._reported_source = self._decoded_source(packet)
         if self._prepared is not None:
             self._check_preparation(packet)
         self._event_revision += 1
@@ -417,6 +444,8 @@ class Interaction(MachineControls, ReadOnlyClient):
         if packet.command == 8023 and len(packet.payload) >= 4:
             state = int.from_bytes(packet.payload[:4], "little")
             self._seen[(8023, state)] = self._event_revision
+            if state not in MOTION_STATES:
+                self._seen[STATE_AT_REST] = self._event_revision
         if packet.command not in MEASUREMENTS:
             self._received_events.append((self._event_revision, packet))
         op = self.operation
@@ -439,6 +468,16 @@ class Interaction(MachineControls, ReadOnlyClient):
         if op is not None and not op.done and op.protocol_error is None:
             op.protocol_error = exc.details
         self._signal()
+
+    @staticmethod
+    def _decoded_source(packet: Packet) -> int | None:
+        """The packet's decoded water source; unknown when it has none."""
+        try:
+            values = decode_values(packet)
+        except ValueError:
+            return None
+        labels = [value for name, value, _, _ in values if name == "water_source"]
+        return SOURCE_CODES.get(labels[-1]) if labels else None
 
     def _check_preparation(self, packet: Packet) -> None:
         assert self._prepared is not None
@@ -641,6 +680,10 @@ class Interaction(MachineControls, ReadOnlyClient):
         activity = self.state.observations.get("machine_state_code")
         if activity and activity.value in MOTION_STATES:
             raise BusyError("Machine reports motion outside an owned operation")
+        # A motion event newer than any rest evidence is outstanding even
+        # when the last reported state code or identity looks idle.
+        if self._last(MOTION_KEYS) > self._last(REST_KEYS):
+            raise BusyError("Machine reports motion outside an owned operation")
 
     async def _wait_event(
         self,
@@ -685,6 +728,10 @@ class Interaction(MachineControls, ReadOnlyClient):
         # rejected frame is never handed to a transport.
         validate_control_frame(frame)
         async with self._commands:
+            if self._partial_frame:
+                raise SessionError(
+                    "A partially written frame holds this link; reconnect"
+                )
             if active_operation is not None and (
                 active_operation._stop_requested or active_operation.status != "running"
             ):
@@ -716,12 +763,19 @@ class Interaction(MachineControls, ReadOnlyClient):
 
             def transmit() -> None:
                 # A matching notification before this point is stale.
-                progress.transmitted_at = time.monotonic()
-                self._waiter = (key, future)
+                progress.transmitted_at = now = time.monotonic()
+                self._waiter = (key, future, progress)
                 if ack_budget is not None:
+                    progress.deadline = now + ack_budget
                     progress.expiry = loop.call_later(ack_budget, expire)
                 if on_transmit is not None:
-                    on_transmit()
+                    try:
+                        on_transmit()
+                    except BaseException:
+                        # Raised before the final chunk: the frame is begun
+                        # but unfinished, unless the transport writes whole.
+                        progress.withheld = True
+                        raise
 
             # A stop's bounded journal wait must not consume its write bound.
             bound = self.write_timeout + (
@@ -747,10 +801,12 @@ class Interaction(MachineControls, ReadOnlyClient):
                     return future.result()
                 write.result()
                 wait, budgeted = self.ack_timeout, False
-                if ack_budget is not None and progress.transmitted_at is not None:
-                    left = progress.transmitted_at + ack_budget - time.monotonic()
+                now = time.monotonic()
+                if progress.deadline is not None:
+                    left = progress.deadline - now
                     if left < wait:
                         wait, budgeted = max(0.0, left), True
+                progress.deadline = now + wait
                 # wait_for can swallow cancellation racing with a completed ACK
                 # on Python 3.10/3.11. wait preserves it and leaves cleanup below
                 # responsible for the shared ACK future.
@@ -771,6 +827,8 @@ class Interaction(MachineControls, ReadOnlyClient):
                         self._uncertain = True
                 elif progress.transmitted_at is not None and not _confirmed(future):
                     self._uncertain = True
+                if progress.withheld and self._withholds_final_chunk():
+                    self._partial_frame = self._uncertain = True
                 raise
             finally:
                 if progress.expiry is not None:
@@ -780,6 +838,9 @@ class Interaction(MachineControls, ReadOnlyClient):
                     future.cancel()
                 elif not future.cancelled():
                     future.exception()  # consume an error even if the write failed
+
+    def _withholds_final_chunk(self) -> bool:
+        return bool(getattr(self.transport, "transmit_hook_before_final_chunk", False))
 
     async def _write(
         self,
@@ -825,11 +886,13 @@ class Interaction(MachineControls, ReadOnlyClient):
         if sufficient is None or sufficient.value is not True:
             raise SessionError("Water sufficiency not confirmed; no automatic retry")
         raw = bytes.fromhex(info.value) if info else b""
-        if len(raw) < 63 or raw[36] not in (0, 1):
+        # The newest decoded report (identity block or 8015 event) decides;
+        # a newer report without a known source makes it unknown.
+        if len(raw) < 63 or self._reported_source is None:
             raise SessionError("Current water-source configuration unknown")
         if self._selected_water_source is not None:
             return self._selected_water_source
-        return raw[36]
+        return self._reported_source
 
     async def start_water(
         self,
@@ -1113,23 +1176,38 @@ class Interaction(MachineControls, ReadOnlyClient):
                 raise SessionError("Machine ownership lost; start not sent")
             if op._stop_requested:
                 raise BusyError("Operation was stopped before its start was sent")
+            # Motion and machine faults first: they always require recovery,
+            # even when the water check would also refuse the start. Low water
+            # then stays a recoverable refusal; any other water fault does not.
+            self._refuse_changed_machine(op, MACHINE_FAULT_KEYS)
+            source = None
             if claim is None and op.kind in WATER_KINDS:
                 # A selected source still overrides the reported one.
                 source = self._water_source()
-                if op._source is not None and source != op._source:
-                    raise SessionError(
-                        "Water source changed after admission; start not sent"
-                    )
-            if self._last(FAULT_KEYS) > op._since:
-                self._uncertain = True
-                raise SessionError("Machine reported a fault before start; not sent")
-            if self._last(MOTION_KEYS) > op._since:
-                self._uncertain = True
-                raise BusyError("Machine reported motion before start; not sent")
+            self._refuse_changed_machine(op)
+            if source is not None and op._source is not None and source != op._source:
+                raise SessionError(
+                    "Water source changed after admission; start not sent"
+                )
             if claim is not None:
                 claim()
 
         return guard
+
+    def _refuse_changed_machine(
+        self, op: Operation, faults: tuple[SeenKey, ...] = FAULT_KEYS
+    ) -> None:
+        """Refuse a start after any fault or motion reported since launch.
+
+        Uses the persistent per-event revisions, so neither history eviction
+        nor the gap between frame chunks can hide one.
+        """
+        if self._last(faults) > op._since:
+            self._uncertain = True
+            raise SessionError("Machine reported a fault before start; not sent")
+        if self._last(MOTION_KEYS) > op._since:
+            self._uncertain = True
+            raise BusyError("Machine reported motion before start; not sent")
 
     def _completed(self, op: Operation) -> bool:
         events = list(op._events)
@@ -1137,7 +1215,10 @@ class Interaction(MachineControls, ReadOnlyClient):
             raise ProtocolCommandError(
                 op.protocol_error, op.protocol_error.get("pending_command")
             )
-        if any(code in FAULT_EVENTS for code, _ in events):
+        if (
+            any(code in FAULT_EVENTS for code, _ in events)
+            or self._last(FAULT_KEYS) > op._since
+        ):
             raise SessionError("Machine reported a fault; inspect last machine event")
         states = [
             int.from_bytes(data[:4], "little")
@@ -1177,6 +1258,11 @@ class Interaction(MachineControls, ReadOnlyClient):
             boundary: list[float] = []
 
             def transmitted() -> None:
+                # Recheck immediately before the final chunk: a fault or motion
+                # reported between chunks withholds it, so the machine never
+                # receives a complete start. The begun frame then blocks every
+                # later write on this link instead of corrupting the next one.
+                self._refuse_changed_machine(op)
                 op._armed = True  # starts can take effect before their ACK
                 boundary.append(time.monotonic())
 
@@ -1197,7 +1283,11 @@ class Interaction(MachineControls, ReadOnlyClient):
                     raise SessionError(
                         "Connection lost during operation; machine state unknown"
                     )
-                success = self._completed(op)
+                # Recipes and tea skip their stop on natural completion, so
+                # newer motion than the completion means it is still running.
+                success = self._completed(op) and (
+                    op.kind not in ("recipe", "tea") or not self._moving(op)
+                )
                 if success:
                     op.stop_observed = op.kind != "calibration"
                     break
@@ -1236,6 +1326,13 @@ class Interaction(MachineControls, ReadOnlyClient):
             # Even an interrupted cleanup leaves a final result for waiters.
             if op.cleanup_status == "pending":
                 op.cleanup_status = "skipped_uncertain"
+                self._uncertain = True
+            # Reconcile once more after cleanup, cancelled or not: motion newer
+            # than every stop or completion makes earlier evidence stale.
+            if op._armed and self._moving(op):
+                op.stop_observed = False
+                op.status = "unknown"
+                op.error = op.error or "Machine reports motion after the operation"
                 self._uncertain = True
             op.phase = op.status
             op._final = self.snapshot()
@@ -1280,7 +1377,8 @@ class Interaction(MachineControls, ReadOnlyClient):
 
     def _rest_and_motion(self, kind: str) -> tuple[int, int]:
         stopped_code = 40507 if kind in ("grinder", "calibration") else 40511
-        return self._last(((stopped_code, None), (8023, 1))), self._last(MOTION_KEYS)
+        rest = ((stopped_code, None), (8023, 1), (8023, 0x24))
+        return self._last(rest), self._last(MOTION_KEYS)
 
     def _stopped_since(self, revision: int, kind: str, stopped: bool) -> bool:
         """The newest stop or motion evidence after ``revision`` decides;

@@ -115,6 +115,18 @@ class _Link:
     lost = False
 
 
+class _Registration:
+    """One notification subscription on a link.
+
+    Invalidated before unsubscribing, on a failed subscribe and on link loss,
+    so a callback left registered by an earlier subscription on the same link
+    can never reach the cache or a later handshake.
+    """
+
+    def __init__(self, link: _Link) -> None:
+        self.link = link
+
+
 class ReadOnlyClient:
     """Connect, subscribe and register a session; never send settings or actions.
 
@@ -166,6 +178,7 @@ class ReadOnlyClient:
         self._subscribed = False
         self._handshake_armed = False
         self._link: _Link | None = None
+        self._registration: _Registration | None = None
         # True once this client, as owner, asked the transport to connect;
         # only then may cleanup close the (possibly shared) link.
         self._opened = False
@@ -190,6 +203,7 @@ class ReadOnlyClient:
         self._changed.set()
 
     def _disconnected(self) -> None:
+        self._registration = None
         self.state.connected = False
         self.state.session_ready = False
         self._signal()
@@ -274,18 +288,34 @@ class ReadOnlyClient:
     def _owns(self) -> bool:
         return _owners.get(self.address) is self and self._lease.held
 
-    def _link_notifications(self, link: _Link) -> Callable[[bytes], None]:
-        """Deliver notifications only while ``link`` is the current connection.
+    def _registered_notifications(
+        self, registration: _Registration
+    ) -> Callable[[bytes], None]:
+        """Deliver notifications only while ``registration`` is current.
 
-        A callback queued by an earlier connection must not reach the next
-        handshake or its cache.
+        A callback queued by an earlier connection, or left registered by an
+        earlier subscription on this one, must not reach the next handshake or
+        its cache.
         """
 
         def notification(data: bytes) -> None:
-            if self._link is link and not link.lost:
+            link = registration.link
+            if (
+                self._registration is registration
+                and self._link is link
+                and not link.lost
+            ):
                 self._notification(data)
 
         return notification
+
+    def _new_registration(self, link: _Link) -> _Registration:
+        """Start a registration whose handshake state owes nothing to earlier ones."""
+        registration = self._registration = _Registration(link)
+        self._ack.clear()
+        self._handshake_armed = False
+        self._session_error = None
+        return registration
 
     def _link_callback(self, link: _Link) -> Callable[[], None]:
         def lost() -> None:
@@ -330,8 +360,17 @@ class ReadOnlyClient:
                 raise SessionError("Connect before subscribing")
             if not self._subscribed:
                 assert self._link is not None  # set whenever connected
-                callback = self._link_notifications(self._link)
-                await self._call(self.transport.subscribe(callback))
+                registration = self._new_registration(self._link)
+                try:
+                    await self._call(
+                        self.transport.subscribe(
+                            self._registered_notifications(registration)
+                        )
+                    )
+                except BaseException:
+                    if self._registration is registration:
+                        self._registration = None
+                    raise
                 self._subscribed = True
 
     async def open_session(self) -> None:
@@ -344,14 +383,18 @@ class ReadOnlyClient:
                 raise SessionError("Connect and subscribe before opening a session")
             if self.state.session_ready:
                 return
+            registration = self._registration
+            if registration is None:
+                raise SessionError("Subscription lost; subscribe again")
             self._ack.clear()
             self._handshake_armed = False
+            self._session_error = None
             # Allow the peripheral to finish enabling its notification subscription.
             await asyncio.sleep(self.subscription_settle)
             await self._call(self._send_handshake())
             deadline = time.monotonic() + self.handshake_timeout
             while not self._ack.is_set() and self._session_error is None:
-                if not self.state.connected:
+                if not self.state.connected or self._registration is not registration:
                     raise SessionError("Disconnected during handshake")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -364,7 +407,7 @@ class ReadOnlyClient:
             await asyncio.sleep(self.settle)
             if self._session_error is not None:
                 raise self._session_error
-            if not self.state.connected:
+            if not self.state.connected or self._registration is not registration:
                 raise SessionError("Disconnected during initialization")
             self.state.session_ready = True
             self._signal()
@@ -426,6 +469,9 @@ class ReadOnlyClient:
             if self.state.session_ready:
                 self.state.session_ready = False
                 self._signal()
+            # Late callbacks of this registration are ignored from here on,
+            # even if stop_notify fails and leaves them registered.
+            self._registration = None
             if self._subscribed:
                 self._subscribed = False
                 await self._call(self.transport.unsubscribe())
@@ -439,6 +485,7 @@ class ReadOnlyClient:
         finally:
             self._opened = False
             self._link = None
+            self._registration = None
             self._subscribed = False
             self._disconnected()
             if _owners.get(self.address) is self:

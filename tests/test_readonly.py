@@ -716,6 +716,81 @@ class LifecycleRoundTwoTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("serial_number", c.snapshot()["fields"])
 
 
+class LifecycleRoundThreeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_same_link_callback_cannot_feed_next_handshake(self):
+        # S3: each subscription has its own identity. A callback of an earlier
+        # subscription on the same link, even one left registered by a failed
+        # unsubscribe, can neither satisfy nor poison the next handshake.
+        class Stuck(ScriptedConnector):
+            fail = False
+
+            async def stop_notify(self):
+                self.calls.append("stop_notify")
+                if self.fail:
+                    raise OSError("radio")
+                self._callback = None
+
+        error = reply(65534, u32(7), marker=0xCD)
+        link = Stuck("sim-registration")
+        c = ReadOnlyClient(
+            connector=link, settle=0, subscription_settle=0, handshake_timeout=0.05
+        )
+        async with c:
+            first = link._callback
+            await c.unsubscribe()
+            await c.subscribe()
+            packets = len(c.packets)
+            first(reply(8023, u32(0x22)))
+            first(error)
+            self.assertEqual(len(c.packets), packets)
+            link.responder = lambda packet: (first(ACK), [])[1]
+            with self.assertRaisesRegex(SessionError, "No handshake acknowledgment"):
+                await c.open_session()
+            self.assertFalse(c.snapshot()["session_ready"])
+            link.responder = SimulatedStudio()
+            await c.open_session()
+            self.assertTrue(c.snapshot()["session_ready"])
+
+            second = link._callback
+            link.fail = True
+            with self.assertRaisesRegex(SessionError, "radio"):
+                await c.unsubscribe()
+            self.assertIs(link._callback, second)  # still registered
+            second(error)
+            second(ACK)
+            self.assertEqual(len(c.packets), packets + 4)
+            link.fail = False
+            await c.subscribe()
+            await c.open_session()
+            self.assertTrue(c.snapshot()["session_ready"])
+
+    async def test_failed_subscribe_invalidates_its_registration(self):
+        # S3: a callback registered by a subscribe that then failed is dead.
+        class Failing(ScriptedConnector):
+            fail = True
+
+            async def start_notify(self, callback):
+                await super().start_notify(callback)
+                if self.fail:
+                    self.fail = False
+                    raise OSError("radio")
+
+        link = Failing("sim-failed-subscribe")
+        c = ReadOnlyClient(connector=link, settle=0, subscription_settle=0)
+        await c.connect()
+        try:
+            with self.assertRaisesRegex(SessionError, "radio"):
+                await c.subscribe()
+            stale = link._callback
+            stale(reply(65534, u32(7), marker=0xCD))
+            self.assertEqual(len(c.packets), 0)
+            await c.subscribe()
+            await c.open_session()
+            self.assertTrue(c.snapshot()["session_ready"])
+        finally:
+            await c.disconnect()
+
+
 class BoundedWaitTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_racing_completion_still_propagates(self):
         async def instant():

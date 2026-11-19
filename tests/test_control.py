@@ -1565,6 +1565,254 @@ class LifecycleRoundTwoTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(session.get_state()["recovery_required"])
 
 
+def _units(source):
+    """8015 units/source event payload: weight, temperature, water source."""
+    return u32(1) + u32(1) + u32(source)
+
+
+async def _held_start(m, during):
+    """Run start_water while its start journal hook injects ``during``."""
+    gate = Gate(4506, action=during)
+    gate.release.set()
+    async with interaction(m, command_hooks=gate) as session:
+        op = await session.start_water(volume_ml=10)
+        result = await asyncio.wait_for(op.wait(), 2)
+        return result, session.get_state()
+
+
+class LifecycleRoundThreeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_units_source_event_is_the_latest_reported_source(self):
+        # S2: an 8015 report supersedes the identity block's source byte; an
+        # unmapped one makes the source unknown; an acknowledged selection
+        # still overrides any report.
+        m = Machine()
+        m.studio.auto_complete = True
+        async with interaction(m) as session:
+            m.emit(8015, _units(1))
+            result = await (await session.start_water(volume_ml=10)).wait()
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(_start_source(m), 1)
+            m.emit(8015, _units(7))
+            with self.assertRaisesRegex(SessionError, "configuration unknown"):
+                await session.start_water(volume_ml=10)
+            m.emit(8015, _units(0))
+            session._selected_water_source = 1
+            result = await (await session.start_water(volume_ml=10)).wait()
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(_start_source(m), 1)
+            self.assertEqual(m.codes().count(4506), 2)
+
+    async def test_units_source_change_after_admission_blocks_start(self):
+        # S2: an 8015 change after admission makes the encoded source stale.
+        m = Machine()
+        result, state = await _held_start(m, lambda: m.emit(8015, _units(1)))
+        self.assertIn("Water source changed", result["error"])
+        self.assertNotIn(4506, m.codes())
+        self.assertFalse(state["recovery_required"])
+
+    async def test_outstanding_motion_event_blocks_admission(self):
+        # S2: a brewer start or recipe-brewer event newer than any rest
+        # evidence is motion, although the last state code still says idle.
+        for code, payload in ((9005, u32(0) * 3), (40502, b"")):
+            m = Machine()
+            async with interaction(m) as session:
+                m.emit(code, payload)
+                state = session.state.observations["machine_state_code"]
+                self.assertEqual(state.value, 1)
+                with self.assertRaisesRegex(BusyError, "motion"):
+                    await session.start_water(volume_ml=10)
+                with self.assertRaisesRegex(BusyError, "motion"):
+                    await session.start_recipe(EncodedRecipe(b"x", 10))
+                m.state(1)
+                session._require_idle()  # newer rest evidence clears it
+            self.assertEqual(m.codes()[:1], [8100])
+            self.assertEqual(m.codes().count(4506) + m.codes().count(8002), 0)
+
+    async def test_motion_events_after_admission_block_start(self):
+        # S2: 9005 and 40502 are motion keys at the start boundary.
+        for code, payload in ((9005, u32(0) * 3), (40502, b"")):
+            m = Machine()
+            result, state = await _held_start(
+                m, lambda m=m, c=code, p=payload: m.emit(c, p)
+            )
+            self.assertIn("motion before start", result["error"])
+            self.assertNotIn(4506, m.codes())
+            self.assertTrue(state["recovery_required"])
+
+    async def test_fault_with_source_change_always_requires_recovery(self):
+        # S2: fault is checked before the source mismatch, in either order.
+        changes = (
+            (8015, _units(1)),
+            (40521, identity_block(source=1, size=63)),
+        )
+        for fault_first in (False, True):
+            for code, payload in changes:
+                m = Machine()
+
+                def during(m=m, f=fault_first, c=code, p=payload):
+                    if f:
+                        m.emit(40517)
+                    m.emit(c, p)
+                    if not f:
+                        m.emit(40517)
+
+                result, state = await _held_start(m, during)
+                self.assertIn("fault before start", result["error"])
+                self.assertNotIn(4506, m.codes())
+                self.assertTrue(state["recovery_required"])
+
+    async def test_fault_or_motion_between_start_chunks_withholds_final_chunk(
+        self,
+    ):
+        # S2: a fault or external motion reported after the first chunk of a
+        # multi-chunk start withholds its final chunk, so the machine never
+        # receives a complete start. The begun frame blocks every later write
+        # on the link instead of being completed by unrelated bytes.
+        start = (4506).to_bytes(2, "little")
+        injections = (
+            lambda m: m.emit(40517),
+            lambda m: m.emit(9005, u32(0) * 3),
+            lambda m: m.emit(40502),
+            lambda m: m.state(0x23),
+        )
+        for inject in injections:
+            m = Machine()
+            chunks, kinds = [], []
+
+            def sink(kind, data, m=m, chunks=chunks, kinds=kinds, inject=inject):
+                kinds.append(kind)
+                raw = bytes.fromhex(data["hex"])
+                if kind != "ble.outgoing_chunk":
+                    return
+                if raw[:1] == b"\x58" and raw[3:5] == start:
+                    chunks.append(raw)
+                elif len(chunks) == 1:
+                    chunks.append(raw)
+                    inject(m)
+
+            async with interaction(m) as session:
+                session.transport.event_sink = sink
+                op = await session.start_water(volume_ml=10)
+                result = await asyncio.wait_for(op.wait(), 2)
+                self.assertEqual(result["status"], "failed")
+                self.assertIn("before start", result["error"])
+                self.assertFalse(op._armed)
+                self.assertEqual(m.writes[-1], chunks[0])
+                self.assertNotIn(4506, m.codes())
+                self.assertNotIn(4507, m.codes())
+                self.assertIn("ble.outgoing_chunk_withheld", kinds)
+                self.assertEqual(result["cleanup_status"], "skipped_uncertain")
+                self.assertTrue(session.get_state()["recovery_required"])
+                writes = len(m.writes)
+                with self.assertRaisesRegex(SessionError, "partially written"):
+                    await session._command(8022)
+                self.assertEqual(len(m.writes), writes)
+
+    async def test_recipe_completion_followed_by_motion_is_not_completion(self):
+        # S11: a completion followed by newer pouring is still running: the
+        # operation neither ends naturally nor skips its stop.
+        for motion in (lambda m: m.state(0x23), lambda m: m.emit(9005, u32(0) * 3)):
+            m = Machine()
+            async with interaction(m) as session:
+                op = await session.start_recipe(EncodedRecipe(b"x", 10))
+                await transmitted(m, 8002)
+                m.state(0x24)
+                motion(m)
+                await asyncio.sleep(0.15)
+                self.assertFalse(op.done)
+                result = await session.stop()
+                self.assertIn(40519, m.codes())
+                self.assertEqual(result["status"], "stopped")
+                self.assertTrue(result["stop_observed"])
+        # A later completion with no newer motion still ends without a stop.
+        m = Machine()
+        async with interaction(m) as session:
+            op = await session.start_recipe(EncodedRecipe(b"x", 10))
+            await transmitted(m, 8002)
+            m.state(0x24)
+            m.state(0x23)
+            await asyncio.sleep(0.1)
+            m.state(0x24)
+            result = await asyncio.wait_for(op.wait(), 1)
+            self.assertEqual(result["status"], "completed")
+            self.assertNotIn(40519, m.codes())
+
+    async def test_motion_during_cleanup_voids_stop_evidence(self):
+        # S11: motion reported after the stop was observed, during later
+        # cleanup commands, leaves an unknown result, also when the worker
+        # is cancelled during that cleanup.
+        m = Machine()
+        async with interaction(m) as session:
+            op = await session.start_water(volume_ml=10)
+            await transmitted(m, 4506)
+            m.overrides[8022] = lambda p: [reply(8022), reply(8023, u32(0x23))]
+            result = await session.stop()
+            self.assertTrue(result["stop_acknowledged"])
+            self.assertFalse(result["stop_observed"])
+            self.assertEqual(result["status"], "unknown")
+            self.assertIn("motion", result["error"])
+            self.assertTrue(session.get_state()["recovery_required"])
+        m = Machine()
+        m.block_code = 8013
+        async with interaction(m) as session:
+            op = await session.start_water(volume_ml=10)
+            await transmitted(m, 4506)
+            stopping = asyncio.create_task(session.stop())
+            await blocked_write(m, op._task)
+            self.assertTrue(op.stop_observed)
+            m.state(0x23)
+            op._task.cancel()
+            await asyncio.sleep(0)
+            m.release.set()
+            result = await asyncio.wait_for(stopping, 1)
+            self.assertTrue(op._task.cancelled())
+            self.assertTrue(result["stop_acknowledged"])
+            self.assertFalse(result["stop_observed"])
+            self.assertEqual(result["status"], "unknown")
+            self.assertTrue(session.get_state()["recovery_required"])
+
+    async def test_ack_after_budget_during_noncooperative_cleanup_is_rejected(
+        self,
+    ):
+        # A4: the start ACK arrives after the pulse budget, while a connector
+        # that resists cancellation still holds the write. Its eligibility is
+        # judged at receipt, so it never confirms the start.
+        class Resisting(Machine):
+            active = 0
+            overlap = False
+
+            async def write(self, data):
+                self.active += 1
+                self.overlap = self.overlap or self.active > 1
+                try:
+                    sent = len(self.sent)
+                    await super().write(data)
+                    if len(self.sent) > sent and self.sent[-1].command == 3500:
+                        try:
+                            await asyncio.sleep(10)
+                        except asyncio.CancelledError:
+                            await asyncio.sleep(0.3)  # ignores cancellation
+                finally:
+                    self.active -= 1
+
+        m = Resisting()
+        m.studio.silent.add(3500)
+        loop = asyncio.get_running_loop()
+        async with interaction(m, ack_timeout=1, write_timeout=5) as session:
+            op = await session.start_grinder(size=5, rpm=80, duration_s=0.1)
+            await transmitted(m, 3500)
+            late = loop.call_later(0.2, m.emit, 3500)
+            result = await asyncio.wait_for(op.wait(), 3)
+            late.cancel()
+            self.assertEqual(m.dropped, [])
+            self.assertFalse(m.overlap)
+            self.assertEqual(m.codes().count(3500), 1)
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("budget", result["error"])
+            self.assertTrue(result["stop_acknowledged"])
+            self.assertTrue(session.get_state()["recovery_required"])
+
+
 class EncodedRecipeTests(unittest.TestCase):
     def test_validation_and_settings_bytes(self):
         for kwargs in (
