@@ -1513,6 +1513,7 @@ class LifecycleRoundTwoTests(unittest.IsolatedAsyncioTestCase):
         # same link; nothing overlaps, nothing is retried.
         class Suspending(Machine):
             resist = 0.0
+            cancels = 0
             active = 0
             overlap = False
 
@@ -1526,13 +1527,19 @@ class LifecycleRoundTwoTests(unittest.IsolatedAsyncioTestCase):
                         try:  # final start chunk delivered; return suspends
                             await asyncio.sleep(10)
                         except asyncio.CancelledError:
+                            self.cancels += 1
                             if not self.resist:
                                 raise
                             await asyncio.sleep(self.resist)
                 finally:
                     self.active -= 1
 
-        for acked, resist in ((True, 0.0), (False, 0.0), (True, 0.3)):
+        for acked, resist, write_timeout in (
+            (True, 0.0, 5),
+            (False, 0.0, 5),
+            (True, 0.3, 5),
+            (True, 0.3, 0.25),
+        ):
             m = Suspending()
             m.resist = resist
             if not acked:
@@ -1542,12 +1549,15 @@ class LifecycleRoundTwoTests(unittest.IsolatedAsyncioTestCase):
                 t.setdefault(3505, time.monotonic()),
                 m.studio(p),
             )[1]
-            async with interaction(m, ack_timeout=1, write_timeout=5) as session:
+            async with interaction(
+                m, ack_timeout=1, write_timeout=write_timeout
+            ) as session:
                 started = time.monotonic()
                 op = await session.start_grinder(size=5, rpm=80, duration_s=0.1)
                 result = await asyncio.wait_for(op.wait(), 3)
                 elapsed = times[3505] - started
                 self.assertFalse(m.overlap)
+                self.assertEqual(m.cancels, 1)
                 self.assertEqual(m.codes().count(3500), 1)
                 self.assertTrue(result["stop_acknowledged"])
                 if resist:
@@ -1557,7 +1567,11 @@ class LifecycleRoundTwoTests(unittest.IsolatedAsyncioTestCase):
                     self.assertLess(elapsed, 0.1 + resist + 0.3)
                 else:
                     self.assertLess(elapsed, 0.1 + 0.3)
-                if acked:
+                if write_timeout < 0.1 + resist:
+                    self.assertEqual(result["status"], "failed")
+                    self.assertIn("write_timeout", result["error"])
+                    self.assertTrue(session.get_state()["recovery_required"])
+                elif acked:
                     self.assertEqual(result["status"], "completed")
                     self.assertTrue(result["start_observed"])
                     self.assertFalse(session.get_state()["recovery_required"])

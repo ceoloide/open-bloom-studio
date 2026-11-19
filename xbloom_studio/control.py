@@ -895,9 +895,7 @@ class Interaction(MachineControls, ReadOnlyClient):
                 cancelled = write.cancelled()
                 if not cancelled:
                     write.result()
-                if expired == ["write"] or (
-                    not expired and finished_at >= write_deadline
-                ):
+                if expired == ["write"] or finished_at >= write_deadline:
                     raise asyncio.TimeoutError(
                         "Write did not finish within write_timeout; delivery unknown"
                     )
