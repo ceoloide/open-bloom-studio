@@ -21,7 +21,7 @@ classifiers = [
 ble = ["bleak>=1.0,<3"]
 
 [project.urls]
-Repository = "https://github.com/ceoloide/open-bloom-studio"
+Repository = "https://github.com/ceoloide/open-xbloom-studio-tools"
 
 [dependency-groups]
 dev = [
