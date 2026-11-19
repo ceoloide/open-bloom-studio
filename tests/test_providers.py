@@ -320,6 +320,13 @@ class HttpTest(unittest.TestCase):
             opener.open.return_value = FakeResponse(result)
         return mock.patch("xbloom_studio.providers.build_opener", return_value=opener)
 
+    def test_deep_and_nonfinite_http_json_is_rejected(self):
+        url = "https://collective-api.xbloom.com/communityRecipe/recipe/detail"
+        for body in (b'{"x": NaN}', b'{"x": 1e900}', b"[" * 90 + b"0" + b"]" * 90):
+            with self.subTest(body=body):
+                with self.opener(body), self.assertRaisesRegex(ProviderError, "JSON"):
+                    HubProviders()._json(url)
+
     def test_bounded_json_requests(self):
         hubs = HubProviders()
         url = "https://collective-api.xbloom.com/communityRecipe/recipe/detail"
@@ -380,6 +387,20 @@ class NativeConversionTest(unittest.TestCase):
             # RT(39) 90 ml 20 s; 80 ml at 99, 1 min 15 s, flow 35; ratio 425 & 255
             "105a270000ec00781e50630000f120002332a9",
         )
+
+    def test_native_whole_bypass_and_null_optional_fields(self):
+        expected = native_document({"raw": native_coffee()}, "coffee", ProviderError)
+        raw = native_coffee(
+            bypassVolume=20.0, totalBrewWater=None, ratio=None, pourCount=None
+        )
+        result = native_document({"raw": raw}, "coffee", ProviderError)
+        self.assertEqual(
+            encode_coffee_recipe(result).payload, encode_coffee_recipe(expected).payload
+        )
+        raw = single([native_pour(45, 98, 30)])
+        raw["recipeVo"]["pourCount"] = True
+        with self.assertRaisesRegex(ProviderError, "pourCount"):
+            native_document({"raw": raw}, "coffee", ProviderError)
 
     def test_native_sources_refuse_inexact_conversions(self):
         cases = [
@@ -565,6 +586,41 @@ class ImportServiceTest(unittest.TestCase):
             ],
             "https://xbloom-app.vercel.app/recipe/synthetic-1",
         )
+
+    def test_signed_export_url_is_removed_before_persistence(self):
+        export = xrecipe_document()
+        export["fields"]["image"] = {
+            "stringValue": "https://example.com/blob?sp=r&sv=2023-01-03&sig=synthetic"
+        }
+        imported = self.imports.import_export(export, target="coffee")
+        retained = self.store.get_import(imported["id"])
+        recipe = self.store.get_recipe(imported["recipe"]["id"])
+        self.assertNotIn("sig=synthetic", json.dumps([retained, recipe]))
+
+    def test_nonfinite_typed_values_are_retained_as_blocked(self):
+        url = "https://xbloom-app.vercel.app/recipe/synthetic-1"
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                export = xrecipe_document()
+                export["fields"]["optional"] = {"doubleValue": value}
+                imports = RecipeImports(
+                    self.store, HubProviders(Stub({"firestore": export}))
+                )
+                for result in (
+                    imports.import_export(export, target="coffee"),
+                    imports.import_recipe(url, target="coffee"),
+                ):
+                    self.assertIsNotNone(result["error"])
+                    self.assertIsNone(result["source"]["raw"])
+                    raw = result["source"]["raw_document"]
+                    self.assertEqual(raw["fields"]["optional"], {"doubleValue": value})
+
+    def test_tea_cup_type_prevents_host_adaptation(self):
+        export = xrecipe_document()
+        export["fields"]["xBloomData"] = firestore({**HOST_RAW, "cupType": 4})
+        blocked = self.imports.import_export(export, flow_ml_s=3)
+        self.assertIn("Tea requires", blocked["error"])
+        self.assertNotIn("recipe", blocked)
 
     def test_offline_export_import_and_refresh_without_upstream(self):
         imported = self.imports.import_export(xrecipe_document(), target="coffee")

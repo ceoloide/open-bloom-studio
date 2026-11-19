@@ -16,6 +16,7 @@ explicit reason. Offline xRecipe exports remain supported, see
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -23,7 +24,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .provider_exports import read_export
+from .provider_exports import check_document_bounds, read_export
 from .provider_native import native_document
 from .recipes import number, validate_recipe
 
@@ -173,7 +174,9 @@ class HubProviders:
         if len(raw) > MAX_RESPONSE:
             raise ProviderError("Provider response exceeds 2 MiB")
         try:
-            return json.loads(raw)
+            result = json.loads(raw)
+            check_document_bounds(result)
+            return result
         except (UnicodeError, ValueError, RecursionError) as exc:
             raise ProviderError("Provider response is not bounded JSON") from exc
 
@@ -288,7 +291,7 @@ class HubProviders:
             }
             try:
                 source["raw"] = self._firestore({"mapValue": {"fields": raw["fields"]}})
-            except (ProviderError, AttributeError, TypeError, ValueError) as exc:
+            except (AttributeError, TypeError, ValueError, OverflowError) as exc:
                 source["raw"] = None
                 source["decode_error"] = str(
                     exc
@@ -313,7 +316,10 @@ class HubProviders:
         if "integerValue" in value:
             return int(value["integerValue"])
         if "doubleValue" in value:
-            return float(value["doubleValue"])
+            decoded = float(value["doubleValue"])
+            if not math.isfinite(decoded):
+                raise ProviderError("Firestore doubleValue must be finite")
+            return decoded
         if "nullValue" in value:
             return None
         raise ProviderError("Unsupported Firestore value; export source data instead")
@@ -327,12 +333,12 @@ class HubProviders:
         """Adapt a retained source; refuse rather than guess any missing setting."""
         if target not in ("host", "coffee", "tea"):
             raise ProviderError("Conversion target must be host, coffee or tea")
+        if source.get("decode_error"):
+            raise ProviderError(source["decode_error"])
         if target != "host":
             if source.get("native_decode_error"):
                 raise ProviderError(source["native_decode_error"])
             return native_document(source, target, ProviderError)
-        if source.get("decode_error"):
-            raise ProviderError(source["decode_error"])
         return self._host_document(source, flow_ml_s)
 
     def _host_document(
@@ -357,7 +363,10 @@ class HubProviders:
             raise ProviderError(
                 "Recipe targets another machine; explicit adaptation required"
             )
-        if r.get("cupTypeInt") == 4 or r.get("cupTypeName") == "TEA":
+        if (
+            4 in (r.get("cupTypeInt"), r.get("cupType"))
+            or r.get("cupTypeName") == "TEA"
+        ):
             raise ProviderError(
                 "Tea requires native encoding or an explicitly authored host plan"
             )
@@ -365,13 +374,6 @@ class HubProviders:
         pours = r.get("pourList") or r.get("pours")
         if not isinstance(pours, list) or not pours:
             raise ProviderError("Source has no supported pour list")
-        if any(
-            r.get(k)
-            for k in ("bypass", "bypassWater", "bypassVolume", "cupLimits", "vibration")
-        ):
-            raise ProviderError(
-                "Native bypass/cup/vibration behavior cannot be silently adapted"
-            )
         steps: list[dict[str, Any]] = []
         if r.get("dose") or r.get("grinderSize"):
             steps.append(
@@ -388,6 +390,8 @@ class HubProviders:
                 raise ProviderError(
                     "Unsupported pour fields; source retained without lossy conversion"
                 )
+            if not {"volume", "temperature"} <= pour.keys():
+                raise ProviderError("Source pour requires volume and temperature")
             number(pour.get("pattern"), "pattern", 1, 3, True)
             if "pausing" in pour:
                 number(pour["pausing"], "pausing", 0, 3600)

@@ -100,6 +100,18 @@ class RecipeStoreTest(StoreTestCase):
         with self.assertRaises(ValueError):
             store.recipes(limit=0)
 
+    def test_match_ignores_null_filters_and_metadata_values(self):
+        service = RecipeService(self.store)
+        self.store.create_recipe(
+            {**host("First"), "coffee": {"origin": "Sample A", "roaster": None}}
+        )
+        expected = self.store.create_recipe(
+            {**host("Second"), "coffee": {"origin": "Sample B", "roaster": "Example"}}
+        )
+        results = service.match({"origin": "Sample B", "roaster": None})
+        self.assertEqual([row["id"] for row in results], [expected["id"]])
+        self.assertEqual(service.match({"roaster": "none"}), [])
+
     def test_compare_from_brew_and_match(self):
         service = RecipeService(self.store)
         row = self.store.create_recipe(host("Water"))

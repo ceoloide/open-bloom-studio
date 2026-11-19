@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -68,7 +69,7 @@ class MigrationTest(unittest.TestCase):
         self.path = Path(directory.name) / "history.db"
 
     def legacy(self, layout="v1"):
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.executescript(LAYOUTS[layout])
             db.execute("INSERT INTO recipes VALUES('coffee','Old coffee',1,1,0)")
             db.execute(
@@ -95,7 +96,7 @@ class MigrationTest(unittest.TestCase):
                 )
 
     def snapshot(self):
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             tables = [
                 r[0]
                 for r in db.execute(
@@ -109,7 +110,7 @@ class MigrationTest(unittest.TestCase):
             }
 
     def pragmas(self):
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             return (
                 db.execute("PRAGMA user_version").fetchone()[0],
                 db.execute("PRAGMA application_id").fetchone()[0],
@@ -147,7 +148,7 @@ class MigrationTest(unittest.TestCase):
         reference = sqlite3.connect(":memory:")
         try:
             reference.executescript(LAYOUTS["v2"])
-            with sqlite3.connect(self.path) as db:
+            with closing(sqlite3.connect(self.path)) as db, db:
                 self.assertEqual(migrations._layout(db), migrations._layout(reference))
         finally:
             reference.close()
@@ -181,7 +182,7 @@ class MigrationTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=4) as workers:
             list(workers.map(open_store, range(4)))
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             self.assertEqual(db.execute("SELECT count(*) FROM events").fetchone()[0], 6)
         self.assertEqual(self.pragmas()[0], 2)
 
@@ -194,7 +195,7 @@ class MigrationTest(unittest.TestCase):
         ):
             with self.subTest(sql=sql):
                 self.path.unlink(missing_ok=True)
-                with sqlite3.connect(self.path) as db:
+                with closing(sqlite3.connect(self.path)) as db, db:
                     db.execute(sql)
                 before = self.path.read_bytes()
                 with self.assertRaisesRegex(ValueError, message):
@@ -213,14 +214,14 @@ class MigrationTest(unittest.TestCase):
             with self.subTest(sql=sql):
                 self.path.unlink(missing_ok=True)
                 self.legacy("v2")
-                with sqlite3.connect(self.path) as db:
+                with closing(sqlite3.connect(self.path)) as db, db:
                     db.execute(sql)
                 before = self.path.read_bytes()
                 with self.assertRaisesRegex(ValueError, "supported layout"):
                     Store(self.path)
                 self.assertEqual(self.path.read_bytes(), before)
         self.path.unlink()
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.executescript(
                 TABLES.replace("events are append-only", "EVENTS ARE APPEND-ONLY", 1)
                 + "PRAGMA user_version=1;"
@@ -230,7 +231,7 @@ class MigrationTest(unittest.TestCase):
 
     def test_statistics_tables_are_not_drift(self):
         self.legacy()
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("ANALYZE")
         Store(self.path).close()
 

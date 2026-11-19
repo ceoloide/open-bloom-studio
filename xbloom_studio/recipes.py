@@ -349,7 +349,9 @@ class RecipeService:
                     include_temporary=True, limit=1000, cursor=cursor, detail="full"
                 )
                 for row in page["items"]:
-                    metadata = row["document"].get("coffee", {})
+                    metadata = row["document"].get("coffee")
+                    if not isinstance(metadata, dict):
+                        metadata = {}
                     reasons = []
                     score = 0
                     for field, weight in (
@@ -358,8 +360,11 @@ class RecipeService:
                         ("variety", 2),
                         ("origin", 2),
                     ):
-                        query = str(coffee.get(field, "")).strip().casefold()
-                        found = str(metadata.get(field, "")).strip().casefold()
+                        query, found = coffee.get(field), metadata.get(field)
+                        if query is None or found is None:
+                            continue
+                        query = str(query).strip().casefold()
+                        found = str(found).strip().casefold()
                         if query and found and (query == found or query in found):
                             score += weight
                             reasons.append(field)

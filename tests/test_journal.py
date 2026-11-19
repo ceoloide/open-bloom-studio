@@ -7,6 +7,7 @@ import struct
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -26,7 +27,7 @@ def frame(code):
 
 def committed_intents(path):
     """Read committed rows with an independent connection (WAL snapshot)."""
-    with sqlite3.connect(path) as reader:
+    with closing(sqlite3.connect(path)) as reader:
         rows = reader.execute(
             "SELECT data FROM events WHERE kind='command.intent'"
         ).fetchall()
@@ -328,6 +329,44 @@ class FailureTest(JournalTestCase):
 
 
 class RecorderTest(JournalTestCase):
+    async def test_close_refuses_new_events_before_draining(self):
+        started, release = threading.Event(), threading.Event()
+        original = self.store.append
+
+        def blocked(kind, data, **context):
+            if kind == "first":
+                started.set()
+                release.wait(5)
+            return original(kind, data, **context)
+
+        with mock.patch.object(self.store, "append", side_effect=blocked):
+            try:
+                self.recorder.emit("first", {})
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                closing = asyncio.create_task(self.recorder.close())
+                await asyncio.sleep(0)
+                self.recorder.emit("late", {})
+            finally:
+                release.set()
+            with self.assertRaisesRegex(RuntimeError, "after journal closed"):
+                await closing
+        self.assertEqual(self.kinds(), ["first"])
+
+    async def test_gap_counts_cover_only_new_losses(self):
+        self.recorder.slots = threading.BoundedSemaphore(1)
+        for count in (2, 1):
+            self.assertTrue(self.recorder.slots.acquire(blocking=False))
+            try:
+                for _ in range(count):
+                    self.recorder.emit("lost", {})
+            finally:
+                self.recorder.slots.release()
+            with self.assertRaisesRegex(RuntimeError, "queue full"):
+                await self.recorder.flush()
+        self.assertEqual(
+            [event["data"]["lost_events"] for event in self.store.events()], [2, 1]
+        )
+
     async def test_idle_telemetry_gate_and_capture_windows(self):
         with self.assertRaises(ValueError):
             Recorder(self.store, "sim", capture_idle_telemetry="no")

@@ -61,7 +61,7 @@ def credential_key(key: str) -> bool:
     )
 
 
-def _check_bounds(document: Any) -> None:
+def check_document_bounds(document: Any) -> None:
     """Iteratively bound depth and size; reject cycles and non-JSON values."""
     pending = [(document, 0)]
     seen: set[int] = set()
@@ -100,7 +100,7 @@ def read_export(
     document: Any, decode: Callable[[dict[str, Any]], Any]
 ) -> dict[str, Any]:
     """Return a sanitized import source for an owner-supplied export."""
-    _check_bounds(document)
+    check_document_bounds(document)
     redactions = 0
 
     def clean(value: Any) -> Any:
@@ -125,7 +125,7 @@ def read_export(
                     parsed.username
                     or parsed.password
                     or any(
-                        credential_key(key)
+                        key.casefold() == "sig" or credential_key(key)
                         for params in (
                             parsed.query,
                             parsed.fragment,

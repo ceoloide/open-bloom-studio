@@ -68,8 +68,9 @@ plan = compile_recipe(document)
 `xbloom_studio.storage.Store` keeps a local SQLite library of recipe
 revisions, aliases and brew history, by default under
 `$XDG_DATA_HOME/open-bloom/`. A repeated brew reuses its stored plan byte for
-byte. `xbloom_studio.journal.JournalHooks` records each command durably before
-its first byte is written.
+byte. `xbloom_studio.journal.JournalHooks` commits the intent before a normal
+command writes its first byte. Stop commands proceed after a bounded journal
+wait so a stalled disk cannot block a stop.
 
 The bundled starter recipes, coffee examples and tea profiles are original to
 this project. The example and tea lookups also accept your own collection

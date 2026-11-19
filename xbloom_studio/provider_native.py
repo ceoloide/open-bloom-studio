@@ -84,11 +84,13 @@ def native_document(
     pours = required("pourList")
     if not isinstance(pours, list) or not pours:
         raise error("Native source has no pours/steeps")
-    if "pourCount" in recipe and recipe["pourCount"] != len(pours):
+    if recipe.get("pourCount") is not None and (
+        not _numeric(recipe["pourCount"]) or recipe["pourCount"] != len(pours)
+    ):
         raise error("Source pourCount disagrees with pourList")
     set_size = flag(required("isSetGrinderSize"), "isSetGrinderSize")
     bypass_enabled = flag(required("isEnableBypassWater"), "isEnableBypassWater")
-    if "ratio" in recipe and (
+    if recipe.get("ratio") is not None and (
         not _numeric(recipe["ratio"]) or recipe["ratio"] != required("grandWater")
     ):
         raise error("Source ratio disagrees with grandWater")
@@ -128,7 +130,7 @@ def native_document(
                 vibration_after=after,
             )
         converted.append(item)
-    if "totalBrewWater" in recipe and (
+    if recipe.get("totalBrewWater") is not None and (
         not _numeric(recipe["totalBrewWater"])
         or recipe["totalBrewWater"] != sum(p["volume_ml"] for p in converted)
     ):
@@ -173,7 +175,7 @@ def native_document(
         if bypass_enabled:
             bypass_temperature = integer(required("bypassTemp"), "bypassTemp")
             bypass = {
-                "volume_ml": required("bypassVolume"),
+                "volume_ml": integer(required("bypassVolume"), "bypassVolume"),
                 "temperature": BYPASS_CODES.get(bypass_temperature, bypass_temperature),
             }
         document["coffee_recipe"] = {

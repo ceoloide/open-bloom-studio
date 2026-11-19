@@ -166,9 +166,9 @@ class Recorder:
                 if release:
                     self.slots.release()
 
-    def _append_gap(self, lost: int, **context: Any) -> None:
+    def _append_gap(self, lost: int, delta: int, **context: Any) -> None:
         self.store.append(
-            "capture.gap", {"lost_events": lost, "reason": "queue_overflow"}, **context
+            "capture.gap", {"lost_events": delta, "reason": "queue_overflow"}, **context
         )
         with self.lock:
             self.reported_lost = lost
@@ -189,6 +189,7 @@ class Recorder:
                     future = self.executor.submit(
                         self._append_gap,
                         lost,
+                        lost - self.reported_lost,
                         session_id=self.session_id,
                         sequence=self.sequence,
                         operation_id=self.operation_id,
@@ -203,10 +204,11 @@ class Recorder:
             raise RuntimeError(f"Journal failed: {self.error}") from self.error
 
     async def close(self) -> None:
+        with self.lock:
+            self.closed = True
         try:
             await self.flush()
         finally:
-            self.closed = True
             await asyncio.to_thread(self.executor.shutdown, wait=True)
 
 

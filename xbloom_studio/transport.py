@@ -113,7 +113,8 @@ class CommandHooks(Protocol):
     command guard and the first byte; raising prevents the write, except for
     stop commands, which wait at most ``STOP_HOOK_TIMEOUT`` and then proceed
     without waiting for the cancelled hook to finish. Exactly one of
-    ``write_completed`` and ``write_failed`` follows a write attempt. Neither
+    ``write_completed`` and ``write_failed`` follows a write attempt, including
+    when ``before_write`` raises before any bytes are written. Neither
     may block; their exceptions, an explicit ``CancelledError`` included, are
     suppressed so an observer can never turn a sent frame into a failure or
     hide the original write error.
