@@ -1334,6 +1334,9 @@ class Interaction(MachineControls, ReadOnlyClient):
                 op.status = "unknown"
                 op.error = op.error or "Machine reports motion after the operation"
                 self._uncertain = True
+            if not self.state.connected:
+                op.status = "unknown"
+                self._uncertain = True
             op.phase = op.status
             op._final = self.snapshot()
             self._signal()
@@ -1377,7 +1380,9 @@ class Interaction(MachineControls, ReadOnlyClient):
 
     def _rest_and_motion(self, kind: str) -> tuple[int, int]:
         stopped_code = 40507 if kind in ("grinder", "calibration") else 40511
-        rest = ((stopped_code, None), (8023, 1), (8023, 0x24))
+        rest: tuple[SeenKey, ...] = ((stopped_code, None), (8023, 1))
+        if kind in ("recipe", "tea"):
+            rest += ((8023, 0x24),)
         return self._last(rest), self._last(MOTION_KEYS)
 
     def _stopped_since(self, revision: int, kind: str, stopped: bool) -> bool:

@@ -1737,6 +1737,33 @@ class LifecycleRoundThreeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["status"], "completed")
             self.assertNotIn(40519, m.codes())
 
+    async def test_recipe_completion_is_rest_evidence_after_stop(self):
+        m = Machine()
+        m.overrides[40519] = lambda _: [reply(40519), reply(8023, u32(0x24))]
+        async with interaction(m) as session:
+            await session.start_recipe(EncodedRecipe(b"x", 10))
+            await transmitted(m, 8002)
+            m.state(0x23)
+            result = await session.stop()
+            self.assertEqual(result["status"], "stopped")
+            self.assertTrue(result["stop_observed"])
+
+    async def test_disconnect_during_cleanup_has_unknown_outcome(self):
+        m = Machine()
+
+        def drop_after_ack(_):
+            m.emit(8022)
+            m.drop()
+            return []
+
+        async with interaction(m) as session:
+            await session.start_water(volume_ml=10)
+            await transmitted(m, 4506)
+            m.overrides[8022] = drop_after_ack
+            result = await session.stop()
+            self.assertEqual(result["status"], "unknown")
+            self.assertTrue(session.get_state()["recovery_required"])
+
     async def test_motion_during_cleanup_voids_stop_evidence(self):
         # S11: motion reported after the stop was observed, during later
         # cleanup commands, leaves an unknown result, also when the worker
