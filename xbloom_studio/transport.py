@@ -282,6 +282,9 @@ class BleakTransport:
         # that completes the frame: the earliest moment the machine can act
         # on, or acknowledge, the command.
         self.on_transmit: Callable[[], None] | None = None
+        # Runs before each chunk's ``on_transmit``, after its other checks,
+        # with whether the chunk completes the frame; raising withholds it.
+        self.on_chunk: Callable[[bool], None] | None = None
         self._subscribed = False
         # True while an interrupted stop_notify leaves notifications unknown.
         self._notify_unknown = False
@@ -369,7 +372,10 @@ class BleakTransport:
                             self.command_guard()
                         if not self._subscribed or not self.connector.is_connected:
                             raise ConnectionError("No subscribed control connection")
-                    if offset + size >= len(frame) and self.on_transmit:
+                    final = offset + size >= len(frame)
+                    if self.on_chunk is not None:
+                        self.on_chunk(final)
+                    if final and self.on_transmit:
                         self.on_transmit()
                 except BaseException as exc:
                     # Keep the transcript exact: the observed chunk was withheld.

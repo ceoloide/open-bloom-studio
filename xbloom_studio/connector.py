@@ -19,7 +19,8 @@ Lifecycle, for each session the library owns:
    bound, or at a timed command's deadline such as a grinder pulse, is
    cancelled once, and any stop follows only after it returns. A write that
    ignores cancellation holds the link, and delays that stop, until it
-   returns.
+   returns; no later chunk of that frame is written either way, and a frame
+   left unfinished blocks every later write on the link.
 4. ``stop_notify()`` ends notifications; ``disconnect()`` closes the link and
    must be safe to call when already closed or after a failed connect.
 

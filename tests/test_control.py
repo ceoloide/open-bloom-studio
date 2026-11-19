@@ -18,6 +18,7 @@ from xbloom_studio import (
     UntestedOperationError,
 )
 from xbloom_studio.control import STOP_CODES
+from xbloom_studio.machine_controls import EncodedTeaRecipe
 from xbloom_studio.protocol import decode
 
 
@@ -2169,6 +2170,315 @@ class LifecycleRoundFourTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(session.transport.on_transmit)
                 self.assertIsNone(session.transport.command_guard)
                 self.assertFalse(session._commands.locked())
+
+
+class Stalling(Machine):
+    """Stall chunk ``index`` of the ``code`` frame until cancelled.
+
+    ``mode`` is what the connector then does: ``return`` absorbs the
+    cancellation and returns normally after writing the chunk, ``propagate``
+    writes the chunk and then lets the cancellation propagate, and ``error``
+    writes the chunk and raises an error without any cancellation. With
+    ``expire`` set, the write bound's own decision runs in the same loop
+    iteration that completes the chunk (``index`` 0) or that starts the
+    chunk (any other ``index``), before the write task resumes.
+    """
+
+    def __init__(self, code, index, mode, expire=None):
+        super().__init__()
+        self.code, self.index, self.mode, self.expire = code, index, mode, expire
+        self.position = None
+        self.cancels = 0
+        self.active = 0
+        self.overlap = False
+
+    async def write(self, data):
+        if data[:1] == b"\x58" and len(data) >= 5:
+            code = int.from_bytes(data[3:5], "little")
+            self.position = 0 if code == self.code else None
+        elif self.position is not None:
+            self.position += 1
+        self.active += 1
+        self.overlap = self.overlap or self.active > 1
+        try:
+            if self.position != self.index:
+                return await super().write(data)
+            await super().write(data)
+            if self.mode == "error":
+                raise OSError("link failed after this chunk")
+            loop = asyncio.get_running_loop()
+            done = loop.create_future()
+            if self.expire is not None and self.index == 0:
+
+                def complete_and_expire():
+                    done.set_result(None)  # wakes the write task...
+                    self.expire()  # ...which the deadline cancels first
+
+                loop.call_soon(complete_and_expire)
+            elif self.expire is not None:
+                self.expire()
+            try:
+                await done
+            except asyncio.CancelledError:
+                self.cancels += 1
+                if self.mode == "propagate":
+                    raise
+        finally:
+            self.active -= 1
+
+
+def _capture_write_expiry(test):
+    """Record each command's write-bound decision so a test can run it."""
+    loop = asyncio.get_running_loop()
+    real = loop.call_later
+    decisions = []
+
+    def call_later(delay, callback, *args, **kwargs):
+        if getattr(callback, "__name__", "") == "expire" and args == ("write",):
+            decisions.append(lambda: callback(*args))
+        return real(delay, callback, *args, **kwargs)
+
+    loop.call_later = call_later
+    test.addCleanup(lambda: loop.__dict__.pop("call_later", None))
+    return lambda: decisions[-1]()
+
+
+class LifecycleRoundFiveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_newer_identity_without_sufficiency_never_inherits_it(self):
+        # S2: only the latest identity block decides; a newer block whose
+        # water byte is not recognized, or whose layout is not, never keeps
+        # an earlier affirmative, even with an acknowledged source selection.
+        for block in (identity_block(water=2), identity_block(firmware=b"X")):
+            m = Machine()
+            m.studio.auto_complete = True
+            async with interaction(m) as session:
+                session._selected_water_source = 0
+                m.emit(40521, block)
+                for start in (
+                    lambda s=session: s.start_water(volume_ml=10),
+                    lambda s=session: s.start_recipe(EncodedRecipe(b"x", 10)),
+                ):
+                    with self.assertRaisesRegex(SessionError, "sufficiency"):
+                        await start()
+                self.assertFalse(session.get_state()["recovery_required"])
+                m.emit(40521, identity_block())
+                result = await (await session.start_water(volume_ml=10)).wait()
+                self.assertEqual(result["status"], "completed")
+            self.assertEqual(m.codes().count(4506), 1)
+        # Reported between the start's chunks: the final chunk is withheld.
+        m = Machine()
+        session, result = await LifecycleRoundFourTests.withheld_start(
+            self, m, lambda: m.emit(40521, identity_block(water=2))
+        )
+        try:
+            self.assertIn("sufficiency", result["error"])
+            self.assertTrue(session._partial_frame)
+        finally:
+            await session.disconnect()
+
+    async def test_low_water_before_grinder_or_calibration_start_is_a_fault(self):
+        # S2: low water reported while a grinder or calibration is configured
+        # is a fault before the single-chunk (calibration) or fragmented
+        # (grinder) start: byte one and the final chunk both refuse it.
+        low = (40522, u32(0))
+        for kind, code in (("grinder", 3500), ("calibration", 3502)):
+            m = Machine()
+            gate = Gate(code, action=lambda m=m: m.emit(*low))
+            gate.release.set()
+            async with interaction(
+                m, command_hooks=gate, allow_untested=True
+            ) as session:
+                if kind == "grinder":
+                    op = await session.start_grinder(size=5, rpm=80, duration_s=1)
+                else:
+                    op = await session.start_grinder_calibration()
+                result = await asyncio.wait_for(op.wait(), 2)
+                self.assertIn("fault before start", result["error"], kind)
+                self.assertTrue(session.get_state()["recovery_required"])
+                self.assertFalse(session._partial_frame)
+            self.assertNotIn(code, m.codes())
+            self.assertFalse(
+                any(w[3:5] == code.to_bytes(2, "little") for w in m.writes)
+            )
+        # Reported by the grinder's configuration command itself.
+        m = Machine()
+        m.overrides[8006] = lambda p: [reply(8006), reply(*low)]
+        async with interaction(m) as session:
+            op = await session.start_grinder(size=5, rpm=80, duration_s=1)
+            result = await asyncio.wait_for(op.wait(), 2)
+            self.assertIn("fault before start", result["error"])
+        self.assertNotIn(3500, m.codes())
+        # Between the grinder start's chunks.
+        sink, chunks, kinds = _split_start(3500, lambda: m.emit(*low))
+        m = Machine()
+        async with interaction(m) as session:
+            session.transport.event_sink = sink
+            op = await session.start_grinder(size=5, rpm=80, duration_s=1)
+            result = await asyncio.wait_for(op.wait(), 2)
+            self.assertIn("fault before start", result["error"])
+            self.assertIn("ble.outgoing_chunk_withheld", kinds)
+            self.assertEqual(m.writes[-1], chunks[0])
+            self.assertTrue(session._partial_frame)
+        self.assertNotIn(3500, m.codes())
+
+    async def test_bypass_start_is_brewer_motion(self):
+        # S11: a bypass start is brewer motion for admission, before the
+        # start and against an earlier recipe completion.
+        m = Machine()
+        async with interaction(m) as session:
+            m.emit(40520)
+            with self.assertRaisesRegex(BusyError, "motion"):
+                await session.start_water(volume_ml=10)
+            m.emit(40511)
+            session._require_idle()
+        m = Machine()
+        gate = Gate(8002, action=lambda: m.emit(40520))
+        gate.release.set()
+        async with interaction(m, command_hooks=gate) as session:
+            op = await session.start_recipe(EncodedRecipe(b"x", 10))
+            result = await asyncio.wait_for(op.wait(), 2)
+            self.assertIn("motion before start", result["error"])
+        self.assertNotIn(8002, m.codes())
+        m = Machine()
+        async with interaction(m) as session:
+            op = await session.start_recipe(EncodedRecipe(b"x", 10))
+            await transmitted(m, 8002)
+            m.state(0x24)
+            m.emit(40520)
+            await asyncio.sleep(0.15)
+            self.assertFalse(op.done)
+            result = await session.stop()
+            self.assertIn(40519, m.codes())
+            self.assertEqual(result["status"], "stopped")
+            self.assertTrue(result["stop_observed"])
+
+    async def test_recipe_stop_needs_whole_operation_rest(self):
+        # S11: after an explicit recipe or tea stop, a grinder stop or the
+        # brewer's rest at the end of one pour is no proof; machine idle or
+        # recipe completion is.
+        for kind in ("recipe", "tea"):
+            # The start reported pouring: a grinder stop leaves it outstanding.
+            for rest, observed, status in (
+                (reply(40507), False, "unknown"),
+                (reply(40511), False, "stopped"),
+                (reply(8023, u32(1)), True, "stopped"),
+                (reply(8023, u32(0x24)), True, "stopped"),
+            ):
+                m = Machine()
+                m.overrides[40519] = lambda p, r=rest: [reply(40519), r]
+                m.overrides[8022] = lambda p: [reply(8022)]  # cleanup adds no rest
+                async with interaction(m, allow_untested=True) as session:
+                    if kind == "recipe":
+                        await session.start_recipe(EncodedRecipe(b"x", 10))
+                        await transmitted(m, 8002)
+                    else:
+                        await session.start_tea(EncodedTeaRecipe(b"t"))
+                        await transmitted(m, 4512)
+                    result = await session.stop()
+                    self.assertTrue(result["stop_acknowledged"])
+                    self.assertEqual(result["stop_observed"], observed, (kind, rest))
+                    self.assertEqual(result["status"], status, (kind, rest))
+
+    async def interrupted_start(self, m, **options):
+        """Start water on ``m`` and return the session and its result."""
+        session = interaction(m, ack_timeout=0.2, **options)
+        await session.__aenter__()
+        self.addAsyncCleanup(session.disconnect)  # also if an assertion fails
+        op = await session.start_water(volume_ml=10)
+        return session, await asyncio.wait_for(op.wait(), 3)
+
+    async def assert_unfinished_frame_blocks_the_link(self, m, session, result):
+        start = frame(4506, struct.pack("<fffII", 30.0, 100.0, 200.0, 0, 0))
+        try:
+            self.assertEqual(m.writes[-1], start[:20])
+            self.assertNotIn(start[20:], m.writes)
+            self.assertNotIn(4506, m.codes())
+            self.assertNotIn(4507, m.codes())
+            self.assertEqual(result["status"], "failed")
+            self.assertTrue(session._partial_frame)
+            self.assertTrue(session.get_state()["recovery_required"])
+            self.assertFalse(m.overlap)
+            writes = len(m.writes)
+            with self.assertRaisesRegex(SessionError, "partially written"):
+                await session._command(8022)
+            await session.unsubscribe()
+            await session.subscribe()
+            with self.assertRaisesRegex(SessionError, "partially written"):
+                await session.open_session()
+            self.assertEqual(len(m.writes), writes)
+        finally:
+            await session.disconnect()
+        self.assertEqual(len(m.writes), writes)
+
+    async def test_write_deadline_during_nonfinal_chunk_latches_the_frame(self):
+        # A4: the write bound expires while the first of two 20-byte chunks
+        # is being written. Whether the connector absorbs the cancellation
+        # and returns or propagates it after delivery, the final chunk is
+        # never handed to it, and neither a command nor a same-link
+        # handshake can append to the begun frame.
+        for mode in ("return", "propagate"):
+            m = Stalling(4506, 0, mode)
+            session, result = await self.interrupted_start(m, write_timeout=0.1)
+            self.assertIn("write_timeout", result["error"], mode)
+            self.assertEqual(m.cancels, 1)
+            await self.assert_unfinished_frame_blocks_the_link(m, session, result)
+
+    async def test_deadline_simultaneous_with_chunk_completion_latches(self):
+        # A4: the deadline decision runs in the iteration that completes the
+        # first chunk, before the write task resumes to start the next one.
+        for mode in ("return", "propagate"):
+            m = Stalling(4506, 0, mode, expire=_capture_write_expiry(self))
+            session, result = await self.interrupted_start(m, write_timeout=5)
+            self.assertIn("write_timeout", result["error"], mode)
+            self.assertEqual(m.cancels, 1)
+            await self.assert_unfinished_frame_blocks_the_link(m, session, result)
+
+    async def test_error_after_nonfinal_chunk_latches_the_frame(self):
+        # A4: a connector error after a non-final chunk was attempted fails
+        # closed like a cancellation.
+        m = Stalling(4506, 0, "error")
+        session, result = await self.interrupted_start(m)
+        self.assertIn("link failed", result["error"])
+        await self.assert_unfinished_frame_blocks_the_link(m, session, result)
+
+    async def test_deadline_at_final_chunk_stays_unknown_and_stops(self):
+        # A4: once the final chunk is attempted delivery is ambiguous, not
+        # unfinished: no latch, recovery required, and a best-effort stop
+        # strictly after the write settles.
+        for mode in ("propagate", "error"):
+            m = Stalling(4506, 1, mode, expire=_capture_write_expiry(self))
+            session, result = await self.interrupted_start(m, write_timeout=5)
+            try:
+                self.assertIn(
+                    "write_timeout" if mode == "propagate" else "link failed",
+                    result["error"],
+                )
+                self.assertIn(4506, m.codes())
+                self.assertFalse(session._partial_frame)
+                self.assertTrue(session.get_state()["recovery_required"])
+                self.assertEqual(m.codes()[-1], 4507)
+                self.assertTrue(result["stop_acknowledged"])
+                self.assertFalse(m.overlap)
+            finally:
+                await session.disconnect()
+
+    async def test_guard_refusal_keeps_a_clean_link_usable(self):
+        # A4: a first-byte guard refusal of a multi-chunk frame sent nothing,
+        # so it neither latches the link nor makes it uncertain.
+        m = Machine()
+
+        def refuse():
+            raise SessionError("refused before byte one")
+
+        async with interaction(m) as session:
+            writes = len(m.writes)
+            with self.assertRaisesRegex(SessionError, "byte one"):
+                await session._command(8007, bytes(8), before_write=refuse)
+            self.assertEqual(len(m.writes), writes)
+            self.assertFalse(session._partial_frame)
+            self.assertFalse(session.get_state()["recovery_required"])
+            await session._command(8022)
+        self.assertEqual(m.codes()[-1], 8022)
 
 
 class EncodedRecipeTests(unittest.TestCase):

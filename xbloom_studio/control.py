@@ -71,6 +71,7 @@ BREWER_MOTION: tuple[SeenKey, ...] = (
     (8023, MOTION_STATES[1]),
     (9005, None),
     (40502, None),
+    (40520, None),  # bypass started
 )
 MOTION_KEYS = GRINDER_MOTION + BREWER_MOTION
 ACTUATORS: dict[str, tuple[tuple[SeenKey, ...], tuple[SeenKey, ...]]] = {
@@ -294,6 +295,10 @@ class _Progress:
     rejected = False
     # The frame was started but its final chunk withheld.
     withheld = False
+    # A chunk before the final one was handed to the connector, and so may
+    # have reached the machine; ``tracked`` when the transport reports chunks.
+    begun = False
+    tracked = False
     transmitted_at: float | None = None
     # Latest monotonic time at which an acknowledgment is accepted.
     deadline: float | None = None
@@ -301,6 +306,12 @@ class _Progress:
 
     def accepts_ack(self) -> bool:
         return self.deadline is None or time.monotonic() <= self.deadline
+
+    def unfinished(self) -> bool:
+        """Bytes of the frame may have been sent, but not its final chunk."""
+        if not self.tracked:
+            return self.withheld
+        return self.begun and (self.transmitted_at is None or self.withheld)
 
 
 Waiter = tuple[tuple[int, int, "bytes | None"], "asyncio.Future[Packet]", _Progress]
@@ -392,6 +403,9 @@ class Interaction(MachineControls, ReadOnlyClient):
         self._selected_water_source: int | None = None
         # Latest decoded source from an identity block or units/source event.
         self._reported_source: int | None = None
+        # Water sufficiency decoded from the latest identity block only; a
+        # newer block without a recognized value never inherits an older one.
+        self._identity_water: bool | None = None
         # A frame was begun but not finished: later bytes would be appended
         # to it, so nothing more is written on this link.
         self._partial_frame = False
@@ -460,7 +474,7 @@ class Interaction(MachineControls, ReadOnlyClient):
 
     def _disconnected(self) -> None:
         self._invalidate_preparation("connection_lost")
-        self._reported_source = None
+        self._reported_source = self._identity_water = None
         super()._disconnected()
         if self._waiter is not None:
             _, future, _ = self._waiter
@@ -490,7 +504,13 @@ class Interaction(MachineControls, ReadOnlyClient):
         if packet.marker != 0xC1:
             return
         if packet.command in (40521, 8015):
-            self._reported_source = self._decoded_source(packet)
+            label = self._decoded(packet, "water_source")
+            self._reported_source = (
+                SOURCE_CODES.get(label) if isinstance(label, str) else None
+            )
+        if packet.command == 40521:
+            water = self._decoded(packet, "water_sufficient")
+            self._identity_water = water if isinstance(water, bool) else None
         if self._prepared is not None:
             self._check_preparation(packet)
         self._event_revision += 1
@@ -530,19 +550,19 @@ class Interaction(MachineControls, ReadOnlyClient):
         self._signal()
 
     @staticmethod
-    def _decoded_source(packet: Packet) -> int | None:
-        """The packet's decoded water source; unknown when it has none."""
+    def _decoded(packet: Packet, field: str) -> object:
+        """The packet's last decoded ``field``; None when it has none."""
         try:
             values = decode_values(packet)
         except ValueError:
             return None
-        labels = [value for name, value, _, _ in values if name == "water_source"]
-        return SOURCE_CODES.get(labels[-1]) if labels else None
+        found = [value for name, value, _, _ in values if name == field]
+        return found[-1] if found else None
 
     def _check_preparation(self, packet: Packet) -> None:
         assert self._prepared is not None
         code, payload = packet.command, packet.payload
-        motion = code in (9003, 9005, 40502)
+        motion = code in (9003, 9005, 40502, 40520)
         # Sufficient water is a prerequisite for execution, not for storing an
         # unexecuted recipe. Keep its reservation so it can be started after
         # refill; start_prepared checks water again before sending.
@@ -795,6 +815,9 @@ class Interaction(MachineControls, ReadOnlyClient):
             expected = payload if code == 11511 else ack_payload
             key = (code, 0xC2 if function == 2 else 0xC1, expected)
             progress = _Progress()
+            progress.tracked = self._withholds_final_chunk() and hasattr(
+                self.transport, "on_chunk"
+            )
             loop = asyncio.get_running_loop()
             guard: Callable[[], None] | None = None
             if before_write is not None:
@@ -819,6 +842,15 @@ class Interaction(MachineControls, ReadOnlyClient):
                     expired.append(reason)
                     write.cancel()
 
+            def chunk(final: bool) -> None:
+                # Once the deadline decision is made, the write task never
+                # hands the connector another chunk, even if the connector
+                # absorbed that cancellation and returned normally.
+                if expired:
+                    raise asyncio.CancelledError()
+                if not final:
+                    progress.begun = True
+
             def transmit() -> None:
                 # A matching notification before this point is stale.
                 progress.transmitted_at = now = time.monotonic()
@@ -830,8 +862,8 @@ class Interaction(MachineControls, ReadOnlyClient):
                     try:
                         on_transmit()
                     except BaseException:
-                        # Raised before the final chunk: the frame is begun
-                        # but unfinished, unless the transport writes whole.
+                        # Raised before the final chunk, which is withheld;
+                        # earlier chunks, if any, leave the frame unfinished.
                         progress.withheld = True
                         raise
 
@@ -842,7 +874,7 @@ class Interaction(MachineControls, ReadOnlyClient):
             # The one task that owns the connector for this frame. No wait_for
             # wrapper: on Python 3.10/3.11 cancelling one while it drains its
             # inner write returns early and would release the link.
-            write = loop.create_task(self._write(frame, guard, transmit))
+            write = loop.create_task(self._write(frame, guard, transmit, chunk))
             write_expiry = loop.call_later(bound, expire, "write")
             try:
                 interrupted = await _drain(write)
@@ -893,7 +925,9 @@ class Interaction(MachineControls, ReadOnlyClient):
                         self._uncertain = True
                 elif progress.transmitted_at is not None and not _confirmed(future):
                     self._uncertain = True
-                if progress.withheld and self._withholds_final_chunk():
+                # A begun frame whose final chunk was never attempted would
+                # absorb the next bytes; a final attempt stays merely unknown.
+                if progress.unfinished() and self._withholds_final_chunk():
                     self._partial_frame = self._uncertain = True
                 raise
             finally:
@@ -934,6 +968,7 @@ class Interaction(MachineControls, ReadOnlyClient):
         frame: bytes,
         guard: Callable[[], None] | None,
         transmit: Callable[[], None],
+        chunk: Callable[[bool], None],
     ) -> None:
         transport = self.transport
         saved: dict[str, Any] = {}
@@ -947,6 +982,9 @@ class Interaction(MachineControls, ReadOnlyClient):
         if getattr(transport, "transmit_hook_before_final_chunk", False):
             saved["on_transmit"] = getattr(transport, "on_transmit", None)
             setattr(transport, "on_transmit", transmit)  # noqa: B010
+            if hasattr(transport, "on_chunk"):
+                saved["on_chunk"] = transport.on_chunk
+                setattr(transport, "on_chunk", chunk)  # noqa: B010
         try:
             if guard is not None:
                 guard()
@@ -970,7 +1008,13 @@ class Interaction(MachineControls, ReadOnlyClient):
     def _water_source(self) -> int:
         info = self.state.observations.get("device_info_raw")
         sufficient = self.state.observations.get("water_sufficient")
-        if sufficient is None or sufficient.value is not True:
+        # Both the latest identity block and every later water report must
+        # affirm sufficiency; unknown is never sufficient.
+        if (
+            self._identity_water is not True
+            or sufficient is None
+            or sufficient.value is not True
+        ):
             raise SessionError("Water sufficiency not confirmed; no automatic retry")
         raw = bytes.fromhex(info.value) if info else b""
         if len(raw) < 63:
@@ -1278,8 +1322,9 @@ class Interaction(MachineControls, ReadOnlyClient):
 
         Faults (an actionable water report included) and motion come first:
         they always require recovery, even when the water check would also
-        refuse. Low water, an unknown source or a changed source then stay
-        ordinary refusals.
+        refuse. For a water operation, low water, an unknown source or a
+        changed source then stay ordinary refusals; for any other operation
+        low water reported since launch is a fault, as it is once running.
         """
         self._refuse_changed_machine(op)
         if op.kind not in WATER_KINDS:
@@ -1299,7 +1344,10 @@ class Interaction(MachineControls, ReadOnlyClient):
         Uses the persistent per-event revisions, so neither history eviction,
         later benign telemetry nor the gap between frame chunks can hide one.
         """
-        if self._last(MACHINE_FAULT_KEYS) > op._since:
+        faults = MACHINE_FAULT_KEYS
+        if op.kind not in WATER_KINDS:
+            faults += (LOW_WATER,)
+        if self._last(faults) > op._since:
             self._uncertain = True
             raise SessionError("Machine reported a fault before start; not sent")
         if self._last(MOTION_KEYS) > op._since:
@@ -1500,18 +1548,24 @@ class Interaction(MachineControls, ReadOnlyClient):
     def _stopped_since(self, op: Operation, revision: int, stopped: bool) -> bool:
         """Stop evidence for ``op`` after ``revision``.
 
-        Outstanding motion since launch decides against it. Otherwise rest of
-        this operation's own actuators, or idle, newer than ``revision``
-        confirms it; without any, ``stopped`` (prior completion) stands. A
-        rest report retained from before ``revision``, or another actuator's
-        stop, never proves this stop.
+        Outstanding motion since launch decides against it. Otherwise idle,
+        or the rest of this single-actuator operation's own actuator, newer
+        than ``revision`` confirms it; without any, ``stopped`` (prior
+        completion) stands. A rest report retained from before ``revision``,
+        or another actuator's stop, never proves this stop. A recipe or tea
+        needs whole-operation rest: one actuator's stop may be an
+        intermediate stage, such as the end of one pour.
         """
         idle = self._operation_idle(op.kind)
         if self._outstanding(op._since, idle):
             return False
-        rest = idle + tuple(
-            key for name in OPERATION_ACTUATORS[op.kind] for key in ACTUATORS[name][1]
-        )
+        rest = idle
+        if op.kind not in ("recipe", "tea"):
+            rest += tuple(
+                key
+                for name in OPERATION_ACTUATORS[op.kind]
+                for key in ACTUATORS[name][1]
+            )
         return self._last(rest) > revision or stopped
 
     def _moving(self, op: Operation) -> bool:
