@@ -15,6 +15,7 @@ import sys
 from collections.abc import Callable
 from functools import wraps
 from typing import Any
+from urllib.parse import unquote_to_bytes
 
 LOCAL_NAMES = frozenset({None, "", "localhost", "localhost.localdomain"})
 SYSTEM_BUS_PATHS = frozenset(
@@ -46,9 +47,9 @@ def _system_bus_paths() -> set[str]:
         for option in part.partition(":")[2].split(","):
             key, _, value = option.partition("=")
             if key == "path":
-                paths.add(value)
+                paths.add(os.fsdecode(unquote_to_bytes(value)))
             elif key == "abstract":
-                paths.add("\0" + value)
+                paths.add("\0" + os.fsdecode(unquote_to_bytes(value)))
     return paths
 
 

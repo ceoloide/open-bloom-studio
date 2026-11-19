@@ -13,6 +13,7 @@ class OfflineGuardTest(unittest.TestCase):
     def test_suite_runs_with_guard_installed(self):
         offline.install()  # idempotent
         self.assertTrue(offline.installed())
+        self.assertTrue(hasattr(socket.socket.connect, "__wrapped__"))
 
     def test_remote_name_lookup_is_blocked(self):
         with self.assertRaises(offline.NetworkBlocked):
@@ -85,7 +86,7 @@ class OfflineGuardTest(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets unavailable")
     def test_abstract_unix_address_is_allowed_except_system_bus(self):
-        env = {"DBUS_SYSTEM_BUS_ADDRESS": "unix:abstract=system-bus"}
+        env = {"DBUS_SYSTEM_BUS_ADDRESS": "unix:abstract=system%2dbus"}
         with mock.patch.dict(os.environ, env):
             offline.check_address(socket.AF_UNIX, b"\0test-socket")
             with self.assertRaises(offline.NetworkBlocked):
@@ -106,7 +107,8 @@ class OfflineGuardTest(unittest.TestCase):
     def test_system_bus_is_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             custom = os.path.join(directory, "bus")
-            env = {"DBUS_SYSTEM_BUS_ADDRESS": f"tcp:host=x;unix:path={custom},guid=0"}
+            env = {"DBUS_SYSTEM_BUS_ADDRESS": f"unix:path={custom}%2dname,guid=0"}
+            custom += "-name"
             with mock.patch.dict(os.environ, env):
                 for path in (*offline.SYSTEM_BUS_PATHS, custom, custom.encode()):
                     with socket.socket(socket.AF_UNIX) as client:
