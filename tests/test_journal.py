@@ -198,6 +198,19 @@ class FailureTest(JournalTestCase):
         self.recorder.slots = threading.BoundedSemaphore(1)
         started, release = threading.Event(), threading.Event()
         original = self.store.append
+        submit = self.recorder.executor.submit
+        pending_at_completion = []
+        outcome_observed = threading.Event()
+
+        def observe_pending(_):
+            pending_at_completion.append(self.recorder.pending)
+            if len(pending_at_completion) == 2:
+                outcome_observed.set()
+
+        def observe_submit(*args, **kwargs):
+            future = submit(*args, **kwargs)
+            future.add_done_callback(observe_pending)
+            return future
 
         def blocked(kind, data, **context):
             if kind == "command.intent":
@@ -205,7 +218,12 @@ class FailureTest(JournalTestCase):
                 release.wait(5)
             return original(kind, data, **context)
 
-        with mock.patch.object(self.store, "append", side_effect=blocked):
+        with (
+            mock.patch.object(self.store, "append", side_effect=blocked),
+            mock.patch.object(
+                self.recorder.executor, "submit", side_effect=observe_submit
+            ),
+        ):
             write = asyncio.create_task(self.transport._write_frame(frame(4506)))
             try:
                 self.assertTrue(await asyncio.to_thread(started.wait, 1))
@@ -215,6 +233,8 @@ class FailureTest(JournalTestCase):
             finally:
                 release.set()
             await self.recorder.flush()
+            self.assertTrue(await asyncio.to_thread(outcome_observed.wait, 1))
+            self.assertEqual(pending_at_completion, [1, 0])
             self.recorder.emit("after", {})
             await self.recorder.flush()
         self.assertEqual(self.machine.codes(), [])

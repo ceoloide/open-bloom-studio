@@ -435,13 +435,18 @@ class ExportTest(unittest.TestCase):
         fields["fragment"] = {
             "stringValue": "HTTPS://example.com/callback#access_token=never-retain-secret"
         }
-        fields["plain"] = {"stringValue": "https://example.com/plain#section"}
+        fields["routed_fragment"] = {
+            "stringValue": "HTTPS://example.com/#/callback?auth=never-retain-secret"
+        }
+        fields["plain"] = {"stringValue": "https://example.com/#/browse?tab=coffee"}
         fields["broken"] = {"stringValue": "http://[::1"}
         source = read_export(document, HubProviders()._firestore)
         self.assertNotIn("never-retain-secret", json.dumps(source))
-        self.assertEqual(source["redacted_fields"], 12)
+        self.assertEqual(source["redacted_fields"], 13)
         self.assertEqual(source["raw"]["extra"], [{"safe": "kept"}])
-        self.assertEqual(source["raw"]["plain"], "https://example.com/plain#section")
+        self.assertEqual(
+            source["raw"]["plain"], "https://example.com/#/browse?tab=coffee"
+        )
         self.assertIsNone(source["url"])
         self.assertEqual(source["provider_id"], "synthetic-coffee")
         self.assertEqual(source["raw"]["xBloomData"]["grinderSize"], 55)

@@ -126,7 +126,11 @@ def read_export(
                     or parsed.password
                     or any(
                         credential_key(key)
-                        for params in (parsed.query, parsed.fragment)
+                        for params in (
+                            parsed.query,
+                            parsed.fragment,
+                            parsed.fragment.partition("?")[2],
+                        )
                         for key, _ in parse_qsl(params)
                     )
                 )

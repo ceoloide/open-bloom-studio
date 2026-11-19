@@ -25,7 +25,6 @@ from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
-from functools import partial
 from typing import Any, Protocol
 
 from .protocol import Packet
@@ -151,20 +150,21 @@ class Recorder:
             }
             self.pending += 1
             self.last = self.executor.submit(
-                self.store.append, kind, deepcopy(data), **context
+                self._append, kind, deepcopy(data), release, **context
             )
-            self.last.add_done_callback(partial(self._finished, release))
             return True
 
-    def _finished(self, release: bool, future: Future[Any]) -> None:
-        with self.lock:
-            self.pending -= 1
-            if release:
-                self.slots.release()
-            try:
-                future.result()
-            except BaseException as exc:
-                self._fail(exc)
+    def _append(self, kind: str, data: Any, release: bool, **context: Any) -> None:
+        try:
+            self.store.append(kind, data, **context)
+        except BaseException as exc:
+            self._fail(exc)
+            raise
+        finally:
+            with self.lock:
+                self.pending -= 1
+                if release:
+                    self.slots.release()
 
     def _append_gap(self, lost: int, **context: Any) -> None:
         self.store.append(
