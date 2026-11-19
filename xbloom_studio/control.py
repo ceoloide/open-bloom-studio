@@ -521,6 +521,8 @@ class Interaction(MachineControls, ReadOnlyClient):
             self._seen[STATE_REPORT] = self._event_revision
             if state not in MOTION_STATES:
                 self._seen[STATE_AT_REST] = self._event_revision
+        if packet.command == 40521 and self._identity_water is False:
+            self._seen[LOW_WATER] = self._event_revision
         if packet.command == 40522:
             water = LOW_WATER if _known_low_water(packet.payload) else WATER_FAULT
             self._seen[water] = self._event_revision
@@ -846,6 +848,8 @@ class Interaction(MachineControls, ReadOnlyClient):
                 # Once the deadline decision is made, the write task never
                 # hands the connector another chunk, even if the connector
                 # absorbed that cancellation and returned normally.
+                if not expired and time.monotonic() >= write_deadline:
+                    expired.append("write")
                 if expired:
                     raise asyncio.CancelledError()
                 if not final:
@@ -874,29 +878,39 @@ class Interaction(MachineControls, ReadOnlyClient):
             # The one task that owns the connector for this frame. No wait_for
             # wrapper: on Python 3.10/3.11 cancelling one while it drains its
             # inner write returns early and would release the link.
-            write = loop.create_task(self._write(frame, guard, transmit, chunk))
+            write_deadline = time.monotonic() + bound
+            finished_at = write_deadline
+
+            async def write_frame() -> None:
+                nonlocal finished_at
+                try:
+                    await self._write(frame, guard, transmit, chunk)
+                finally:
+                    finished_at = time.monotonic()
+
+            write = loop.create_task(write_frame())
             write_expiry = loop.call_later(bound, expire, "write")
             try:
                 interrupted = await _drain(write)
-                if write.cancelled():
-                    if expired == ["write"]:
-                        raise asyncio.TimeoutError(
-                            "Write did not finish within write_timeout; "
-                            "delivery unknown"
-                        )
-                    # Cancelled by the budget (or by the connector itself).
-                    # An ACK before the deadline proves delivery; otherwise
-                    # the outcome is unknown.
-                    if not _confirmed(future):
-                        raise TimeoutError(
-                            "Command budget expired during its write; "
-                            "delivery unconfirmed"
-                        )
-                else:
+                cancelled = write.cancelled()
+                if not cancelled:
                     write.result()
+                if expired == ["write"] or (
+                    not expired and finished_at >= write_deadline
+                ):
+                    raise asyncio.TimeoutError(
+                        "Write did not finish within write_timeout; delivery unknown"
+                    )
+                budget_expired = expired == ["budget"] or (
+                    progress.deadline is not None and finished_at >= progress.deadline
+                )
+                if (cancelled or budget_expired) and not _confirmed(future):
+                    raise TimeoutError(
+                        "Command budget expired during its write; delivery unconfirmed"
+                    )
                 if interrupted:
                     raise asyncio.CancelledError()
-                if write.cancelled():
+                if cancelled or budget_expired:
                     return future.result()
                 wait, budgeted = self.ack_timeout, False
                 now = time.monotonic()
@@ -1559,13 +1573,14 @@ class Interaction(MachineControls, ReadOnlyClient):
         idle = self._operation_idle(op.kind)
         if self._outstanding(op._since, idle):
             return False
-        rest = idle
-        if op.kind not in ("recipe", "tea"):
-            rest += tuple(
-                key
-                for name in OPERATION_ACTUATORS[op.kind]
-                for key in ACTUATORS[name][1]
+        if op.kind in ("recipe", "tea"):
+            motion = self._relevant_motion(op.kind)
+            return self._last(idle) > max(revision, motion) or (
+                stopped and self._completion(op) > max(op._armed_at, motion)
             )
+        rest = idle + tuple(
+            key for name in OPERATION_ACTUATORS[op.kind] for key in ACTUATORS[name][1]
+        )
         return self._last(rest) > revision or stopped
 
     def _moving(self, op: Operation) -> bool:

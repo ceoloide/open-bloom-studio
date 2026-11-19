@@ -2321,6 +2321,23 @@ class LifecycleRoundFiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(session._partial_frame)
         self.assertNotIn(3500, m.codes())
 
+    async def test_identity_low_water_blocks_grinder_and_calibration(self):
+        for code in (3500, 3502):
+            m = Machine()
+            gate = Gate(code, action=lambda m=m: m.emit(40521, identity_block(water=0)))
+            gate.release.set()
+            async with interaction(
+                m, command_hooks=gate, allow_untested=True
+            ) as session:
+                if code == 3500:
+                    op = await session.start_grinder(size=5, rpm=80, duration_s=1)
+                else:
+                    op = await session.start_grinder_calibration()
+                result = await asyncio.wait_for(op.wait(), 2)
+                self.assertIn("fault before start", result["error"])
+                self.assertTrue(session.get_state()["recovery_required"])
+            self.assertNotIn(code, m.codes())
+
     async def test_bypass_start_is_brewer_motion(self):
         # S11: a bypass start is brewer motion for admission, before the
         # start and against an earlier recipe completion.
@@ -2379,6 +2396,22 @@ class LifecycleRoundFiveTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result["stop_observed"], observed, (kind, rest))
                     self.assertEqual(result["status"], status, (kind, rest))
 
+    async def test_recipe_idle_older_than_bypass_does_not_prove_stop(self):
+        m = Machine()
+        m.overrides[40519] = lambda _: [
+            reply(40519),
+            reply(8023, u32(1)),
+            reply(40520),
+            reply(40511),
+        ]
+        m.overrides[8022] = lambda _: [reply(8022)]
+        async with interaction(m) as session:
+            await session.start_recipe(EncodedRecipe(b"x", 10))
+            await transmitted(m, 8002)
+            result = await session.stop()
+            self.assertTrue(result["stop_acknowledged"])
+            self.assertFalse(result["stop_observed"])
+
     async def interrupted_start(self, m, **options):
         """Start water on ``m`` and return the session and its result."""
         session = interaction(m, ack_timeout=0.2, **options)
@@ -2432,6 +2465,38 @@ class LifecycleRoundFiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("write_timeout", result["error"], mode)
             self.assertEqual(m.cancels, 1)
             await self.assert_unfinished_frame_blocks_the_link(m, session, result)
+
+    async def test_due_write_deadline_forbids_next_chunk_before_timer_callback(self):
+        class InlineSlowWrite(Machine):
+            overlap = False
+
+            async def write(self, data):
+                await super().write(data)
+                if data[:1] == b"\x58" and data[3:5] == (4506).to_bytes(2, "little"):
+                    # No yield between this write and the next chunk. The
+                    # timer is due, but its callback cannot run yet.
+                    time.sleep(0.06)
+
+        m = InlineSlowWrite()
+        session, result = await self.interrupted_start(m, write_timeout=0.02)
+        self.assertIn("write_timeout", result["error"])
+        await self.assert_unfinished_frame_blocks_the_link(m, session, result)
+
+    async def test_late_final_write_ack_after_swallowed_timeout_cannot_succeed(self):
+        class LateAck(Stalling):
+            async def write(self, data):
+                await super().write(data)
+                if self.position == self.index:
+                    self.emit(4506)
+
+        m = LateAck(4506, 1, "return")
+        m.studio.silent.add(4506)
+        session, result = await self.interrupted_start(m, write_timeout=0.1)
+        self.assertIn("write_timeout", result["error"])
+        self.assertIn(4507, m.codes())
+        self.assertTrue(result["stop_acknowledged"])
+        self.assertFalse(session._partial_frame)
+        self.assertTrue(session.get_state()["recovery_required"])
 
     async def test_error_after_nonfinal_chunk_latches_the_frame(self):
         # A4: a connector error after a non-final chunk was attempted fails
