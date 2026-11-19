@@ -20,6 +20,20 @@ class OfflineGuardTest(unittest.TestCase):
         with self.assertRaises(offline.NetworkBlocked):
             socket.create_connection((DOCUMENTATION_HOST, 9), timeout=1)
 
+    def test_hostname_is_rejected_before_socket_operation(self):
+        action = mock.Mock()
+        for index, args in (
+            (0, ("remote.invalid", 9)),
+            (-1, (b"test", ("remote.invalid", 9))),
+            (3, ([b"test"], [], 0, ("remote.invalid", 9))),
+        ):
+            destination = (args,) if index == 0 else args
+            with socket.socket() as client:
+                check = offline._before_address_resolution(action, index)
+                with self.assertRaises(offline.NetworkBlocked):
+                    check(client, *destination)
+        action.assert_not_called()
+
     def test_remote_datagram_is_blocked(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
             with self.assertRaises(offline.NetworkBlocked):
@@ -68,6 +82,14 @@ class OfflineGuardTest(unittest.TestCase):
         self.assertTrue(offline._is_local_host(b"localhost"))
         self.assertTrue(offline._is_local_host("::1"))
         self.assertFalse(offline._is_local_host("fe80::1%lo"))
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets unavailable")
+    def test_abstract_unix_address_is_allowed_except_system_bus(self):
+        env = {"DBUS_SYSTEM_BUS_ADDRESS": "unix:abstract=system-bus"}
+        with mock.patch.dict(os.environ, env):
+            offline.check_address(socket.AF_UNIX, b"\0test-socket")
+            with self.assertRaises(offline.NetworkBlocked):
+                offline.check_address(socket.AF_UNIX, b"\0system-bus")
 
     @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets unavailable")
     def test_local_unix_socket_is_allowed(self):

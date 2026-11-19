@@ -7,6 +7,7 @@ failing check does not republish the value it found.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import subprocess
 import sys
@@ -45,6 +46,7 @@ LINE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("Slack token", re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}")),
     ("API key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
+    ("PyPI token", re.compile(r"\bpypi-AgEI[A-Za-z0-9_-]{20,}")),
     ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
     ("home directory path", re.compile(r"(?:/home/|/Users/|\b[A-Za-z]:\\Users\\)\w")),
 )
@@ -122,7 +124,12 @@ def check_line(text: str) -> list[str]:
 def check_file(path: str, data: bytes) -> list[Finding]:
     """Check one file's name and content against the policy."""
     pure = PurePosixPath(path)
-    if pure.name in FORBIDDEN_NAMES or pure.suffix.lower() in FORBIDDEN_SUFFIXES:
+    basename = pure.name.lower()
+    if (
+        basename in FORBIDDEN_NAMES
+        or basename.startswith(".env.")
+        or pure.suffix.lower() in FORBIDDEN_SUFFIXES | {".env"}
+    ):
         return [Finding(path, 0, "forbidden file type")]
     if len(data) > MAX_FILE_BYTES:
         return [Finding(path, 0, "file too large")]
@@ -143,11 +150,25 @@ def check_files(items: Iterable[tuple[str, bytes]]) -> list[Finding]:
     return [finding for path, data in items for finding in check_file(path, data)]
 
 
-def repository_files(root: Path) -> list[tuple[str, bytes | None]]:
-    """List tracked and unignored files; symlinks map to ``None``."""
+def git_environment() -> dict[str, str]:
+    """Keep Git's working directory independent of a calling hook."""
+    env = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    return {**env, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def repository_files(
+    root: Path, *, tracked_only: bool = False
+) -> list[tuple[str, bytes | None]]:
+    """List repository files; symlinks map to ``None``."""
+    command = ["git", "ls-files", "-z", "--cached"]
+    if not tracked_only:
+        command.extend(("--others", "--exclude-standard"))
     listed = subprocess.run(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        command,
         cwd=root,
+        env=git_environment(),
         check=True,
         capture_output=True,
     ).stdout.decode("utf-8")

@@ -282,7 +282,7 @@ def package_only(sources: Mapping[str, bytes]) -> dict[str, bytes]:
 def source_files(root: Path) -> dict[str, bytes]:
     """Tracked files that artifacts must reproduce byte for byte."""
     files = {}
-    for name, data in publication_policy.repository_files(root):
+    for name, data in publication_policy.repository_files(root, tracked_only=True):
         if name.startswith(f"{PACKAGE}/") or name in COPIED_ROOT_FILES:
             if data is None:
                 raise DistError(f"distributed file is a symbolic link: {name}")
@@ -296,7 +296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(__doc__, file=sys.stderr)
         return 2
     try:
-        sdist, wheel = find_artifacts(Path(args[0]))
+        sdist, wheel = find_artifacts(Path(args[0]).resolve())
         expected = expected_metadata(source_metadata())
         sources = source_files(Path.cwd())
         problems = check_artifacts(sdist, wheel, sources, expected)

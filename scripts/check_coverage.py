@@ -14,6 +14,7 @@ from pathlib import Path, PurePath
 from typing import Any
 
 MINIMUM_PERCENT = 90.0
+REQUIRED_ROOTS = {"scripts", "xbloom_studio"}
 COUNTS = ("covered_lines", "num_statements", "covered_branches", "num_branches")
 
 
@@ -53,7 +54,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--minimum", type=float, default=MINIMUM_PERCENT)
     args = parser.parse_args(argv)
     groups = group_totals(json.loads(args.report.read_text("utf-8"))["files"])
-    problems = failures(groups, args.minimum)
+    problems = [
+        f"missing coverage data for {root}"
+        for root in sorted(REQUIRED_ROOTS - groups.keys())
+    ]
+    problems += failures(groups, args.minimum)
     for problem in problems:
         print(problem, file=sys.stderr)
     for group, totals in sorted(groups.items()):

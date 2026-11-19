@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import publication_policy as policy
 
@@ -18,6 +19,7 @@ SECRET_SAMPLES = {
     "AWS access key": "AK" + "IA" + "A" * 16,
     "Slack token": "xo" + "xb-" + "1" * 12,
     "API key": "s" + "k-" + "x" * 24,
+    "PyPI token": "py" + "pi-AgEI" + "x" * 30,
     "Google API key": "AI" + "za" + "x" * 35,
     "home directory path": "/" + "home/someone/project",
     "email address": "person" + AT + "mail.invalid-domain.net",
@@ -27,7 +29,13 @@ SECRET_SAMPLES = {
 
 
 def git(root, *args):
-    subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", *args],
+        cwd=root,
+        env=policy.git_environment(),
+        check=True,
+        capture_output=True,
+    )
 
 
 class LineRulesTest(unittest.TestCase):
@@ -102,6 +110,22 @@ class RepositoryTest(unittest.TestCase):
         names = [name for name, _ in policy.repository_files(self.root)]
         self.assertEqual(names, [".gitignore", "tracked.txt", "untracked.txt"])
         self.assertEqual(self.run_main()[0], 0)
+
+    def test_git_hook_environment_cannot_redirect_scan_or_fixture_setup(self):
+        external = self.root / "external"
+        env = {"GIT_DIR": str(external), "GIT_INDEX_FILE": str(external / "index")}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(
+                [
+                    name
+                    for name, _ in policy.repository_files(self.root, tracked_only=True)
+                ],
+                [".gitignore", "tracked.txt"],
+            )
+            with tempfile.TemporaryDirectory() as sandbox:
+                git(sandbox, "init", "-q")
+                self.assertTrue((Path(sandbox) / ".git").exists())
+        self.assertFalse(external.exists())
 
     def test_reports_findings_and_skips_deleted_files(self):
         (self.root / "untracked.txt").write_text(KEY_HEADER)

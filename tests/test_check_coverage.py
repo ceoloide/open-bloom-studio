@@ -63,12 +63,33 @@ class CoverageGateTest(unittest.TestCase):
                 (summary(9, 10, 1, 1), 0),
                 (summary(1, 2, 0, 0), 1),
             ):
-                path.write_text(json.dumps({"files": report(**{"p/a.py": data})}))
+                path.write_text(
+                    json.dumps(
+                        {
+                            "files": report(
+                                **{"xbloom_studio/a.py": data, "scripts/b.py": data}
+                            )
+                        }
+                    )
+                )
                 out, err = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     self.assertEqual(check_coverage.main([str(path)]), expected)
-                self.assertIn("p: line", out.getvalue())
+                self.assertIn("xbloom_studio: line", out.getvalue())
                 self.assertEqual(bool(err.getvalue()), expected == 1)
+
+    def test_main_rejects_missing_source_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "coverage.json"
+            path.write_text(
+                json.dumps({"files": report(**{"scripts/a.py": summary(1, 1, 0, 0)})})
+            )
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()) as err,
+            ):
+                self.assertEqual(check_coverage.main([str(path)]), 1)
+            self.assertIn("missing coverage data for xbloom_studio", err.getvalue())
 
 
 if __name__ == "__main__":

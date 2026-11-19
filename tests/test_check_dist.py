@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import site
 import subprocess
 import sys
@@ -296,6 +297,7 @@ class MainTest(unittest.TestCase):
                 check_dist.source_files(Path(".")),
                 {"README.md": b"", "xbloom_studio/a.py": b"x"},
             )
+            rf.assert_called_with(Path("."), tracked_only=True)
             rf.return_value = [("xbloom_studio/b.py", None)]
             with self.assertRaisesRegex(check_dist.DistError, "symbolic link"):
                 check_dist.source_files(Path("."))
@@ -314,6 +316,9 @@ class MainTest(unittest.TestCase):
                 status, out, _ = self.run_main([directory])
                 self.assertEqual(status, 0)
                 self.assertIn("distribution checks passed", out)
+                relative = os.path.relpath(directory)
+                self.assertEqual(self.run_main([relative])[0], 0)
+                self.assertTrue(install.call_args.args[0].is_absolute())
 
                 install.reset_mock()
                 write_sdist(directory, sdist_files(**{"setup.cfg": b"\x00"}))

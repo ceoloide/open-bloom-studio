@@ -22,8 +22,8 @@ gates, and the build, content and installation checks for the sdist and wheel.
 uv run --locked python -m scripts.presubmit
 ```
 
-Tests never use the network or a real machine: the suite blocks every
-connection except loopback and local Unix sockets.
+Tests use no real machine. An in-process Python socket guard permits loopback
+and local Unix sockets, with the system bus excluded.
 
 ## License
 
