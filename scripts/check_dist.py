@@ -61,7 +61,17 @@ SDIST_EGG_INFO_FILES = (
     "top_level.txt",
 )
 
+# Written by setuptools only when the project declares dependencies or extras.
+SDIST_REQUIRES_FILE = "requires.txt"
+
 Runner = Callable[[Sequence[str]], str]
+
+
+def egg_info_files(expected: Mapping[str, list[str]]) -> tuple[str, ...]:
+    if expected["Requires-Dist"] or expected["Provides-Extra"]:
+        return (*SDIST_EGG_INFO_FILES, SDIST_REQUIRES_FILE)
+    return SDIST_EGG_INFO_FILES
+
 
 PROBE = """
 import importlib.metadata, json, sys
@@ -172,7 +182,7 @@ def check_artifacts(
         set(sdist_files),
         set(package_files)
         | set(SDIST_ROOT_FILES)
-        | {f"{egg_info}/{name}" for name in SDIST_EGG_INFO_FILES},
+        | {f"{egg_info}/{name}" for name in egg_info_files(expected)},
     )
     copies = [("sdist", sdist_files, name, name) for name in sorted(sources)]
     copies += [("wheel", wheel_files, name, name) for name in sorted(package_files)]

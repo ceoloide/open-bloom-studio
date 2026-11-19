@@ -1,0 +1,775 @@
+{
+  "format": 1,
+  "description": "Commands this library sends or decodes. Every outgoing control command is acknowledged by an incoming frame with the same code (function 7, marker 0xc1; function 2 commands use marker 0xc2). Names are this project's own labels. The catalog is descriptive and is not used to authorize writes.",
+  "gates": {
+    "handshake": "Sent by every session after subscribing.",
+    "control": "Requires allow_control=True.",
+    "untested": "Requires allow_control=True and allow_untested=True."
+  },
+  "commands": [
+    {
+      "name": "open_session",
+      "code": 8100,
+      "hex": "0x1fa4",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "handshake",
+      "summary": "Register the telemetry session; the only frame the read-only client sends."
+    },
+    {
+      "name": "go_home",
+      "code": 8022,
+      "hex": "0x1f56",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Return the machine interface to its home screen."
+    },
+    {
+      "name": "set_interface_mode",
+      "code": 11511,
+      "hex": "0x2cf7",
+      "direction": "outgoing",
+      "function": 2,
+      "gate": "control",
+      "summary": "Select the pro or recipes interface; acknowledged with the same payload."
+    },
+    {
+      "name": "enter_brewer",
+      "code": 8007,
+      "hex": "0x1f47",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Open the manual brewer with a pattern and target temperature."
+    },
+    {
+      "name": "set_brewer_temperature",
+      "code": 4510,
+      "hex": "0x119e",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Set the manual brewer target temperature in tenths of a degree Celsius."
+    },
+    {
+      "name": "start_water",
+      "code": 4506,
+      "hex": "0x119a",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Start a manual pour with flow, volume, temperature, source and pattern."
+    },
+    {
+      "name": "stop_water",
+      "code": 4507,
+      "hex": "0x119b",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Stop a manual pour."
+    },
+    {
+      "name": "pause_water",
+      "code": 8019,
+      "hex": "0x1f53",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Pause a manual pour."
+    },
+    {
+      "name": "resume_water",
+      "code": 8021,
+      "hex": "0x1f55",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Resume a paused manual pour."
+    },
+    {
+      "name": "exit_brewer",
+      "code": 8013,
+      "hex": "0x1f4d",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Leave the manual brewer."
+    },
+    {
+      "name": "enter_grinder",
+      "code": 8006,
+      "hex": "0x1f46",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Open the manual grinder with a size and speed."
+    },
+    {
+      "name": "start_grinder",
+      "code": 3500,
+      "hex": "0x0dac",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Start the grinder with a duration, size and speed."
+    },
+    {
+      "name": "stop_grinder",
+      "code": 3505,
+      "hex": "0x0db1",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Stop the grinder or a grinder calibration."
+    },
+    {
+      "name": "pause_grinder",
+      "code": 8018,
+      "hex": "0x1f52",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Pause the grinder."
+    },
+    {
+      "name": "resume_grinder",
+      "code": 8020,
+      "hex": "0x1f54",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Resume a paused grinder."
+    },
+    {
+      "name": "exit_grinder",
+      "code": 8012,
+      "hex": "0x1f4c",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Leave the manual grinder."
+    },
+    {
+      "name": "start_grinder_calibration",
+      "code": 3502,
+      "hex": "0x0dae",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Start a grinder position calibration."
+    },
+    {
+      "name": "enter_scale",
+      "code": 8003,
+      "hex": "0x1f43",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Open the standalone scale."
+    },
+    {
+      "name": "tare_scale",
+      "code": 8500,
+      "hex": "0x2134",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Tare the standalone scale."
+    },
+    {
+      "name": "exit_scale",
+      "code": 8014,
+      "hex": "0x1f4e",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Leave the standalone scale."
+    },
+    {
+      "name": "set_recipe_settings",
+      "code": 8102,
+      "hex": "0x1fa6",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Set bypass volume, bypass temperature and dose for the next recipe."
+    },
+    {
+      "name": "set_cup_limits",
+      "code": 8104,
+      "hex": "0x1fa8",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "untested",
+      "summary": "Set the cup reference maximum and minimum as two float32 values."
+    },
+    {
+      "name": "upload_recipe_with_grind_size",
+      "code": 8001,
+      "hex": "0x1f41",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "untested",
+      "summary": "Upload recipe content and apply its grind size."
+    },
+    {
+      "name": "upload_recipe",
+      "code": 8004,
+      "hex": "0x1f44",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Upload recipe content."
+    },
+    {
+      "name": "start_recipe",
+      "code": 8002,
+      "hex": "0x1f42",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Execute the uploaded recipe."
+    },
+    {
+      "name": "pause_recipe",
+      "code": 40518,
+      "hex": "0x9e46",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Pause a recipe or tea operation."
+    },
+    {
+      "name": "resume_recipe",
+      "code": 40524,
+      "hex": "0x9e4c",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Resume a paused recipe or tea operation."
+    },
+    {
+      "name": "stop_recipe",
+      "code": 40519,
+      "hex": "0x9e47",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Stop a recipe or tea operation."
+    },
+    {
+      "name": "upload_tea",
+      "code": 4513,
+      "hex": "0x11a1",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "untested",
+      "summary": "Upload dedicated tea content."
+    },
+    {
+      "name": "start_tea",
+      "code": 4512,
+      "hex": "0x11a0",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "untested",
+      "summary": "Execute uploaded tea content."
+    },
+    {
+      "name": "quit_recipe_preparation",
+      "code": 8017,
+      "hex": "0x1f51",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "untested",
+      "summary": "Leave recipe preparation without executing it."
+    },
+    {
+      "name": "set_brightness",
+      "code": 8103,
+      "hex": "0x1fa7",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Set display brightness."
+    },
+    {
+      "name": "set_weight_unit",
+      "code": 8005,
+      "hex": "0x1f45",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Set the displayed weight unit."
+    },
+    {
+      "name": "set_temperature_unit",
+      "code": 8010,
+      "hex": "0x1f4a",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Set the displayed temperature unit."
+    },
+    {
+      "name": "set_pour_pattern",
+      "code": 8016,
+      "hex": "0x1f50",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "control",
+      "summary": "Set the manual pour pattern."
+    },
+    {
+      "name": "set_water_source",
+      "code": 4508,
+      "hex": "0x119c",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "untested",
+      "summary": "Select the tank or tap water inlet."
+    },
+    {
+      "name": "write_preset",
+      "code": 11510,
+      "hex": "0x2cf6",
+      "direction": "outgoing",
+      "function": 2,
+      "gate": "untested",
+      "summary": "Write one preset slot: slot index, flags and recipe content."
+    },
+    {
+      "name": "set_preset_order",
+      "code": 11512,
+      "hex": "0x2cf8",
+      "direction": "outgoing",
+      "function": 2,
+      "gate": "untested",
+      "summary": "Write the preset slot order."
+    },
+    {
+      "name": "set_preset_count",
+      "code": 40525,
+      "hex": "0x9e4d",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "untested",
+      "summary": "Set the number of shown presets."
+    },
+    {
+      "name": "back_to_normal",
+      "code": 40526,
+      "hex": "0x9e4e",
+      "direction": "outgoing",
+      "function": 1,
+      "gate": "untested",
+      "summary": "Return the grinder mechanism to its normal position."
+    },
+    {
+      "name": "pour_radius",
+      "code": 11506,
+      "hex": "0x2cf2",
+      "direction": "outgoing",
+      "function": 2,
+      "gate": "untested",
+      "summary": "Read the pour radius with an empty payload or initialize it with a value."
+    },
+    {
+      "name": "set_pour_radius",
+      "code": 11507,
+      "hex": "0x2cf3",
+      "direction": "outgoing",
+      "function": 2,
+      "gate": "untested",
+      "summary": "Set the pour radius."
+    },
+    {
+      "name": "vibration",
+      "code": 11508,
+      "hex": "0x2cf4",
+      "direction": "outgoing",
+      "function": 2,
+      "gate": "untested",
+      "summary": "Read the vibration strength with an empty payload or initialize it with a value."
+    },
+    {
+      "name": "set_vibration",
+      "code": 11509,
+      "hex": "0x2cf5",
+      "direction": "outgoing",
+      "function": 2,
+      "gate": "untested",
+      "summary": "Set the vibration strength."
+    },
+    {
+      "name": "session_acknowledged",
+      "code": 8100,
+      "hex": "0x1fa4",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Empty acknowledgment that registers the session."
+    },
+    {
+      "name": "error_envelope",
+      "code": 65534,
+      "hex": "0xfffe",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Machine error (marker 0xcd) or protocol error (marker 0xc1) with a uint32 value."
+    },
+    {
+      "name": "transport_error",
+      "code": 65533,
+      "hex": "0xfffd",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Transport error envelope (marker 0xcd)."
+    },
+    {
+      "name": "scale_weight",
+      "code": 20501,
+      "hex": "0x5015",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Signed float32 scale weight in grams."
+    },
+    {
+      "name": "scale_weight_alternate",
+      "code": 10507,
+      "hex": "0x290b",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Alternate signed float32 scale weight in grams."
+    },
+    {
+      "name": "water_counter",
+      "code": 40523,
+      "hex": "0x9e4b",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Float32 raw water counter; dividing by 1000 gives an uncalibrated millilitre estimate."
+    },
+    {
+      "name": "asleep",
+      "code": 8009,
+      "hex": "0x1f49",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "The machine entered sleep."
+    },
+    {
+      "name": "awake",
+      "code": 8011,
+      "hex": "0x1f4b",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "The machine woke."
+    },
+    {
+      "name": "water_fault",
+      "code": 40522,
+      "hex": "0x9e4a",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Uint32 water fault code; zero reports insufficient water."
+    },
+    {
+      "name": "machine_state",
+      "code": 8023,
+      "hex": "0x1f57",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Uint32 raw machine state code."
+    },
+    {
+      "name": "device_info",
+      "code": 40521,
+      "hex": "0x9e49",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Identity and configuration block."
+    },
+    {
+      "name": "units_source_changed",
+      "code": 8015,
+      "hex": "0x1f4f",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Weight unit, temperature unit and water source codes."
+    },
+    {
+      "name": "grinder_setting_changed",
+      "code": 8105,
+      "hex": "0x1fa9",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Uint32 grind setting offset by 30."
+    },
+    {
+      "name": "grinder_rpm_changed",
+      "code": 8106,
+      "hex": "0x1faa",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Uint32 grinder speed setting."
+    },
+    {
+      "name": "brewer_mode_changed",
+      "code": 8107,
+      "hex": "0x1fab",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Uint32 brewer mode code."
+    },
+    {
+      "name": "brewer_temperature_changed",
+      "code": 8108,
+      "hex": "0x1fac",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Uint32 raw brewer temperature setting."
+    },
+    {
+      "name": "preset_selected",
+      "code": 8111,
+      "hex": "0x1faf",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Selected preset index."
+    },
+    {
+      "name": "tea_soak_time_changed",
+      "code": 8113,
+      "hex": "0x1fb1",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Raw tea soak time."
+    },
+    {
+      "name": "grinder_entered",
+      "code": 9000,
+      "hex": "0x2328",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Grinder opened with configuration size and speed."
+    },
+    {
+      "name": "brewer_entered",
+      "code": 9001,
+      "hex": "0x2329",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Brewer opened with volume, temperature and pattern."
+    },
+    {
+      "name": "scale_entered",
+      "code": 9002,
+      "hex": "0x232a",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Standalone scale opened."
+    },
+    {
+      "name": "grinder_started",
+      "code": 9003,
+      "hex": "0x232b",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Grinder started with configuration size and speed."
+    },
+    {
+      "name": "grinder_exited",
+      "code": 9004,
+      "hex": "0x232c",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Grinder closed."
+    },
+    {
+      "name": "brewer_started",
+      "code": 9005,
+      "hex": "0x232d",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Brewer started with volume, temperature and pattern."
+    },
+    {
+      "name": "brewer_exited",
+      "code": 9006,
+      "hex": "0x232e",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Brewer closed."
+    },
+    {
+      "name": "scale_exited",
+      "code": 9008,
+      "hex": "0x2330",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Standalone scale closed."
+    },
+    {
+      "name": "grinder_paused",
+      "code": 9009,
+      "hex": "0x2331",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Grinder paused."
+    },
+    {
+      "name": "brewer_paused",
+      "code": 9010,
+      "hex": "0x2332",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Brewer paused."
+    },
+    {
+      "name": "tea_restarted",
+      "code": 9011,
+      "hex": "0x2333",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Tea operation resumed."
+    },
+    {
+      "name": "tea_soaking",
+      "code": 9012,
+      "hex": "0x2334",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Tea operation soaking."
+    },
+    {
+      "name": "preset_state",
+      "code": 11518,
+      "hex": "0x2cfe",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Four-byte preset state."
+    },
+    {
+      "name": "pod_detected",
+      "code": 40501,
+      "hex": "0x9e35",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Six-character ASCII pod identifier."
+    },
+    {
+      "name": "recipe_brewer_started",
+      "code": 40502,
+      "hex": "0x9e36",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Brewer started within a recipe."
+    },
+    {
+      "name": "grinder_position_progress",
+      "code": 40505,
+      "hex": "0x9e39",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Uint32 grinder position progress."
+    },
+    {
+      "name": "grinder_stopped",
+      "code": 40507,
+      "hex": "0x9e3b",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Grinder stopped."
+    },
+    {
+      "name": "pour_stage",
+      "code": 40510,
+      "hex": "0x9e3e",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Uint32 pour index within a recipe."
+    },
+    {
+      "name": "brewer_stopped",
+      "code": 40511,
+      "hex": "0x9e3f",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Brewer stopped."
+    },
+    {
+      "name": "recipe_enjoy",
+      "code": 40512,
+      "hex": "0x9e40",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Recipe finished and waiting for the cup to be taken."
+    },
+    {
+      "name": "recipe_enjoy_alternate",
+      "code": 40513,
+      "hex": "0x9e41",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Alternate recipe finished notification."
+    },
+    {
+      "name": "tea_paused",
+      "code": 40515,
+      "hex": "0x9e43",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Tea operation paused."
+    },
+    {
+      "name": "idling_fault",
+      "code": 40517,
+      "hex": "0x9e45",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Fault reported while idle."
+    },
+    {
+      "name": "bypass_started",
+      "code": 40520,
+      "hex": "0x9e48",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Bypass water started within a recipe."
+    },
+    {
+      "name": "grinder_position",
+      "code": 40526,
+      "hex": "0x9e4e",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Uint32 grinder position; an empty payload is a housekeeping acknowledgment."
+    },
+    {
+      "name": "before_vibration",
+      "code": 40527,
+      "hex": "0x9e4f",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Recipe stage before vibration."
+    },
+    {
+      "name": "abnormal_grinder_position",
+      "code": 8203,
+      "hex": "0x200b",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Grinder position fault."
+    },
+    {
+      "name": "abnormal_dose_or_water",
+      "code": 8204,
+      "hex": "0x200c",
+      "direction": "incoming",
+      "function": 7,
+      "summary": "Dose or water fault."
+    }
+  ]
+}
