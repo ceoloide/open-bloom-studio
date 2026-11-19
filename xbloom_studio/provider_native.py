@@ -8,7 +8,6 @@ are refused rather than guessed; the source is retained by the caller.
 
 from __future__ import annotations
 
-import math
 from copy import deepcopy
 from typing import Any
 
@@ -70,7 +69,9 @@ def native_document(
         return bool(value == 1)
 
     def integer(value: Any, label: str) -> int:
-        if not _numeric(value) or not math.isfinite(value) or int(value) != value:
+        if type(value) is int:
+            return int(value)
+        if type(value) is not float or not value.is_integer():
             raise error(label + " must be a whole number")
         return int(value)
 

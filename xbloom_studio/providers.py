@@ -100,6 +100,15 @@ def _object(value: Any, message: str) -> dict[str, Any]:
     return value
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Provider response contains duplicate JSON keys")
+        result[key] = value
+    return result
+
+
 class HubProviders:
     """Read and search public recipe pages; adapt sources only when exact."""
 
@@ -174,7 +183,7 @@ class HubProviders:
         if len(raw) > MAX_RESPONSE:
             raise ProviderError("Provider response exceeds 2 MiB")
         try:
-            result = json.loads(raw)
+            result = json.loads(raw, object_pairs_hook=_unique_json_object)
             check_document_bounds(result)
             return result
         except (UnicodeError, ValueError, RecursionError) as exc:

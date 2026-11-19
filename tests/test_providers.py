@@ -327,6 +327,16 @@ class HttpTest(unittest.TestCase):
                 with self.opener(body), self.assertRaisesRegex(ProviderError, "JSON"):
                     HubProviders()._json(url)
 
+    def test_duplicate_json_keys_do_not_hide_invalid_values(self):
+        url = "https://collective-api.xbloom.com/communityRecipe/recipe/detail"
+        for first in (b"1", b"NaN", b"1e900", b"[" * 90 + b"0" + b"]" * 90):
+            with (
+                self.subTest(first=first),
+                self.opener(b'{"nested":{"x":' + first + b',"x":0}}'),
+                self.assertRaisesRegex(ProviderError, "JSON"),
+            ):
+                HubProviders()._json(url)
+
     def test_bounded_json_requests(self):
         hubs = HubProviders()
         url = "https://collective-api.xbloom.com/communityRecipe/recipe/detail"
@@ -614,6 +624,18 @@ class ImportServiceTest(unittest.TestCase):
                     self.assertIsNone(result["source"]["raw"])
                     raw = result["source"]["raw_document"]
                     self.assertEqual(raw["fields"]["optional"], {"doubleValue": value})
+
+    def test_oversized_integer_bypass_is_retained_as_blocked(self):
+        export = xrecipe_document()
+        volume = {"integerValue": str(10**309)}
+        fields = export["fields"]["xBloomData"]["mapValue"]["fields"]
+        fields["bypassVolume"] = volume
+        blocked = self.imports.import_export(export, target="coffee")
+        self.assertIn("/coffee_recipe/bypass/volume_ml", blocked["error"])
+        retained = self.store.get_import(blocked["id"])
+        self.assertEqual(
+            retained["source"]["raw"]["xBloomData"]["bypassVolume"], 10**309
+        )
 
     def test_tea_cup_type_prevents_host_adaptation(self):
         export = xrecipe_document()
