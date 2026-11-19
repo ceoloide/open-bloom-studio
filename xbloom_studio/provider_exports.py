@@ -61,7 +61,7 @@ def credential_key(key: str) -> bool:
     )
 
 
-def check_document_bounds(document: Any) -> None:
+def check_document_bounds(document: Any, *, measure_size: bool = True) -> None:
     """Iteratively bound depth and size; reject cycles and non-JSON values."""
     pending = [(document, 0)]
     seen: set[int] = set()
@@ -90,9 +90,12 @@ def check_document_bounds(document: Any) -> None:
             budget += len(str(value))
         else:
             raise ValueError("Export must contain JSON values only")
-        if budget > MAX_EXPORT:
+        if measure_size and budget > MAX_EXPORT:
             raise ValueError("Export exceeds 2 MiB")
-    if len(json.dumps(document, ensure_ascii=False).encode()) > MAX_EXPORT:
+    if (
+        measure_size
+        and len(json.dumps(document, ensure_ascii=False).encode()) > MAX_EXPORT
+    ):
         raise ValueError("Export exceeds 2 MiB")
 
 

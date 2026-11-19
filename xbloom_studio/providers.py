@@ -184,7 +184,7 @@ class HubProviders:
             raise ProviderError("Provider response exceeds 2 MiB")
         try:
             result = json.loads(raw, object_pairs_hook=_unique_json_object)
-            check_document_bounds(result)
+            check_document_bounds(result, measure_size=False)
             return result
         except (UnicodeError, ValueError, RecursionError) as exc:
             raise ProviderError("Provider response is not bounded JSON") from exc

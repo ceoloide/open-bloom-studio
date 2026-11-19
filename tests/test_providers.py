@@ -17,6 +17,7 @@ from xbloom_studio import encode_coffee_recipe, encode_tea_recipe
 from xbloom_studio.provider_exports import MAX_EXPORT, load_export, read_export
 from xbloom_studio.provider_native import native_document
 from xbloom_studio.providers import (
+    MAX_RESPONSE,
     SHARE_OMITTED,
     HubProviders,
     NoRedirects,
@@ -337,6 +338,21 @@ class HttpTest(unittest.TestCase):
             ):
                 HubProviders()._json(url)
 
+    def test_http_limit_applies_to_received_bytes(self):
+        rows = [{"id": i, "description": "example"} for i in range(20)]
+        response = {"code": 200, "data": {"list": rows, "total": len(rows)}}
+
+        def encode():
+            return json.dumps(response, separators=(",", ":")).encode()
+
+        rows[-1]["description"] += "x" * (MAX_RESPONSE - len(encode()))
+        body = encode()
+        self.assertEqual(len(body), MAX_RESPONSE)
+        with self.opener(body):
+            self.assertEqual(len(HubProviders().search("sample")["results"]), 20)
+        with self.opener(body + b" "), self.assertRaisesRegex(ProviderError, "2 MiB"):
+            HubProviders().search("sample")
+
     def test_bounded_json_requests(self):
         hubs = HubProviders()
         url = "https://collective-api.xbloom.com/communityRecipe/recipe/detail"
@@ -636,6 +652,18 @@ class ImportServiceTest(unittest.TestCase):
         self.assertEqual(
             retained["source"]["raw"]["xBloomData"]["bypassVolume"], 10**309
         )
+
+    def test_oversized_host_numbers_are_retained_as_blocked(self):
+        for field in ("dose", "grinderSize", "rpm"):
+            with self.subTest(field=field):
+                source = {**HOST_RAW, field: 10**309}
+                self.stub.responses["recipe/detail"] = {"code": 200, "data": source}
+                blocked = self.imports.import_recipe(
+                    "https://collective.xbloom.com/recipe/12", flow_ml_s=3
+                )
+                self.assertIn(field, blocked["error"])
+                retained = self.store.get_import(blocked["id"])
+                self.assertEqual(retained["source"]["raw"][field], 10**309)
 
     def test_tea_cup_type_prevents_host_adaptation(self):
         export = xrecipe_document()

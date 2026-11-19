@@ -128,12 +128,12 @@ class Recorder:
         self, kind: str, data: Any, *, reserved: bool = False, release: bool = True
     ) -> bool:
         with self.lock:
+            if self._idle(kind):
+                return False
             if self.closed:
                 if reserved:
                     self.slots.release()
                 self._fail(RuntimeError("Event arrived after journal closed"))
-                return False
-            if self._idle(kind):
                 return False
             if not reserved and not self.slots.acquire(blocking=False):
                 self.lost += 1
@@ -213,7 +213,7 @@ class Recorder:
 
 
 class JournalHooks:
-    """Durable intent before every frame, through the transport's CommandHooks.
+    """Durable command intent with a bounded journal wait for stop frames.
 
     Pass to ``Interaction(command_hooks=...)`` or a transport's ``hooks``.
     The transport orders: intent committed, command guard, first byte. A guard

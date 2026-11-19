@@ -343,13 +343,35 @@ class RecorderTest(JournalTestCase):
             try:
                 self.recorder.emit("first", {})
                 self.assertTrue(await asyncio.to_thread(started.wait, 1))
-                closing = asyncio.create_task(self.recorder.close())
+                close_task = asyncio.create_task(self.recorder.close())
                 await asyncio.sleep(0)
                 self.recorder.emit("late", {})
             finally:
                 release.set()
             with self.assertRaisesRegex(RuntimeError, "after journal closed"):
-                await closing
+                await close_task
+        self.assertEqual(self.kinds(), ["first"])
+
+    async def test_disabled_idle_telemetry_does_not_fail_close(self):
+        self.recorder.capture_idle_telemetry = False
+        started, release = threading.Event(), threading.Event()
+        original = self.store.append
+
+        def blocked(*args, **kwargs):
+            started.set()
+            release.wait(5)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(self.store, "append", side_effect=blocked):
+            try:
+                self.recorder.emit("first", {})
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                close_task = asyncio.create_task(self.recorder.close())
+                await asyncio.sleep(0)
+                self.recorder.emit("ble.packet", {})
+            finally:
+                release.set()
+            await close_task
         self.assertEqual(self.kinds(), ["first"])
 
     async def test_gap_counts_cover_only_new_losses(self):
