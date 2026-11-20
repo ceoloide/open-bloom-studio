@@ -21,10 +21,9 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-from .coffee_guidance import recipe_examples
 from .connector import Connector, normalize_identity
 from .errors import error_detail
-from .facade import Application
+from .facade import Application, bundled_examples, bundled_tea_references
 from .grind_profiles import grind_profile
 from .provider_exports import load_export
 from .recipe_validation import check_recipe, recipe_constraints
@@ -32,7 +31,7 @@ from .recipes import compile_recipe
 from .rpc import LocalServer, call, default_socket
 from .serialization import dumps
 from .storage import Store
-from .tea_guidance import FAMILIES, recipe_tea_references
+from .tea_guidance import FAMILIES
 from .tea_validation import validate_tea_recipe
 from .templates import recipe_templates
 
@@ -50,8 +49,8 @@ PURE: dict[str, Callable[..., Any]] = {
     "recipe_validate": check_recipe,
     "recipe_constraints": recipe_constraints,
     "recipe_templates": recipe_templates,
-    "recipe_tea_references": recipe_tea_references,
-    "recipe_examples": recipe_examples,
+    "recipe_tea_references": bundled_tea_references,
+    "recipe_examples": bundled_examples,
     "recipe_tea_validate": validate_tea_recipe,
     "recipe_preview": compile_recipe,
 }
@@ -668,7 +667,7 @@ async def _execute(
                     "Host preparation gates require a running daemon; start xbloom "
                     "serve first"
                 )
-            params["expected_recipe_sha256"] = preview["recipe_sha256"]
+            params.setdefault("expected_recipe_sha256", preview["recipe_sha256"])
     result = await invoke(method, params)
     if a.command == "history" and a.action == "export":
         while result:

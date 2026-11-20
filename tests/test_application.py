@@ -590,6 +590,20 @@ class CommandTests(ServiceCase):
                 await self.service.command(*args, **kwargs)
         self.assertEqual(self.machine.calls, [])
 
+    async def test_recipe_configuration_requires_opt_in_on_each_experimental_call(self):
+        await self.service.connect(allow_untested=True)
+        for settings in ({"bypass_ml": 10}, {"cup_limits": [40, 80]}):
+            with self.subTest(settings=settings):
+                with self.assertRaisesRegex(ValueError, "allow_untested"):
+                    await self.service.command(
+                        "configure_recipe", {"dose_g": 15, **settings}, True
+                    )
+        self.assertNotIn(8102, self.machine.codes())
+        self.assertNotIn(8104, self.machine.codes())
+        await self.service.command("configure_recipe", {"dose_g": 15}, True)
+        self.assertIn(8102, self.machine.codes())
+        self.assertNotIn(8104, self.machine.codes())
+
     async def test_preset_backup_is_caller_supplied_and_never_readback(self):
         presets = [{"slot": s, "payload_hex": "414141", "flags": 4} for s in "ABC"]
         backup = [{"slot": s, "payload_hex": "6f6c64", "flags": 1} for s in "ABC"]

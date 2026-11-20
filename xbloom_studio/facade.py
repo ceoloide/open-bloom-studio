@@ -28,14 +28,14 @@ if TYPE_CHECKING:
     from .storage import Store
 
 
-def _examples(
+def bundled_examples(
     coffee: dict[str, Any], water_ml: float | None = None, limit: int = 5
 ) -> dict[str, Any]:
     """Bundled examples only: callers never choose a file to read."""
     return recipe_examples(coffee, water_ml, limit)
 
 
-def _tea_references(family: str | None = None) -> dict[str, Any]:
+def bundled_tea_references(family: str | None = None) -> dict[str, Any]:
     """Bundled references only: callers never choose a file to read."""
     return recipe_tea_references(family)
 
@@ -88,8 +88,8 @@ class Application:
             "recipe_import_export": (self.imports.import_export, True),
             "recipe_match": (self.recipes.match, True),
             "recipe_import": (self.imports.import_recipe, True),
-            "recipe_examples": (_examples, True),
-            "recipe_tea_references": (_tea_references, True),
+            "recipe_examples": (bundled_examples, True),
+            "recipe_tea_references": (bundled_tea_references, True),
             "recipe_tea_validate": (validate_tea_recipe, True),
             "recipe_preview": (compile_recipe, True),
             "recipe_import_get": (store.get_import, True),

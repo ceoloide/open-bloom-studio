@@ -326,6 +326,23 @@ class PureCommandTests(CliCase):
         self.assertEqual((code, lines[0]["data"]["version"]), (0, 1))
         self.assertFalse(self.db.exists())
 
+    def test_generic_call_only_reads_bundled_guidance(self):
+        for method, arguments in (
+            ("recipe_tea_references", {}),
+            ("recipe_examples", {"coffee": {}}),
+        ):
+            with self.subTest(method=method):
+                corpus = self.file("corpus.json", {})
+                params = self.file("params.json", {**arguments, "path": corpus})
+                code, _, errors = self.xbloom(
+                    "call", method, "--params", params, connector=None
+                )
+                self.assertNotEqual(code, 0)
+                self.assertIn(
+                    "unexpected keyword argument", errors[0]["error"]["message"]
+                )
+        self.assertFalse(self.db.exists())
+
     def test_option_conflicts_are_refused(self):
         cases = [
             ("--ssh-config", "c", "recipe", "templates"),
@@ -375,6 +392,30 @@ class DirectTests(CliCase):
         store = Store(self.db)
         try:
             self.assertEqual(len(store.history()), 1)
+        finally:
+            store.close()
+
+    def test_direct_generic_start_preserves_the_supplied_digest(self):
+        params = self.file(
+            "start.json",
+            {
+                "request": {
+                    "kind": "recipe",
+                    "document": {"name": "Recipe", "steps": [WATER]},
+                },
+                "idempotency_key": "digest-mismatch",
+                "allow_control": True,
+                "expected_recipe_sha256": "0" * 64,
+            },
+        )
+        code, _, errors = self.xbloom(
+            "--direct", "call", "operation_start", "--params", params
+        )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(errors[0]["error"]["code"], "conflict")
+        store = Store(self.db)
+        try:
+            self.assertEqual(store.history(), [])
         finally:
             store.close()
 

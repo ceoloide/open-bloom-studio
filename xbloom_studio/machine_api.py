@@ -14,7 +14,11 @@ from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .command_schema import command_schema, validate_command_params
+from .command_schema import (
+    command_schema,
+    recipe_configuration_untested,
+    validate_command_params,
+)
 from .control import BusyError, EncodedRecipe, Interaction
 from .machine_controls import (
     EncodedTeaRecipe,
@@ -254,7 +258,13 @@ class MachineCommandAPI:
         if type(allow_untested) is not bool:
             raise ValueError("allow_untested must be a boolean")
         values = command_parameters(command, {} if params is None else params)
-        if command in MachineControls.UNTESTED_METHODS and not allow_untested:
+        experimental = command in MachineControls.UNTESTED_METHODS or (
+            command == "configure_recipe"
+            and recipe_configuration_untested(
+                values.get("bypass_ml", 0), values.get("cup_limits")
+            )
+        )
+        if experimental and not allow_untested:
             raise ValueError("Command requires allow_untested")
         self._reject_queued_write()
         async with self.guard:

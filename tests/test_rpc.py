@@ -266,6 +266,33 @@ class LocalServerTests(ServerCase):
             server.close()
             await server.wait_closed()
 
+    async def test_client_timeout_reports_possible_delivery(self):
+        self.path.parent.mkdir(mode=0o700)
+        received, closed = asyncio.Event(), asyncio.Event()
+
+        async def withhold(reader, writer):
+            try:
+                await reader.readline()
+                received.set()
+                await reader.read()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                closed.set()
+
+        server = await asyncio.start_unix_server(withhold, str(self.path))
+        try:
+            with self.assertRaises(ConnectionError) as raised:
+                await call(self.path, "service_info", timeout=0.25)
+            detail = error_detail(raised.exception)
+            self.assertEqual(detail["code"], "connection_unavailable")
+            self.assertIn("original idempotency key", detail["next_step"])
+            self.assertTrue(received.is_set())
+            await asyncio.wait_for(closed.wait(), timeout=1)
+        finally:
+            server.close()
+            await server.wait_closed()
+
     async def test_slow_handlers_are_bounded_at_close(self):
         server = await LocalServer(self.app, self.path).start()
         reader, writer = await asyncio.open_unix_connection(str(self.path))

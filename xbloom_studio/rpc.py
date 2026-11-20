@@ -70,7 +70,13 @@ async def call(
             writer.close()
             await writer.wait_closed()
 
-    return await asyncio.wait_for(exchange(), timeout)
+    try:
+        return await asyncio.wait_for(exchange(), timeout)
+    except asyncio.TimeoutError as exc:
+        raise ConnectionError(
+            "Local RPC timed out; inspect operation_lookup with the original key "
+            "before any new start"
+        ) from exc
 
 
 class LocalServer:

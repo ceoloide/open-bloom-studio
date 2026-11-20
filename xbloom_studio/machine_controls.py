@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .client import SessionError
+from .command_schema import recipe_configuration_untested
 from .protocol import Packet, decode
 
 if TYPE_CHECKING:
@@ -655,7 +656,7 @@ class MachineControls:
         _number("bypass_ml", bypass_ml, 0, 1000)
         _number("bypass_temperature_c", bypass_temperature_c, 20, 99)
         validate_cup_limits(cup_limits)
-        untested = bool(bypass_ml or cup_limits is not None)
+        untested = recipe_configuration_untested(bypass_ml, cup_limits)
         if untested:
             self._require_untested("Bypass/cup-limit behavior")
         after = () if cup_limits is None else ((8104, cup_limits_payload(cup_limits)),)
