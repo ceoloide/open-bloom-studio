@@ -25,6 +25,9 @@ GRINDING = 0x22
 POURING = 0x23
 RECIPE_COMPLETE = 0x24
 PRESET_SAVED = 0x25
+PRESET_REJECTED = 0x44
+# A non-empty 11510 response observed with a refused single-slot write.
+PRESET_REJECTION_RESPONSE = bytes.fromhex("00000000000000000000000000400044")
 
 
 def notification(code: int, payload: bytes = b"", *, marker: int = 0xC1) -> bytes:
@@ -76,6 +79,9 @@ class SimulatedStudio:
     With ``auto_complete`` pours, recipes, tea and calibration report
     completion right after starting; otherwise they stay active until stopped
     or until a test injects notifications. ``silent`` commands get no reply.
+    Each third consecutive preset write saves, unless ``reject_preset_attempts``
+    is positive: that attempt is refused as once observed on hardware (a
+    rejection state, a non-empty response, then idle) and the count drops.
     """
 
     auto_complete: bool = True
@@ -85,6 +91,7 @@ class SimulatedStudio:
     parameters: dict[int, int] = field(
         default_factory=lambda: {11506: 700, 11508: 1300}
     )
+    reject_preset_attempts: int = 0
     _preset_writes: int = field(default=0, init=False)
 
     def __call__(self, packet: Packet) -> list[bytes]:
@@ -98,6 +105,8 @@ class SimulatedStudio:
                 state_notification(IDLE),
                 notification(20501, struct.pack("<f", self.weight)),
             ]
+        if code == 11510:
+            return self._preset_write()
         if code in FUNCTION_2_COMMANDS:
             reply = packet.payload
             if code in self.parameters and not reply:
@@ -109,8 +118,7 @@ class SimulatedStudio:
 
     def _effects(self, code: int) -> list[bytes]:
         done = self.auto_complete
-        if code != 11510:
-            self._preset_writes = 0
+        self._preset_writes = 0
         if code == 8022:
             return [state_notification(IDLE)]
         if code == 4506:
@@ -126,12 +134,26 @@ class SimulatedStudio:
         if code in (4507, 3505, 40519):
             stopped = 40507 if code == 3505 else 40511
             return [notification(stopped), state_notification(IDLE)]
-        if code == 11510:
-            self._preset_writes += 1
-            if self._preset_writes == 3:
-                self._preset_writes = 0
-                return [state_notification(PRESET_SAVED), state_notification(IDLE)]
         return []
+
+    def _preset_write(self) -> list[bytes]:
+        self._preset_writes += 1
+        acknowledgment = notification(11510, marker=0xC2)
+        if self._preset_writes < 3:
+            return [acknowledgment]
+        self._preset_writes = 0
+        if self.reject_preset_attempts > 0:
+            self.reject_preset_attempts -= 1
+            return [
+                state_notification(PRESET_REJECTED),
+                notification(11510, PRESET_REJECTION_RESPONSE, marker=0xC2),
+                state_notification(IDLE),
+            ]
+        return [
+            acknowledgment,
+            state_notification(PRESET_SAVED),
+            state_notification(IDLE),
+        ]
 
     @staticmethod
     def _started(finished: list[bytes]) -> list[bytes]:

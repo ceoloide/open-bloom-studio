@@ -140,16 +140,27 @@ COMMAND_SCHEMAS: dict[str, Schema] = {
     ),
     "write_preset": obj(
         {
-            "preset": {**PRESET, "description": "Intended replacement."},
+            "preset": {
+                **PRESET,
+                "description": "Intended replacement; resubmit it unchanged to "
+                "repeat an incomplete write.",
+            },
             "backup": {
                 **PRESET,
                 "description": (
-                    "Caller-supplied previous contents for the same slot; not readback."
+                    "Optional caller-supplied previous contents for the same slot; "
+                    "not readback."
                 ),
             },
             "save_timeout": SAVE_TIMEOUT,
+            "acknowledge_incomplete": {
+                "type": "string",
+                "description": "Only after the user's direction: the slot's latest "
+                "write ID, acknowledged so a new write may start.",
+                "pattern": "^[0-9a-f]{32}$",
+            },
         },
-        ("preset", "backup"),
+        ("preset",),
     ),
     "write_presets": obj(
         {
@@ -414,6 +425,7 @@ def validate_command_params(command: str, params: Any) -> None:
 
     if (
         command == "write_preset"
+        and "backup" in params
         and params["preset"]["slot"] != params["backup"]["slot"]
     ):
         invalid("/params/backup/slot", "Backup must address the replacement slot")

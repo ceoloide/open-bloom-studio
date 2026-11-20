@@ -19,6 +19,7 @@ from .command_schema import CommandValidationError
 from .control import BusyError
 from .machine_controls import PresetWriteError, UntestedOperationError
 from .ownership import LeaseBusyError, LeaseDirectoryError
+from .preset_writes import PresetWriteRefused
 from .providers import ProviderError
 from .recipe_validation import RecipeValidationError
 from .rpc_types import RemoteError, SocketDirectoryError, SocketPathError
@@ -119,9 +120,21 @@ def error_detail(exc: BaseException, *, log_unexpected: bool = True) -> dict[str
             name,
             "preset_write_incomplete",
             "Preset write did not finish; stored contents are unverified.",
-            "Inspect backup and acknowledged progress; disconnect and inspect the "
-            "machine before recovery. Do not retry or roll back automatically.",
+            "Inspect the outcome, backup and progress; disconnect and inspect the "
+            "machine before recovery. Never roll back automatically; repeat only an "
+            "identical single-slot write that machine_preset_writes reports as "
+            "retry_allowed.",
             {"preset_write": exc.result},
+        )
+    if isinstance(exc, PresetWriteRefused):
+        return _detail(
+            name,
+            "conflict",
+            str(exc),
+            "Nothing was sent. Inspect machine_preset_writes for the slot's write "
+            "ID, outcomes and exact contents; ask the user before acknowledging "
+            "an incomplete write.",
+            {"preset_write": exc.write},
         )
     if isinstance(exc, UntestedOperationError):
         return _detail(

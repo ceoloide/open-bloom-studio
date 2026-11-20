@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import tempfile
 import threading
@@ -18,6 +19,7 @@ from xbloom_studio.control import BusyError
 from xbloom_studio.errors import error_detail
 from xbloom_studio.journal import Recorder
 from xbloom_studio.machine_api import same_attempt, same_request
+from xbloom_studio.preset_writes import PresetWriteRefused
 from xbloom_studio.storage import ConflictError, Store
 
 FAST = {
@@ -1026,12 +1028,13 @@ class CommandTests(ServiceCase):
             )
 
     async def test_incomplete_preset_write_reports_recovery_without_retry(self):
-        self.machine.overrides[11510] = lambda p: [reply(11510, p.payload, 0xC2)]
+        self.machine.overrides[11510] = lambda p: [reply(11510, b"", 0xC2)]
         result = await self.service.command(
             "write_preset",
             {
                 "preset": {"slot": "B", "payload_hex": "6e6577", "flags": 2},
                 "backup": {"slot": "B", "payload_hex": "6f6c64", "flags": 2},
+                "save_timeout": 0.05,
             },
             True,
             allow_untested=True,
@@ -1041,6 +1044,11 @@ class CommandTests(ServiceCase):
         self.assertIn("backup", result["details"])
         self.assertIsInstance(result["recovery_required"], bool)
         self.assertEqual(self.machine.codes().count(11510), 3)
+        self.assertEqual(result["details"]["outcome"], "unconfirmed")
+        self.assertEqual(
+            {k: result["attempt"][k] for k in ("outcome", "state", "attempts_used")},
+            {"outcome": "unconfirmed", "state": "retryable", "attempts_used": 1},
+        )
 
     async def test_failing_command_is_recorded(self):
         self.machine.fail_commands[8103] = ConnectionError("gone")
@@ -1061,6 +1069,229 @@ class CommandTests(ServiceCase):
         await self.service.close()
         with self.assertRaisesRegex(RuntimeError, "closed"):
             await self.service.command("back_home", {}, True)
+
+
+A = {"slot": "A", "payload_hex": "6e6577", "flags": 4}
+
+
+class PresetRetryTests(ServiceCase):
+    """Bounded identical repeats of single-slot writes, from the journal."""
+
+    async def write(self, preset=A, **params):
+        return await self.service.command(
+            "write_preset", {"preset": preset, **params}, True, allow_untested=True
+        )
+
+    def frames(self):
+        return self.machine.codes().count(11510)
+
+    def latest(self, slot="A"):
+        return self.service.preset_writes(slot)["writes"][0]
+
+    def journal(self, kind, **data):
+        self.store.append(kind, data, device=self.service.device)
+
+    async def test_rejected_write_repeats_identically_in_a_fresh_session(self):
+        self.machine.studio.reject_preset_attempts = 1
+        first = await self.write()
+        attempt = first["attempt"]
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(
+            [attempt[k] for k in ("outcome", "state", "attempts_used")],
+            ["rejected", "retryable", 1],
+        )
+        self.assertEqual((attempt["remaining_attempts"], attempt["preset"]), (2, A))
+        self.assertTrue(attempt["retry_allowed"])
+        with self.assertRaisesRegex(SessionError, "fresh session"):
+            await self.write()
+        await self.service.disconnect()
+        # A fresh caller finds the exact contents and count without connecting.
+        self.assertEqual(self.latest()["preset"], A)
+        second = await self.write()
+        self.assertTrue(second["saved_observed"])
+        self.assertFalse(second["readback_verified"])
+        self.assertEqual(second["attempt"]["write_id"], attempt["write_id"])
+        self.assertEqual(
+            [second["attempt"][k] for k in ("outcome", "state", "attempts_used")],
+            ["saved", "saved", 2],
+        )
+        self.assertEqual(self.frames(), 6)
+        # Every preset frame belongs to an attempt committed before it.
+        open_attempt = False
+        for event in self.store.events(limit=10000):
+            if event["kind"] == "preset_write.started":
+                open_attempt = True
+            elif event["kind"] == "preset_write.finished":
+                open_attempt = False
+            elif (
+                event["kind"] == "command.intent" and event["data"]["command"] == 11510
+            ):
+                self.assertTrue(open_attempt)
+        await self.service.disconnect()
+        with self.assertRaisesRegex(PresetWriteRefused, "already observed a save"):
+            await self.write()
+        self.assertEqual(self.frames(), 6)
+        other = await self.write({**A, "payload_hex": "6f74686572"})
+        self.assertNotEqual(other["attempt"]["write_id"], attempt["write_id"])
+
+    async def test_exhausted_write_needs_an_acknowledged_new_write(self):
+        self.machine.studio.reject_preset_attempts = 3
+        for _ in range(3):
+            result = await self.write()
+            await self.service.disconnect()
+        attempt = result["attempt"]
+        self.assertEqual(
+            [attempt[k] for k in ("state", "attempts_used", "remaining_attempts")],
+            ["exhausted", 3, 0],
+        )
+        self.assertFalse(attempt["retry_allowed"])
+        for preset, params in (
+            (A, {}),
+            ({**A, "flags": 5}, {}),
+            (A, {"acknowledge_incomplete": "0" * 32}),
+        ):
+            with self.subTest(params=params), self.assertRaises(PresetWriteRefused):
+                await self.write(preset, **params)
+        self.assertEqual(self.frames(), 9)
+        self.assertEqual(self.machine.calls.count("connect"), 3)
+        result = await self.write(acknowledge_incomplete=attempt["write_id"])
+        self.assertTrue(result["saved_observed"])
+        self.assertNotEqual(result["attempt"]["write_id"], attempt["write_id"])
+        self.assertEqual(result["attempt"]["attempts_used"], 1)
+        self.assertIn("preset_write.acknowledged", self.kinds())
+
+    async def test_incomplete_write_blocks_only_its_own_slot(self):
+        self.machine.studio.reject_preset_attempts = 1
+        await self.write()
+        await self.service.disconnect()
+        with self.assertRaisesRegex(PresetWriteRefused, "different contents") as caught:
+            await self.write({**A, "flags": 5})
+        detail = error_detail(caught.exception)
+        self.assertEqual(detail["code"], "conflict")
+        self.assertEqual(detail["details"]["preset_write"]["state"], "retryable")
+        result = await self.write({**A, "slot": "B"})
+        self.assertEqual(result["attempt"]["state"], "saved")
+        await self.service.disconnect()
+        await self.service.command("set_brightness", {"level": 5}, True)
+        self.assertEqual(self.latest()["state"], "retryable")
+
+    async def test_attempts_without_an_outcome_count_after_restart(self):
+        for attempt_id in ("2" * 32, "3" * 32):
+            self.journal(
+                "preset_write.started", write_id="1" * 32, attempt_id=attempt_id, **A
+            )
+        self.store.append(
+            "preset_write.started",
+            {"write_id": "4" * 32, "attempt_id": "5" * 32, **A},
+            device="ANOTHER-MACHINE",
+        )
+        await self.service.close()
+        self.service = self.make(self.machine)
+        write = self.latest()
+        self.assertEqual(
+            [a["outcome"] for a in write["attempts"]], ["interrupted", "interrupted"]
+        )
+        self.assertEqual(
+            (write["state"], write["remaining_attempts"]), ("retryable", 1)
+        )
+        self.machine.studio.reject_preset_attempts = 1
+        result = await self.write()
+        self.assertEqual(result["attempt"]["write_id"], "1" * 32)
+        self.assertEqual(result["attempt"]["state"], "exhausted")
+
+    async def test_cancelled_attempt_stops_automatic_repeats(self):
+        self.machine.block_code = 11510
+        task = asyncio.create_task(self.write())
+        await until(lambda: self.machine.blocked.is_set(), 5)
+        self.assertEqual(self.latest()["state"], "in_progress")
+        task.cancel()
+        self.machine.release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.machine.block_code = None
+        await self.service.recorder.flush()
+        write = self.latest()
+        self.assertEqual(
+            (write["state"], write["attempts"][-1]["outcome"]),
+            ("cancelled", "cancelled"),
+        )
+        await self.service.disconnect()
+        with self.assertRaisesRegex(PresetWriteRefused, "cancelled"):
+            await self.write()
+        result = await self.write(acknowledge_incomplete=write["write_id"])
+        self.assertTrue(result["saved_observed"])
+
+    async def test_a_repeat_needs_a_current_idle_report(self):
+        self.machine.studio.reject_preset_attempts = 1
+        await self.write()
+        await self.service.disconnect()
+        await self.service.connect(allow_untested=True)
+        session = self.service.session
+        self.machine.state(0x44)
+        with self.assertRaisesRegex(PresetWriteRefused, "current idle"):
+            await self.write()
+        self.machine.state(1)
+        observed = session.state.observations["machine_state_code"]
+        session.state.observations["machine_state_code"] = dataclasses.replace(
+            observed, monotonic_at=observed.monotonic_at - 60
+        )
+        with self.assertRaisesRegex(PresetWriteRefused, "current idle"):
+            await self.write()
+        self.assertEqual((self.frames(), self.latest()["attempts_used"]), (3, 1))
+        self.machine.state(1)
+        result = await self.write()
+        self.assertEqual(result["attempt"]["attempts_used"], 2)
+
+    async def test_an_unreadable_journal_refuses_preset_writes(self):
+        self.journal(
+            "preset_write.finished",
+            write_id="1" * 32,
+            attempt_id="2" * 32,
+            slot="A",
+            outcome="saved",
+        )
+        with self.assertRaisesRegex(PresetWriteRefused, "not readable"):
+            self.service.preset_writes()
+        with self.assertRaises(PresetWriteRefused):
+            await self.write()
+        self.assertEqual(self.machine.calls, [])
+
+    async def test_backup_is_optional_and_batches_and_opt_ins_are_unchanged(self):
+        with self.assertRaisesRegex(ValueError, "allow_untested"):
+            await self.service.command("write_preset", {"preset": A}, True)
+        with self.assertRaisesRegex(ValueError, "allow_control"):
+            await self.service.command(
+                "write_preset", {"preset": A}, False, allow_untested=True
+            )
+        with self.assertRaises(ValueError):
+            self.service.preset_writes("D")
+        self.assertEqual(self.machine.calls, [])
+        result = await self.write()
+        self.assertIsNone(result["backup"])
+        self.assertFalse((self.root / "preset-backups").exists())
+        await self.service.disconnect()
+        b, old = {**A, "slot": "B"}, {**A, "slot": "B", "payload_hex": "6f6c64"}
+        result = await self.write(b, backup=old)
+        saved = json.loads(Path(result["backup"]["path"]).read_text())
+        self.assertEqual(saved["presets"], [old])
+        await self.service.disconnect()
+        presets = [{**A, "slot": slot} for slot in "ABC"]
+        with self.assertRaises(ValueError):
+            await self.service.command(
+                "write_presets", {"presets": presets}, True, allow_untested=True
+            )
+        result = await self.service.command(
+            "write_presets",
+            {"presets": presets, "backup": presets},
+            True,
+            allow_untested=True,
+        )
+        self.assertNotIn("attempt", result)
+        writes = self.service.preset_writes()["writes"]
+        self.assertEqual(
+            [(w["preset"]["slot"], w["attempts_used"]) for w in writes],
+            [("A", 1), ("B", 1)],
+        )
 
 
 if __name__ == "__main__":

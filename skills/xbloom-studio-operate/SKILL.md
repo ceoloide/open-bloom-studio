@@ -126,18 +126,34 @@ receipt, not the physical effect. Scale use is `enter_scale`, `tare`, then
 `exit_scale` on the same connection. Calibration and firmware commands are not
 available.
 
-Preset writes are experimental and need backups of the slots' previous
-contents that the user supplies; never build them from local aliases. A
-successful write still reports `readback_verified=false`: nothing read the
-preset back. If a write fails partway, report `recovery_required` and the
-saved backup and stop.
+Preset writes are experimental. A backup of a slot's previous contents is
+optional for `write_preset` and required for `write_presets`; use only
+contents the user supplies, never ones built from local aliases. Nothing
+reads a preset back: even a success reports `readback_verified=false`.
+
+One `write_preset` call is one attempt of three planned frames. Its result's
+`attempt` field gives the `outcome` (`saved`, `saved_cleanup_failed`,
+`rejected`, `unconfirmed`, `cancelled` or `refused`), `attempts_used`,
+`retry_allowed` and `next_step`. When `retry_allowed` is true for a write the
+user asked for, call `machine_disconnect`, then submit `write_preset` again
+with exactly the same slot, flags and payload. Never recompile or change the
+contents to retry. The daemon allows 3 attempts per machine and slot and
+repeats only after a current idle report from the new connection. Stop and
+ask the user once a save was observed, an attempt was cancelled or the
+attempts are used up. Only after their direction, pass
+`acknowledge_incomplete` with the reported `write_id` to start a new write. A
+fresh caller finds the exact contents and counts with
+`machine_preset_writes(slot)`, which never connects. Batch preset writes,
+brew starts and other commands are never repeated automatically.
 
 ## Errors
 
 Error envelopes carry `error.code`, `details` and `next_step`. A failed
 `machine_command`, such as an incomplete preset write, can instead return
-an MCP tool error with `status: failed`, an `error` string, `details` and
-`recovery_required`. Preserve those details and the backup location. If a
+an MCP tool error with `status: failed`, an `error` string, `details`,
+`recovery_required` and, for `write_preset`, `attempt`. Preserve those details
+and any backup location. A preset write refused by the attempt limit returns
+`conflict` with the write in `details.preset_write`; nothing was sent. If a
 start may already have happened, inspect its operation ID or look it up by
 key; do not start again.
 
@@ -146,3 +162,4 @@ From the command line, the `water`, `grind`, `brew`, `history repeat` and
 `--allow-control`, `--allow-untested` and `--wait`. For example
 `xbloom-studio history repeat ID --key KEY --allow-control --wait` repeats a
 past brew exactly; recover with `xbloom-studio operation lookup KEY`.
+`xbloom-studio machine preset-writes --slot A` shows a slot's recorded write.

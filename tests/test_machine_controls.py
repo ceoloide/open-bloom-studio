@@ -503,10 +503,7 @@ class PresetTests(Base):
 
     async def test_early_completion_stops_further_single_slot_writes(self):
         m = Machine()
-        m.overrides[11510] = lambda p: [
-            reply(11510, p.payload, 0xC2),
-            reply(8023, u32(0x25)),
-        ]
+        m.overrides[11510] = lambda p: [reply(11510, b"", 0xC2), reply(8023, u32(0x25))]
         async with interaction(m, allow_untested=True) as session:
             with self.assertRaises(PresetWriteError) as caught:
                 await session.write_preset(
@@ -622,6 +619,108 @@ class PresetTests(Base):
                 await session.write_preset(a, backup=a, backup_path=self.path())
         self.assertEqual(m.codes(), [8100])
         self.assertEqual(self.path().read_text(), "existing")
+
+
+class PresetAttemptTests(Base):
+    """One single-slot attempt: evidence stops it early and classifies it."""
+
+    async def attempt(self, m, preset=None, **kwargs):
+        async with interaction(m, allow_untested=True, **kwargs) as session:
+            with self.assertRaises(PresetWriteError) as caught:
+                await asyncio.wait_for(
+                    session.write_preset(
+                        preset or SavedPreset("A", b"new", 4), save_timeout=30
+                    ),
+                    2,
+                )
+        return caught.exception.result
+
+    async def test_observed_rejection_ends_the_attempt_without_a_save_wait(self):
+        m = Machine()
+        m.studio.reject_preset_attempts = 1
+        result = await self.attempt(m)
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertEqual(result["transmitted_write_count"], 3)
+        self.assertEqual(result["acknowledged_write_count"], 2)
+        self.assertFalse(result["saved_observed"])
+        self.assertIsNone(result["backup"])
+        self.assertEqual(
+            [(e["command"], e["payload_hex"]) for e in result["rejection_evidence"]],
+            [(11510, "00000000000000000000000000400044"), (8023, "44000000")],
+        )
+        self.assertEqual(m.codes()[1:], [*PREPARE, 11510, 11510, 11510])
+
+    async def test_rejection_state_is_checked_before_the_next_frame(self):
+        m = Machine()
+        m.overrides[11510] = lambda p: [reply(11510, b"", 0xC2), reply(8023, u32(0x44))]
+        result = await self.attempt(m)
+        self.assertEqual(m.codes().count(11510), 1)
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertIn("rejection state", result["error"])
+
+    async def test_rejection_state_while_awaiting_the_save(self):
+        m = Machine()
+        sent = []
+
+        def respond(packet):
+            sent.append(packet)
+            late = [reply(8023, u32(0x44))] if len(sent) == 3 else []
+            return [reply(11510, b"", 0xC2), *late]
+
+        m.overrides[11510] = respond
+        result = await self.attempt(m)
+        self.assertEqual(result["acknowledged_write_count"], 3)
+        self.assertEqual(result["outcome"], "rejected")
+        self.assertIn("not a save", result["error"])
+
+    async def test_prepare_failure_sends_no_preset_frame(self):
+        m = Machine()
+        m.fail_commands[MODE] = ConnectionError("gone")
+        result = await self.attempt(m)
+        self.assertEqual(
+            (result["outcome"], result["transmitted_write_count"]), ("refused", 0)
+        )
+        self.assertNotIn(11510, m.codes())
+
+    async def test_partial_frame_counts_as_an_unconfirmed_attempt(self):
+        m = Machine(write_size=20)
+        m.block_code = 11510
+        result = await self.attempt(
+            m, SavedPreset("A", bytes(40), 0), write_timeout=0.1
+        )
+        self.assertEqual(result["transmitted_write_count"], 0)
+        self.assertTrue(result["partial_frame"])
+        self.assertEqual(result["outcome"], "unconfirmed")
+
+    async def test_backup_is_optional_for_one_slot(self):
+        m = Machine()
+        async with interaction(m, allow_untested=True) as session:
+            with self.assertRaisesRegex(ValueError, "go together"):
+                await session.write_preset(
+                    SavedPreset("C", b"new", 1), backup_path=self.path()
+                )
+            result = await session.write_preset(SavedPreset("C", b"new", 1))
+        self.assertIsNone(result["backup"])
+        self.assertEqual(
+            (result["outcome"], result["transmitted_write_count"]), ("saved", 3)
+        )
+        self.assertEqual(result["rejection_evidence"], [])
+        self.assertFalse(self.path().exists())
+
+    async def test_cancelled_single_slot_attempt_is_classified(self):
+        m = Machine()
+        m.block_code = 11510
+        async with interaction(m, allow_untested=True) as session:
+            task = asyncio.create_task(session.write_preset(SavedPreset("A", b"x", 0)))
+            await until(lambda: m.blocked.is_set())
+            task.cancel()
+            m.release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            result = session.get_state()["last_preset_write"]
+        self.assertEqual(
+            (result["outcome"], result["transmitted_write_count"]), ("cancelled", 1)
+        )
 
 
 class CalibrationTests(Base):

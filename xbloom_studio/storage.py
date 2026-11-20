@@ -335,6 +335,19 @@ class Store(Pagination):
             ).fetchall()
         return [{**dict(r), "data": json.loads(r["data"])} for r in rows]
 
+    def preset_write_events(self, device: str) -> list[dict[str, Any]]:
+        """Single-slot preset write records for one machine, in journal order.
+
+        ``data`` stays undecoded so the reader can fail closed on it.
+        """
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT id,at,kind,data FROM events WHERE device=? "
+                "AND kind GLOB 'preset_write.*' ORDER BY id",
+                (device,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def create_operation(
         self, device: str, request: Any, plan: dict[str, Any], key: str
     ) -> tuple[dict[str, Any], bool]:

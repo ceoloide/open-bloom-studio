@@ -14,17 +14,28 @@ from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .client import SessionError
 from .command_schema import (
     command_schema,
     recipe_configuration_untested,
     validate_command_params,
 )
-from .control import BusyError, EncodedRecipe, Interaction
+from .control import IDLE_STATES, NO_WATER_STATE, BusyError, EncodedRecipe, Interaction
 from .machine_controls import (
+    SLOTS,
     EncodedTeaRecipe,
     MachineControls,
     PresetWriteError,
     SavedPreset,
+)
+from .preset_writes import (
+    ACKNOWLEDGED,
+    FINISHED,
+    MAX_ATTEMPTS,
+    STARTED,
+    PresetWriteRefused,
+    admit,
+    fold,
 )
 from .recipe_validation import HOST_STEPS, NATIVE, check_recipe
 from .recipes import upload_requires_untested
@@ -43,7 +54,9 @@ COMMANDS = {
     "back_home": "Return home; may wake the display.",
     "wake": "Use the home route and report observed wake status.",
     "set_mode": "Switch pro/recipes.",
-    "write_preset": "Experimental single-slot transaction; supplied backup is not "
+    "write_preset": "Experimental single-slot attempt of three planned frames; "
+    "an incomplete write may be resubmitted identically, at most "
+    f"{MAX_ATTEMPTS} attempts per machine and slot. Optional backup is not "
     "readback.",
     "write_presets": "Write A/B/C once each; requires caller-supplied backups.",
     "set_water_source": "Select tank/tap source by the existing validated argument "
@@ -104,7 +117,7 @@ def command_capabilities() -> dict[str, Any]:
             for name, description in COMMANDS.items()
         },
         "preset_backup": "Service-generated private file; caller supplies previous "
-        "contents, never machine readback.",
+        "contents, never machine readback. Optional for write_preset.",
         "prepared_recipe": "Single native coffee/tea step; session-local single-use "
         "token, no automatic expiry or retry. For a plan that can be uploaded, "
         "follow the machine_prepare preview's upload_requires_untested. "
@@ -145,15 +158,20 @@ def command_parameters(name: str, params: Any) -> dict[str, Any]:
         raise ValueError("The service chooses the preset backup path")
     if name == "write_preset":
         for key in ("preset", "backup"):
-            converted[key] = _preset(converted[key])
+            if key in converted:
+                converted[key] = _preset(converted[key])
     if name == "write_presets":
         for key in ("presets", "backup"):
             converted[key] = [_preset(value) for value in converted[key]]
     if name == "configure_recipe" and converted.get("cup_limits") is not None:
         converted["cup_limits"] = tuple(converted["cup_limits"])
-    if name in BACKUP_COMMANDS:
-        converted["backup_path"] = None  # Required argument; filled by the service.
-    inspect.signature(getattr(Interaction, name)).bind(None, **converted)
+    if name in BACKUP_COMMANDS and "backup" in converted:
+        converted["backup_path"] = None  # Filled by the service.
+    # The daemon's retry policy consumes the acknowledgment, not the machine.
+    inspect.signature(getattr(Interaction, name)).bind(
+        None,
+        **{k: v for k, v in converted.items() if k != "acknowledge_incomplete"},
+    )
     return converted
 
 
@@ -251,6 +269,8 @@ class MachineCommandAPI:
     worker_started: asyncio.Event | None
     prepared: dict[str, Any] | None
     _prepared_plan: dict[str, Any] | None
+    # The running preset write attempt, reported as in progress, not interrupted.
+    preset_attempt: str | None = None
 
     if TYPE_CHECKING:
 
@@ -306,6 +326,7 @@ class MachineCommandAPI:
         if type(allow_untested) is not bool:
             raise ValueError("allow_untested must be a boolean")
         values = command_parameters(command, {} if params is None else params)
+        acknowledge = values.pop("acknowledge_incomplete", None)
         experimental = command in MachineControls.UNTESTED_METHODS or (
             command == "configure_recipe"
             and recipe_configuration_untested(
@@ -317,6 +338,11 @@ class MachineCommandAPI:
         self._reject_queued_write()
         async with self.guard:
             self._require_unoccupied()
+            # Policy refusals come before any connection; the guard holds the
+            # decision until the attempt is committed.
+            admitted = None
+            if command == "write_preset":
+                admitted = await self._admit_preset_write(values["preset"], acknowledge)
             await self._connect(allow_untested)
             recorder, session = self._recorder, self._session
             recorder.emit(
@@ -328,7 +354,13 @@ class MachineCommandAPI:
                 folder = Path(self.store.path).parent / "preset-backups"
                 folder.mkdir(mode=0o700, exist_ok=True)
                 values["backup_path"] = folder / (uuid.uuid4().hex + ".json")
+            attempt: dict[str, Any] | None = None
+            before = session._last_preset_write
             try:
+                if admitted is not None:
+                    attempt = await self._begin_preset_write(
+                        values["preset"], acknowledge, *admitted
+                    )
                 with recorder.capturing():
                     result: dict[str, Any] = await getattr(session, command)(**values)
             except PresetWriteError as exc:
@@ -340,16 +372,116 @@ class MachineCommandAPI:
                     "recovery_required": session._uncertain,
                 }
             except BaseException as exc:
+                if attempt is not None:
+                    self._finish_preset_write(attempt, before)
                 recorder.emit(
                     "machine.command_failed",
                     {"command": command, "type": type(exc).__name__, "error": str(exc)},
                 )
                 raise
+            if attempt is not None:
+                outcome = self._finish_preset_write(attempt, before)
+                await recorder.flush()
+                write = (await asyncio.to_thread(self._preset_ledger))[attempt["slot"]]
+                result["attempt"] = {
+                    "attempt_id": attempt["attempt_id"],
+                    "outcome": outcome,
+                    **write,
+                }
             recorder.emit(
                 "machine.command_finished", {"command": command, "result": result}
             )
             await recorder.flush()
             return result
+
+    def _preset_ledger(self) -> dict[str, Any]:
+        if not self.device:
+            raise ValueError("Configure a machine address for preset writes")
+        rows = self.store.preset_write_events(self.device)
+        return fold(rows, self.preset_attempt)
+
+    def preset_writes(self, slot: str | None = None) -> dict[str, Any]:
+        """The latest recorded single-slot write per slot; never connects.
+
+        Each carries its exact preset, attempt outcomes and the next step, so
+        a fresh caller can resubmit identical contents or ask the user.
+        """
+        if slot is not None and slot not in SLOTS:
+            raise ValueError("slot must be A, B or C")
+        writes = self._preset_ledger()
+        return {
+            "device": self.device,
+            "max_attempts": MAX_ATTEMPTS,
+            "writes": [write for key, write in writes.items() if slot in (None, key)],
+        }
+
+    async def _admit_preset_write(
+        self, preset: SavedPreset, acknowledge: str | None
+    ) -> tuple[dict[str, Any] | None, str | None, bool]:
+        current = (await asyncio.to_thread(self._preset_ledger)).get(preset.slot)
+        return (current, *admit(current, preset.to_dict(), acknowledge))
+
+    async def _begin_preset_write(
+        self,
+        preset: SavedPreset,
+        acknowledge: str | None,
+        current: dict[str, Any] | None,
+        write_id: str | None,
+        repeat: bool,
+    ) -> dict[str, Any]:
+        """Check the session, then commit the attempt before any frame."""
+        session, recorder = self._session, self._recorder
+        if session._preset_write_used or session._uncertain:
+            raise SessionError(
+                "A preset write needs a fresh session; disconnect, then resubmit. "
+                "Nothing was sent."
+            )
+        if repeat:
+            # Repeat only on a current idle report from this connection.
+            state = session.snapshot()["fields"].get("machine_state_code") or {}
+            if not state.get("available") or state.get("value") not in (
+                *IDLE_STATES,
+                NO_WATER_STATE,
+            ):
+                raise PresetWriteRefused(
+                    "Repeating a preset write needs a current idle report from "
+                    "this connection; nothing was sent. Check the machine, "
+                    "disconnect and resubmit.",
+                    current,
+                )
+        attempt = {
+            "write_id": write_id or uuid.uuid4().hex,
+            "attempt_id": uuid.uuid4().hex,
+            **preset.to_dict(),
+        }
+        if acknowledge is not None:
+            recorder.emit(ACKNOWLEDGED, {"write_id": acknowledge, "slot": preset.slot})
+        recorder.emit(STARTED, attempt)
+        self.preset_attempt = attempt["attempt_id"]
+        try:
+            await recorder.flush()
+        except BaseException:
+            self._finish_preset_write(attempt, session._last_preset_write)
+            raise
+        return attempt
+
+    def _finish_preset_write(self, attempt: dict[str, Any], before: Any) -> str:
+        """Record this attempt's outcome; a call that never began sent nothing."""
+        latest = self._session._last_preset_write
+        outcome = "refused"
+        if latest is not None and latest is not before and latest["outcome"]:
+            outcome = latest["outcome"]
+        self._recorder.emit(
+            FINISHED,
+            {
+                "write_id": attempt["write_id"],
+                "attempt_id": attempt["attempt_id"],
+                "slot": attempt["slot"],
+                "outcome": outcome,
+            },
+        )
+        self.preset_attempt = None
+        return outcome
 
     async def upload(
         self,

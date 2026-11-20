@@ -289,6 +289,7 @@ DESCRIPTIONS = {
     "or reuse across collections.",
     "detail": "compact returns an inspection summary; full retains complete "
     "documents/plans/event data.",
+    "slot": "Physical preset slot A, B or C; omit for every recorded slot.",
 }
 EXPORT_DOCUMENT = (
     "Owner-supplied Firestore REST document envelope with name and typed fields; "
@@ -588,6 +589,36 @@ Prepared = model(
 )
 
 
+PresetWrite = model(
+    "PresetWrite",
+    write_id=(
+        str,
+        ...,
+        "Write ID; acknowledge_incomplete names it after user direction.",
+    ),
+    preset=(dict[str, Any], ..., "Exact slot, payload_hex and flags to resubmit."),
+    state=(
+        str,
+        ...,
+        "retryable, exhausted, cancelled, saved, not_sent, in_progress or "
+        "acknowledged.",
+    ),
+    attempts_used=(int, ..., "Attempts that may have sent a frame."),
+    max_attempts=(int, ..., "Attempt limit per machine and slot."),
+    remaining_attempts=(int, ..., "Identical attempts still allowed."),
+    retry_allowed=(bool, ..., "Whether the identical write may be resubmitted."),
+    attempts=(list[dict[str, Any]], ..., "Attempt IDs, start times and outcomes."),
+    next_step=(str, ..., "What a caller may do next."),
+    readback_verified=(bool, ..., "False: nothing read the slot back."),
+)
+PresetWrites = model(
+    "PresetWrites",
+    device=(str, ..., "Machine identity the writes belong to."),
+    max_attempts=(int, ..., "Attempt limit per machine and slot."),
+    writes=(list_of(PresetWrite), ..., "Latest recorded write per slot."),
+)
+
+
 class CommandOutcome(Output):
     model_config = ConfigDict(
         extra="allow",
@@ -599,7 +630,6 @@ class CommandOutcome(Output):
                 {"required": ["machine", "query_source"]},
                 {
                     "required": [
-                        "backup",
                         "requested_slots",
                         "acknowledged_write_count",
                         "saved_observed",
@@ -627,7 +657,14 @@ class CommandOutcome(Output):
         None, description="Whether explicit recovery is required."
     )
     backup: dict[str, Any] | None = Field(
-        None, description="Intentional caller-backup identity and service-owned path."
+        None,
+        description="Intentional caller-backup identity and service-owned path; "
+        "null when no backup was supplied.",
+    )
+    attempt: dict[str, Any] | None = Field(
+        None,
+        description="Single-slot preset attempt: write ID, outcome, attempts used "
+        "and remaining, retry_allowed and next_step.",
     )
     requested_slots: list[str] | None = Field(
         None, description="Requested physical preset slots."
@@ -646,8 +683,7 @@ class CommandOutcome(Output):
             (self.command is not None and self.acknowledged is not None)
             or (self.machine is not None and self.query_source is not None)
             or (
-                self.backup is not None
-                and self.requested_slots is not None
+                self.requested_slots is not None
                 and self.acknowledged_write_count is not None
                 and self.saved_observed is not None
             )
@@ -882,6 +918,7 @@ OUTPUTS: dict[str, Model] = {
         ),
     ),
     "machine_state": State,
+    "machine_preset_writes": PresetWrites,
     "machine_prepare": Plan,
     "machine_connect": State,
     "machine_disconnect": model(

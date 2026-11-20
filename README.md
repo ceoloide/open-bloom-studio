@@ -93,6 +93,15 @@ For experimental work, open the session with
 standard session, run `xbloom-studio machine disconnect` before reconnecting.
 Experimental actions still need their own `--allow-untested`.
 
+A single-slot preset write (`write_preset`) is one attempt of three planned
+frames. If an attempt is rejected or unconfirmed, the daemon allows the
+identical slot, flags and payload again from a fresh connection, at most three
+attempts per machine and slot, recorded in the database journal. A different
+write to that slot, or any write after a cancellation or the last attempt,
+waits for an explicit `acknowledge_incomplete` with the reported write ID.
+`xbloom-studio machine preset-writes --slot A` shows the recorded write without
+connecting. A save event is not a readback of the stored preset.
+
 For an offline run, start the daemon with
 `xbloom-studio --connector simulator serve`. Run the daemon and the CLI under
 the same account; they share ownership locks in

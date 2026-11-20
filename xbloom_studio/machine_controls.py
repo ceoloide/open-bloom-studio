@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from .telemetry import DeviceState
 
 PRESET_SAVED = b"\x25\0\0\0"
+# Observed instead of a save when the machine refused a single-slot write.
+PRESET_REJECTED = b"\x44\0\0\0"
 RECIPES_MODE = bytes.fromhex("91327856")
 PRO_MODE = b"\0" * 4
 PATTERNS = {"center": 0, "ring": 1, "spiral": 2}
@@ -44,6 +46,17 @@ class PresetWriteError(SessionError):
     def __init__(self, message: str, result: dict[str, Any]) -> None:
         super().__init__(message)
         self.result = result
+
+
+def preset_outcome(result: dict[str, Any], exc: BaseException | None) -> str:
+    """Classify one write attempt from its evidence; never a content readback."""
+    if result["saved_observed"]:
+        return "saved" if exc is None else "saved_cleanup_failed"
+    if not result["transmitted_write_count"] and not result["partial_frame"]:
+        return "refused"
+    if isinstance(exc, asyncio.CancelledError):
+        return "cancelled"
+    return "rejected" if result["rejection_evidence"] else "unconfirmed"
 
 
 def _number(name: str, value: object, low: float, high: float) -> float:
@@ -223,6 +236,7 @@ class MachineControls:
         _lifecycle: asyncio.Lock
         _scale_mode: bool
         _uncertain: bool
+        _partial_frame: bool
         _event_revision: int
         _preset_write_used: bool
         _last_preset_write: dict[str, Any] | None
@@ -420,24 +434,33 @@ class MachineControls:
         self,
         preset: SavedPreset,
         *,
-        backup: SavedPreset,
-        backup_path: str | os.PathLike[str],
+        backup: SavedPreset | None = None,
+        backup_path: str | os.PathLike[str] | None = None,
         save_timeout: float = 10,
     ) -> dict[str, Any]:
-        """Send one slot's replacement in a fixed three-message transaction.
+        """Send one slot's replacement as one attempt of three planned messages.
 
-        The three messages are planned writes, never retries after a failure.
-        The caller supplies the same slot's previous contents, not a readback.
-        Success means ACK plus a fresh, temporally correlated save notification;
-        it does not establish stored contents or persistence across restart.
+        The messages are planned writes, never retries after a failure: an
+        early save, a non-empty response or a rejection state stops the rest.
+        An optional backup holds the same slot's previous contents as the
+        caller knows them, not a readback. Success means ACK plus a fresh,
+        temporally correlated save notification; it does not establish stored
+        contents or persistence across restart.
         """
         self._require_untested("Single-slot preset writes")
-        if not isinstance(preset, SavedPreset) or not isinstance(backup, SavedPreset):
+        if not isinstance(preset, SavedPreset) or not isinstance(
+            backup, (SavedPreset, type(None))
+        ):
             raise ValueError("Provide SavedPreset objects for preset and backup")
-        if preset.slot != backup.slot:
+        if backup is not None and preset.slot != backup.slot:
             raise ValueError("Preset and backup must address the same slot")
+        if (backup is None) != (backup_path is None):
+            raise ValueError("A backup and its backup_path go together")
         return await self._write_preset_selection(
-            (preset,) * 3, (backup,), backup_path, save_timeout
+            (preset,) * 3,
+            None if backup is None else (backup,),
+            backup_path,
+            save_timeout,
         )
 
     async def write_presets(
@@ -461,8 +484,8 @@ class MachineControls:
     async def _write_preset_selection(
         self,
         presets: tuple[SavedPreset, ...],
-        backup: tuple[SavedPreset, ...],
-        backup_path: str | os.PathLike[str],
+        backup: tuple[SavedPreset, ...] | None,
+        backup_path: str | os.PathLike[str] | None,
         save_timeout: float,
     ) -> dict[str, Any]:
         _number("save_timeout", save_timeout, 0.001, 60)
@@ -473,40 +496,55 @@ class MachineControls:
                     "Each preset write requires a fresh interaction; "
                     "do not restore on this session"
                 )
-            saved = _save_backup(
-                backup_path,
-                {
-                    "kind": "caller_supplied_preset_backup",
-                    "machine_readback_verified": False,
-                    "presets": [preset.to_dict() for preset in backup],
-                },
-            )
+            saved = None
+            if backup is not None and backup_path is not None:
+                saved = _save_backup(
+                    backup_path,
+                    {
+                        "kind": "caller_supplied_preset_backup",
+                        "machine_readback_verified": False,
+                        "presets": [preset.to_dict() for preset in backup],
+                    },
+                )
             slots = list(dict.fromkeys(preset.slot for preset in presets))
+            # Only a single-slot attempt stops early on evidence; batches keep
+            # their planned sequence.
+            single = len(slots) == 1
             acknowledged: list[str] = []
+            evidence: list[dict[str, Any]] = []
             result: dict[str, Any] = {
                 "backup": saved,
                 "requested_slots": slots,
                 "planned_slot_writes": [preset.slot for preset in presets],
+                "transmitted_write_count": 0,
+                # A begun frame without its final chunk counts as an attempt.
+                "partial_frame": False,
                 "acknowledged_write_count": 0,
                 "acknowledged_slots": acknowledged,
                 "saved_observed": False,
                 "save_event": None,
+                "rejection_evidence": evidence,
+                "outcome": None,
                 "readback_verified": False,
                 "restoration_attempted": False,
             }
             self._last_preset_write = result
             self._preset_write_used = True
+            start: int | None = None
             cursor: int | None = None
 
             def is_save(packet: Packet) -> bool:
                 return packet.command == 8023 and packet.payload == PRESET_SAVED
 
-            def save_since(after: int) -> Packet | None:
+            def is_rejection(packet: Packet) -> bool:
+                return packet.command == 8023 and packet.payload == PRESET_REJECTED
+
+            def since(after: int, predicate: Callable[[Packet], bool]) -> Packet | None:
                 return next(
                     (
                         packet
                         for revision, packet in self._received_events
-                        if revision > after and is_save(packet)
+                        if revision > after and predicate(packet)
                     ),
                     None,
                 )
@@ -520,33 +558,75 @@ class MachineControls:
                     "correlation": "temporal_only",
                 }
 
+            def transmitted() -> None:
+                result["transmitted_write_count"] += 1
+
             try:
                 await self._prepare()
-                cursor = self._event_revision
+                start = cursor = self._event_revision
                 for index, preset in enumerate(presets):
-                    if len(slots) == 1 and index and save_since(cursor) is not None:
+                    if single and index and since(cursor, is_save) is not None:
                         raise SessionError(
                             "Preset completion arrived before the final planned "
                             "write; no further writes sent"
                         )
+                    if single and since(start, is_rejection) is not None:
+                        raise SessionError(
+                            "Machine reported a rejection state; no further writes sent"
+                        )
                     cursor = self._event_revision
-                    await self._command(11510, preset.body(), 2)
+                    packet = await self._command(
+                        11510, preset.body(), 2, on_transmit=transmitted
+                    )
+                    if packet.payload:
+                        evidence.append(
+                            {
+                                "command": 11510,
+                                "payload_hex": packet.payload.hex(),
+                                "write_index": index,
+                                "correlation": "response_to_this_write",
+                            }
+                        )
+                        if single:
+                            raise SessionError(
+                                "Preset write response was not an empty "
+                                "acknowledgment; no further writes sent"
+                            )
                     if preset.slot not in acknowledged:
                         acknowledged.append(preset.slot)
                     result["acknowledged_write_count"] += 1
                     await asyncio.sleep(0.1 if self.transition_delay else 0)
-                packet = await self._wait_event(cursor, is_save, save_timeout)
+                packet = await self._wait_event(
+                    cursor,
+                    lambda packet: is_save(packet) or (single and is_rejection(packet)),
+                    save_timeout,
+                )
+                if not is_save(packet):
+                    raise SessionError("Machine reported a rejection state, not a save")
                 record_save(packet, cursor)
                 await self._command(8022)
                 await asyncio.sleep(self.transition_delay)
+                result["outcome"] = preset_outcome(result, None)
                 return {**result, "acknowledged_slots": acknowledged.copy()}
             except BaseException as exc:
-                if cursor is not None:
-                    late = save_since(cursor)
+                if start is not None and cursor is not None:
+                    late = since(cursor, is_save)
                     if late is not None:
                         record_save(late, cursor)
+                    state = since(start, is_rejection)
+                    if state is not None:
+                        evidence.append(
+                            {
+                                "command": state.command,
+                                "payload_hex": state.payload.hex(),
+                                "after_event_revision": start,
+                                "correlation": "temporal_only",
+                            }
+                        )
                 self._uncertain = True
+                result["partial_frame"] = self._partial_frame
                 result["error"] = f"{type(exc).__name__}: {exc}"
+                result["outcome"] = preset_outcome(result, exc)
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 raise PresetWriteError(

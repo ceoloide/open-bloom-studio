@@ -47,6 +47,8 @@ class CommandSchemaTests(unittest.TestCase):
             ("set_cup_limits", {"minimum": 0, "maximum": 0}),
             ("initialize_pour_radius", {"value": 2147483647}),
             ("write_preset", {"preset": PRESET, "backup": {**PRESET, "flags": 0}}),
+            ("write_preset", {"preset": PRESET}),
+            ("write_preset", {"preset": PRESET, "acknowledge_incomplete": "0a" * 16}),
             (
                 "write_presets",
                 {
@@ -115,6 +117,12 @@ class CommandSchemaTests(unittest.TestCase):
                 {"preset": PRESET, "backup": {**PRESET, "slot": "B"}},
                 "/params/backup/slot",
                 "replacement slot",
+            ),
+            (
+                "write_preset",
+                {"preset": PRESET, "acknowledge_incomplete": "write-1"},
+                "/params/acknowledge_incomplete",
+                "format",
             ),
             (
                 "write_presets",

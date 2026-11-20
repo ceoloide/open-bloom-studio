@@ -241,6 +241,8 @@ def _machine_actions(actions: Any) -> None:
         a = actions.add_parser(name)
         if name == "connect":
             a.add_argument("--allow-untested", action="store_true")
+    a = actions.add_parser("preset-writes")
+    a.add_argument("--slot", choices=("A", "B", "C"))
     a = actions.add_parser("command")
     a.add_argument("machine_command")
     a.add_argument("--params", type=Path)
@@ -431,6 +433,8 @@ def _machine_route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             "token": a.token,
             "allow_control": a.allow_control,
         }
+    if a.action == "preset-writes":
+        return "machine_preset_writes", {"slot": a.slot}
     connect = {"allow_untested": a.allow_untested} if a.action == "connect" else {}
     return "machine_" + a.action, connect
 

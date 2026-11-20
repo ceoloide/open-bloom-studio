@@ -70,6 +70,7 @@ REMOTE_METHODS = frozenset(
         "recipe_start_uploaded",
         "recipe_cancel_uploaded",
         "machine_state",
+        "machine_preset_writes",
         "machine_prepare",
         "machine_connect",
         "machine_disconnect",
