@@ -180,13 +180,10 @@ class UntestedTests(Base):
                     preset, backup=preset, backup_path=self.path()
                 ),
                 lambda: session.set_water_source("tap"),
-                session.read_pour_radius,
-                session.read_vibration,
                 lambda: session.initialize_pour_radius(700),
                 lambda: session.set_pour_radius(700),
                 lambda: session.set_pour_radius_level(2, baseline=700),
                 lambda: session.initialize_vibration(1200),
-                lambda: session.set_vibration_level(2),
                 lambda: session.set_cup_limits(5, 100),
                 lambda: session.configure_recipe(dose_g=10, bypass_ml=5),
                 lambda: session.configure_recipe(dose_g=10, cup_limits=(5, 100)),
@@ -206,21 +203,35 @@ class UntestedTests(Base):
 
     async def test_parameter_queries_accept_actual_response_not_request_echo(self):
         m = Machine()
-        async with interaction(m, allow_untested=True) as session:
+        async with interaction(m) as session:
             radius = await session.read_pour_radius()
             vibration = await session.read_vibration()
         self.assertEqual((radius["value"], vibration["value"]), (700, 1300))
         self.assertTrue(radius["readback_verified"])
-        self.assertEqual(radius["protocol_evidence"], "untested")
+        self.assertTrue(vibration["readback_verified"])
+        self.assertEqual(radius["protocol_evidence"], "tested")
+        self.assertEqual(vibration["protocol_evidence"], "tested")
         self.assertEqual(radius["units"], "raw_units")
         self.assertEqual(m.payloads(11506), [b""])
         self.assertEqual(m.payloads(11508), [b""])
         self.assertIn(frame(11506, function=2), b"".join(m.writes))
 
+    async def test_vibration_level_uses_control_for_each_supported_level(self):
+        m = Machine()
+        async with interaction(m) as session:
+            for level in range(6):
+                result = await session.set_vibration_level(level)
+                self.assertTrue(result["acknowledged"])
+                self.assertEqual(result["protocol_evidence"], "tested")
+                self.assertFalse(result["readback_verified"])
+        self.assertEqual(
+            m.payloads(11509), [u32(value) for value in range(1000, 1501, 100)]
+        )
+
     async def test_malformed_parameter_reply_is_not_a_value(self):
         m = Machine()
         m.overrides[11506] = lambda p: [reply(11506, b"\x01\x02", 0xC2)]
-        async with interaction(m, allow_untested=True) as session:
+        async with interaction(m) as session:
             with self.assertRaisesRegex(SessionError, "uint32"):
                 await session.read_pour_radius()
             self.assertTrue(session.get_state()["recovery_required"])
