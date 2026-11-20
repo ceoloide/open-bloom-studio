@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import socket
@@ -122,6 +123,26 @@ class ErrorContractTests(unittest.TestCase):
         detail = error_detail(raised.exception)
         self.assertEqual(detail["code"], "permission_required")
         self.assertIn("0700", detail["next_step"])
+
+    def test_readonly_account_home_preserves_permission_guidance(self):
+        failure = OSError(errno.EROFS, "Read-only file system")
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / "leases"
+            directory.mkdir(mode=0o700)
+            for target in ("pathlib.Path.mkdir", "xbloom_studio.ownership.os.open"):
+                with (
+                    self.subTest(target=target),
+                    patch(
+                        "xbloom_studio.ownership.lease_directory",
+                        return_value=directory,
+                    ),
+                    patch(target, side_effect=failure),
+                    self.assertRaises(LeaseDirectoryError) as raised,
+                ):
+                    AddressLease("synthetic").acquire()
+                detail = error_detail(raised.exception)
+                self.assertEqual(detail["code"], "permission_required")
+                self.assertIn("write there", detail["next_step"])
 
     def test_unexpected_errors_hide_internals_with_a_correlation_id(self):
         with self.assertLogs("xbloom_studio.errors", "ERROR"):

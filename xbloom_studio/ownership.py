@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import stat
@@ -49,12 +50,14 @@ class AddressLease:
         try:
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             info = directory.lstat()
-        except PermissionError as exc:
+        except FileExistsError as exc:
+            raise LeaseDirectoryError("Lease directory path is occupied") from exc
+        except OSError as exc:
+            if not isinstance(exc, PermissionError) and exc.errno != errno.EROFS:
+                raise
             raise LeaseDirectoryError(
                 "Cannot access the per-user lease directory"
             ) from exc
-        except FileExistsError as exc:
-            raise LeaseDirectoryError("Lease directory path is occupied") from exc
         if (
             not stat.S_ISDIR(info.st_mode)
             or info.st_uid != os.getuid()
@@ -70,7 +73,9 @@ class AddressLease:
                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
                 0o600,
             )
-        except PermissionError as exc:
+        except OSError as exc:
+            if not isinstance(exc, PermissionError) and exc.errno != errno.EROFS:
+                raise
             raise LeaseDirectoryError(
                 "Cannot open a file in the per-user lease directory"
             ) from exc

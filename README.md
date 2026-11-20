@@ -92,7 +92,9 @@ xbloom operation lookup first
 private Unix socket; other `xbloom` commands then use it automatically.
 Run the daemon and CLI under the same account with access to its home
 directory. They share ownership locks there even with different temporary
-directories.
+directories. When upgrading from a build that used temporary-directory
+locks, stop existing daemons and finish any direct-mode operations before
+starting the new version.
 Pass `--device <address>` (or set `BLOOM_DEVICE`) for local Bluetooth, or
 `--connector package.module:factory` for any other connector.
 
