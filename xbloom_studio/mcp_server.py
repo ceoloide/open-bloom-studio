@@ -666,9 +666,9 @@ def _machine_tools(  # noqa: C901
     async def recipe_cancel_uploaded(
         token: str, allow_control: bool = False
     ) -> dict[str, Any]:
-        """Quit matching native preparation through its owned session. Failed cleanup
-        requires recovery. Does not stop an already started brew; use
-        operation_stop for that operation ID.
+        """Release a matching native preparation. If already invalidated, release
+        its reservation without sending commands and return cancelled=false.
+        Failed cleanup requires recovery. Use operation_stop for an active brew.
         """
         return await invoke(
             "recipe_cancel_uploaded", {"token": token, "allow_control": allow_control}

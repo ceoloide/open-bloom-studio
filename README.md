@@ -36,11 +36,13 @@ xbloom --connector simulator --direct water --volume-ml 100 --key first --allow-
 xbloom operation lookup first
 ```
 
-Every start needs an idempotency key. Reusing a key returns the recorded
-attempt and never starts the machine again. After any uncertainty, inspect
-`xbloom operation lookup KEY` instead of starting with a new key. A start
-whose delivery stays unconfirmed is recorded `unknown`, not `failed`, and is
-never replayed.
+Every start needs an idempotency key. Repeating a matching request returns
+its recorded attempt if one exists. After any uncertainty, run
+`xbloom operation lookup KEY` with the original key. If it returns an
+operation ID, use `xbloom history get ID` for details. If no attempt is found,
+submitting another start can run the machine even with the original key.
+Wait for fresh machine state and explicit authorization before retrying.
+A start whose delivery stays unconfirmed is recorded as `unknown`.
 
 ## Use a machine
 
@@ -63,6 +65,11 @@ After the daemon prints a JSON response with `serving`, use a second terminal:
 xbloom machine connect
 xbloom water --volume-ml 100 --key second --allow-control --wait
 ```
+
+For experimental work, open the session with
+`xbloom machine connect --allow-untested`. If you already opened a standard
+session, run `xbloom machine disconnect` before reconnecting. Experimental
+actions still need their own `--allow-untested`.
 
 For an offline run, start the daemon with `xbloom --connector simulator serve`. Run the daemon and the CLI under the same account; they share
 ownership locks in `~/.local/state/open-bloom/leases` under that account's
@@ -133,6 +140,10 @@ in three groups, so a client can be given only the roles it needs:
   }
 }
 ```
+
+If the MCP host uses a different environment from the daemon, add
+`--socket` and the daemon's absolute socket path to each local server's
+`args`. This matters when the host does not inherit `XDG_RUNTIME_DIR`.
 
 The `skills/` folder holds four standalone skills that follow the
 [Agent Skills specification](https://agentskills.io/specification) and teach

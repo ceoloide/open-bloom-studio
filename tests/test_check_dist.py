@@ -461,6 +461,32 @@ class InstallTest(unittest.TestCase):
             "installed xbloom did not complete a simulated operation", problems
         )
 
+    def test_daemon_probe_rejects_nonzero_cli_exit_with_completed_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli = root / "xbloom"
+            cli.write_text(
+                "#!/bin/sh\n"
+                """echo '{"ok": true, "data": {"status": "completed"}}'\n"""
+                "exit 2\n"
+            )
+            cli.chmod(0o700)
+            output = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    check_dist.DAEMON_PROBE,
+                    directory,
+                    directory,
+                    "00:00:5E:00:53:01",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        self.assertNotEqual(output.returncode, 0)
+        self.assertIn("exit status 2", output.stderr)
+
     def test_daemon_probe_problems(self):
         venv = Path("/venv")
         self.assertEqual(check_dist.check_probe(self.daemon(venv), venv), [])

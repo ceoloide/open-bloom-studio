@@ -138,7 +138,7 @@ ACTIVE = ("accepted", "running", "waiting_for_user")
 
 def xbloom(*args):
     done = subprocess.run([str(scripts / "xbloom"), *args], env=ENV, cwd=root,
-                          capture_output=True, text=True, timeout=120)
+                          check=True, capture_output=True, text=True, timeout=120)
     lines = [json.loads(line) for line in done.stdout.splitlines() if line.strip()]
     return lines[-1] if lines else {}
 

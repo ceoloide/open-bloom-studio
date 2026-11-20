@@ -31,6 +31,10 @@ user already answered in this session.
   current reading. `detail="full"` returns everything.
 - `machine_connect` opens and keeps a monitoring connection. A new
   connection can beep, and the machine accepts one Bluetooth owner at a time.
+  For authorized experimental work, open the session with
+  `machine_connect(allow_untested=true)`. If a standard session is already
+  open, use `machine_disconnect` before reconnecting. The experimental
+  action still needs its own opt-in.
 - `machine_prepare(request)` previews offline and never actuates. Requests:
   - water: `{"kind": "water", "volume_ml": 150, "temperature_c": 90, "flow_ml_s": 3, "pattern": "spiral"}`
   - grind: `{"kind": "grind", "size": 40, "rpm": 100, "duration_s": 5}`
@@ -60,7 +64,8 @@ live readings; page `history_events` only when diagnosing.
   device step.
 - A host recipe step of kind `user` waits at a gate. Ask the user to do the
   physical step and confirm it, then call
-  `operation_acknowledge(operation_id, token)` with that exact gate's token.
+  `operation_acknowledge(operation_id, token)` with that gate's `token`
+  from the `gate` field in `machine_state`.
   It never advances a prompt shown on the machine itself; those are handled on
   the machine.
 
@@ -73,11 +78,12 @@ from telemetry; `unknown` means the outcome could not be confirmed.
 If a start times out, the connection drops, a response is lost or a status is
 `unknown`:
 
-1. Call read-only `operation_lookup(idempotency_key)` with the original key,
-   then `history_get` and `machine_state`.
-2. Never start again automatically and never switch to a new key to force a
-   second attempt. Reusing the same key only returns the recorded attempt. A
-   missing lookup result does not prove the request never arrived.
+1. Call read-only `operation_lookup(idempotency_key)` with the original key.
+   If it returns an operation ID, use `history_get` for details. Check
+   `machine_state` for current telemetry.
+2. A matching recorded attempt is returned without execution. If the lookup
+   finds no attempt, another start can run the machine even with the original
+   key. Never submit another start automatically.
 3. Explain what is known and let the user check the machine. A retry needs
    fresh state and the user's explicit go-ahead.
 
