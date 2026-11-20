@@ -201,9 +201,9 @@ def create_server(  # noqa: C901 - one registration per tool
             try:
                 normalized = {"result": value} if isinstance(value, list) else value
                 validated = outputs.model_validate(normalized)
-                return self.result(
-                    validated.model_dump(mode="json", exclude_unset=True)
-                )
+                data = validated.model_dump(mode="json", exclude_unset=True)
+                failed = name == "machine_command" and data.get("status") == "failed"
+                return self.result(data, failed)
             except Exception:
                 correlation_id = uuid.uuid4().hex
                 logging.getLogger(__name__).exception(
@@ -666,9 +666,9 @@ def _machine_tools(  # noqa: C901
     async def recipe_cancel_uploaded(
         token: str, allow_control: bool = False
     ) -> dict[str, Any]:
-        """Quit matching native preparation through its owned session. Failed cleanup
-        requires recovery. Does not stop an already started brew; use
-        operation_stop for that operation ID.
+        """Release a matching native preparation. If already invalidated, release
+        its reservation without sending commands and return cancelled=false.
+        Failed cleanup requires recovery. Use operation_stop for an active brew.
         """
         return await invoke(
             "recipe_cancel_uploaded", {"token": token, "allow_control": allow_control}

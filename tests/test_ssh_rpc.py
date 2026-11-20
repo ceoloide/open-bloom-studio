@@ -198,7 +198,7 @@ class Output:
 class RelayTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         quiet_asyncio(self)
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
         self.store = Store(self.root / "bloom.sqlite3")
         self.app = Application(self.store, "00:00:5E:00:53:01")

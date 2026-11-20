@@ -94,7 +94,8 @@ class OfflineGuardTest(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets unavailable")
     def test_local_unix_socket_is_allowed(self):
-        with tempfile.TemporaryDirectory() as directory:
+        # Keep the bound path short even when TMPDIR is deeply nested.
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             path = os.path.join(directory, "s")
             with socket.socket(socket.AF_UNIX) as server:
                 server.bind(path)

@@ -866,7 +866,9 @@ OUTPUTS: dict[str, Model] = {
         cancelled=(
             bool,
             ...,
-            "Preparation-exit/home commands acknowledged; not a brew stop.",
+            "True when preparation-exit and home commands were acknowledged. "
+            "False when preparation was already invalidated and the reservation "
+            "was released without sending commands.",
         ),
     ),
     "machine_state": State,

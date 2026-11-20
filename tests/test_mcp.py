@@ -104,6 +104,26 @@ class ContractTests(ToolCase):
         self.assertEqual(value["error"]["code"], "validation_error")
         self.assertEqual(self.machine.calls, [])
 
+    async def test_failed_machine_command_marks_tool_error_and_keeps_evidence(self):
+        outcome = {
+            "status": "failed",
+            "error": "incomplete",
+            "type": "PresetWriteError",
+            "details": {"backup": {"slot": "A"}},
+            "recovery_required": True,
+        }
+
+        async def caller(method, params):
+            self.assertEqual(method, "machine_command")
+            return outcome
+
+        server = create_server(caller=caller)
+        result = await server.call_tool(
+            "machine_command", {"command": "back_home", "allow_control": True}
+        )
+        self.assertTrue(result.is_error)
+        self.assertEqual(result.structured_content, outcome)
+
     async def test_unknown_tools_and_domain_errors_are_structured(self):
         error, value = await self.tool("history_backup", {"destination": "/tmp/x"})
         self.assertEqual((error, value["error"]["code"]), (True, "unknown_tool"))

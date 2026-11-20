@@ -9,15 +9,18 @@ except through an explicit, checked stale-socket recovery.
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import socket
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ._cleanup import wait_cleanup
 from .errors import error_detail
-from .rpc_types import RemoteError, SocketDirectoryError
+from .rpc_types import RemoteError, SocketDirectoryError, SocketPathError
 from .rpc_wire import MAX_REQUEST, MAX_RESPONSE, frame
 from .rpc_wire import request as decode_request
 from .rpc_wire import response as decode_response
@@ -32,8 +35,30 @@ START_METHODS = ("operation_start", "recipe_start_uploaded")
 
 
 def default_socket() -> Path:
-    base = Path(os.environ.get("XDG_RUNTIME_DIR", Path.home() / ".local/state"))
-    return base / "open-bloom/bloom.sock"
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return Path(runtime) / "open-bloom/bloom.sock"
+    return Path.home() / ".local/state/open-bloom/run/bloom.sock"
+
+
+@contextmanager
+def _socket_path_errors() -> Iterator[None]:
+    try:
+        yield
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG or str(exc) == "AF_UNIX path too long":
+            raise SocketPathError("Unix socket path is too long") from exc
+        raise
+
+
+def socket_path_exists(path: Path, *, follow_symlinks: bool = True) -> bool:
+    """Check occupancy while retaining actionable filesystem path errors."""
+    with _socket_path_errors():
+        try:
+            os.stat(path, follow_symlinks=follow_symlinks)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+    return True
 
 
 async def call(
@@ -51,9 +76,10 @@ async def call(
     decode_request(payload, MAX_REQUEST)
 
     async def exchange() -> Any:
-        reader, writer = await asyncio.open_unix_connection(
-            os.fspath(socket_path), limit=MAX_RESPONSE
-        )
+        with _socket_path_errors():
+            reader, writer = await asyncio.open_unix_connection(
+                str(Path(socket_path).expanduser()), limit=MAX_RESPONSE
+            )
         try:
             writer.write(payload)
             await writer.drain()
@@ -98,13 +124,18 @@ class LocalServer:
         self._close_task: asyncio.Task[None] | None = None
 
     async def start(self) -> LocalServer:
-        self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        mode = self.path.parent.stat()
-        if mode.st_uid != os.getuid() or stat.S_IMODE(mode.st_mode) & 0o077:
+        with _socket_path_errors():
+            self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            mode = self.path.parent.lstat()
+        if (
+            not stat.S_ISDIR(mode.st_mode)
+            or mode.st_uid != os.getuid()
+            or stat.S_IMODE(mode.st_mode) & 0o077
+        ):
             raise SocketDirectoryError(
                 "Socket directory must be owned by this user and mode 0700"
             )
-        occupied = self.path.exists() or self.path.is_symlink()
+        occupied = socket_path_exists(self.path, follow_symlinks=False)
         if occupied and not self.recover_stale:
             raise FileExistsError(
                 "Socket already exists; use explicit stale recovery after "
@@ -119,7 +150,8 @@ class LocalServer:
             # directly so a competing listener is preserved with EADDRINUSE.
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener.setblocking(False)
-            listener.bind(str(self.path))
+            with _socket_path_errors():
+                listener.bind(str(self.path))
             bound = self.path.lstat()
             self.socket_identity = (bound.st_dev, bound.st_ino)
             self.server = await asyncio.start_unix_server(
@@ -161,9 +193,10 @@ class LocalServer:
                 "or regular file"
             )
         try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(str(self.path)), 1
-            )
+            with _socket_path_errors():
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_unix_connection(str(self.path)), 1
+                )
         except ConnectionRefusedError:
             pass
         else:

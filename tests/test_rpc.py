@@ -26,6 +26,7 @@ from xbloom_studio.ownership import AddressLease, LeaseDirectoryError
 from xbloom_studio.providers import ProviderError
 from xbloom_studio.recipe_validation import RecipeValidationError
 from xbloom_studio.rpc import LocalServer, RemoteError, call, default_socket
+from xbloom_studio.rpc_types import SocketPathError
 from xbloom_studio.storage import ConflictError, Store
 
 
@@ -165,7 +166,7 @@ class ErrorContractTests(unittest.TestCase):
 
 class ServerCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
         self.store = Store(self.root / "bloom.sqlite3")
         self.app = Application(self.store, "00:00:5E:00:53:01")
@@ -178,11 +179,43 @@ class ServerCase(unittest.IsolatedAsyncioTestCase):
 
 
 class LocalServerTests(ServerCase):
+    async def test_overlong_filename_is_an_actionable_socket_error(self):
+        path = self.root / ("x" * 256)
+        with self.assertRaises(SocketPathError):
+            await LocalServer(self.app, path).start()
+        self.assertFalse(self.app.machine.owned)
+
+    async def test_stale_recovery_rejects_overlong_alias_without_unlinking(self):
+        parent = self.root / ("directory-" * 10)
+        parent.mkdir(mode=0o700)
+        alias = self.root / "short"
+        alias.symlink_to(parent, target_is_directory=True)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(alias / "bloom.sock"))
+        path = parent / "bloom.sock"
+        with self.assertRaises(SocketPathError):
+            await LocalServer(self.app, path, recover_stale=True).start()
+        self.assertTrue(path.is_socket())
+        self.assertFalse(self.app.machine.owned)
+
+    async def test_overlong_socket_path_has_actionable_error(self):
+        path = self.root / "run" / ("x" * 110 + ".sock")
+        with self.assertRaises(SocketPathError) as bind_error:
+            await LocalServer(self.app, path).start()
+        with self.assertRaises(SocketPathError) as connect_error:
+            await call(path, "service_info")
+        for exc in (bind_error.exception, connect_error.exception):
+            detail = error_detail(exc)
+            self.assertEqual(detail["code"], "invalid_argument")
+            self.assertIn("shorter --socket path", detail["next_step"])
+        self.assertFalse(self.app.machine.owned)
+
     async def test_private_socket_serves_and_removes_only_itself(self):
         server = await LocalServer(self.app, self.path).start()
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.path.parent.stat().st_mode), 0o700)
-        info = await call(self.path, "service_info")
+        with patch.dict(os.environ, {"HOME": str(self.root)}):
+            info = await call("~/run/bloom.sock", "service_info")
         self.assertEqual(info["device"], "00:00:5E:00:53:01")
         with self.assertRaises(RemoteError) as caught:
             await call(self.path, "history_get", {"ident": "missing"})
@@ -340,6 +373,24 @@ class LocalServerTests(ServerCase):
             await server.close()
         writer.close()
         self.assertEqual(server.handlers, set())
+
+    async def test_default_socket_has_private_fallback_beside_existing_leases(self):
+        with (
+            patch.object(Path, "home", return_value=self.path.parent),
+            patch("pwd.getpwuid") as account,
+            patch.dict(os.environ, {"XDG_RUNTIME_DIR": ""}),
+        ):
+            account.return_value.pw_dir = self.path.parent
+            await self.app.machine._own()
+            self.assertEqual(
+                default_socket(),
+                self.path.parent / ".local/state/open-bloom/run/bloom.sock",
+            )
+            server = await LocalServer(self.app).start()
+            try:
+                self.assertEqual(stat.S_IMODE(server.path.parent.stat().st_mode), 0o700)
+            finally:
+                await server.close()
 
     def test_default_socket_uses_the_runtime_directory(self):
         with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1000"}):

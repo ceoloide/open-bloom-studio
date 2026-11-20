@@ -53,12 +53,18 @@ class CliCase(unittest.TestCase):
 
     def xbloom(self, *args, connector="simulator"):
         base = ["--db", str(self.db), "--socket", str(self.socket)]
-        if connector is not None:
+        if connector is not None and ("--direct" in args or "serve" in args):
             base += ["--connector", connector]
         return run_cli(*base, *args)
 
 
 class RouteTests(CliCase):
+    def test_serve_reports_overlong_socket_filename(self):
+        code, _, errors = run_cli("--socket", str(self.root / ("x" * 256)), "serve")
+        self.assertEqual(code, 2)
+        self.assertEqual(errors[0]["error"]["code"], "invalid_argument")
+        self.assertIn("shorter --socket path", errors[0]["error"]["next_step"])
+
     def route(self, *args):
         return cli.route(cli.parser().parse_args(list(args)))
 
@@ -463,7 +469,7 @@ class DirectTests(CliCase):
             {"name": "Gate", "steps": [{"kind": "user", "instruction": "Cup"}, WATER]},
         )
         cases = [
-            ("brew", "--file", gate, "--key", "g", "--allow-control"),
+            ("--direct", "brew", "--file", gate, "--key", "g", "--allow-control"),
             ("machine", "connect"),
             ("machine", "command", "back_home", "--allow-control"),
         ]
@@ -473,9 +479,44 @@ class DirectTests(CliCase):
                 self.assertEqual(code, 2)
                 self.assertIn("daemon", errors[0]["error"]["message"])
         code, _, errors = self.xbloom(
-            "water", "--volume-ml", "50", "--key", "x", connector=None
+            "--direct", "water", "--volume-ml", "50", "--key", "x", connector=None
         )
         self.assertEqual(errors[0]["error"]["code"], "permission_required")
+
+    def test_implicit_direct_start_and_lifecycle_calls_do_not_open_store(self):
+        cases = (
+            ("water", "--volume-ml", "5", "--key", "w", "--allow-control"),
+            ("machine", "disconnect"),
+            ("operation", "stop", "missing"),
+            ("operation", "pause", "missing"),
+            ("operation", "acknowledge", "missing", "token"),
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                status, _, errors = self.xbloom(*args)
+                self.assertEqual(status, 2)
+                self.assertIn(
+                    "daemon" if args[0] != "water" else "--direct",
+                    errors[0]["error"]["message"],
+                )
+                self.assertFalse(self.db.exists())
+
+    def test_inline_recipe_rejects_saved_revision_selection(self):
+        document = self.file("recipe.json", {"name": "Example", "steps": [WATER]})
+        status, _, errors = self.xbloom(
+            "--direct",
+            "brew",
+            "--file",
+            document,
+            "--revision",
+            "2",
+            "--key",
+            "w",
+            "--allow-control",
+        )
+        self.assertEqual(status, 2)
+        self.assertIn("--revision requires", errors[0]["error"]["message"])
+        self.assertFalse(self.db.exists())
 
     def test_failed_direct_operation_exits_nonzero(self):
         machine = Machine("SIM-SILENT", auto_complete=True)
@@ -527,7 +568,7 @@ class ConnectorSpecTests(unittest.TestCase):
 
 class DaemonClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
         self.db = self.root / "bloom.sqlite3"
         self.store = Store(self.db)
@@ -552,6 +593,25 @@ class DaemonClientTests(unittest.IsolatedAsyncioTestCase):
     async def xbloom(self, *args):
         return await asyncio.to_thread(run_cli, "--socket", str(self.socket), *args)
 
+    async def test_tilde_socket_path_routes_to_daemon(self):
+        def tilde(*args):
+            return run_cli("--socket", "~/run/bloom.sock", *args)
+
+        with patch.dict("os.environ", {"HOME": str(self.root)}):
+            code, lines, errors = await asyncio.to_thread(tilde, "machine", "state")
+            self.assertEqual(code, 0, errors)
+            self.assertTrue(lines[0]["ok"])
+            # Only the daemon's identity check can reject a different device.
+            code, _, errors = await asyncio.to_thread(
+                tilde, "--device", "00:00:5E:00:53:08", "machine", "state"
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("different device", errors[0]["error"]["message"])
+            code, _, errors = await asyncio.to_thread(
+                tilde, "--direct", "machine", "state"
+            )
+            self.assertIn("do not bypass", errors[0]["error"]["message"])
+
     async def test_client_checks_the_served_machine_and_database(self):
         code, _, errors = await self.xbloom(
             "--device", "00:00:5E:00:53:08", "machine", "state"
@@ -572,6 +632,22 @@ class DaemonClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("daemon owns the link", errors[0]["error"]["message"])
         code, _, errors = await self.xbloom("--direct", "machine", "state")
         self.assertIn("do not bypass", errors[0]["error"]["message"])
+
+    async def test_failed_machine_command_exits_nonzero_and_keeps_result(self):
+        outcome = {"status": "failed", "error": "incomplete", "recovery_required": True}
+        dispatch = self.app.call
+
+        async def simulate(method, params=None):
+            if method == "machine_command":
+                return outcome
+            return await dispatch(method, params)
+
+        with patch.object(self.app, "call", simulate):
+            status, lines, _ = await self.xbloom(
+                "machine", "command", "back_home", "--allow-control"
+            )
+        self.assertEqual(status, 2)
+        self.assertEqual(lines[0]["data"], outcome)
 
     async def test_waiting_start_follows_the_daemon_operation(self):
         task = asyncio.create_task(
