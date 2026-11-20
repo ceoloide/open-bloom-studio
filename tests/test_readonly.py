@@ -1,9 +1,13 @@
 import asyncio
+import os
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
+import uuid
 from contextlib import aclosing
+from pathlib import Path
 from unittest import mock
 
 from tests import fake_bleak
@@ -19,7 +23,7 @@ from xbloom_studio import (
     plan,
 )
 from xbloom_studio.client import bounded, wait_set
-from xbloom_studio.ownership import AddressLease
+from xbloom_studio.ownership import AddressLease, lease_directory
 from xbloom_studio.transport import BleakTransport
 
 SCALE = reply(20501, struct.pack("<f", 0))
@@ -875,6 +879,47 @@ class PlanTests(unittest.TestCase):
 
 
 class LeaseTests(unittest.TestCase):
+    def test_lease_directory_uses_the_account_home(self):
+        with tempfile.TemporaryDirectory() as root:
+            with (
+                mock.patch("pwd.getpwuid") as account,
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "HOME": root + "/other-home",
+                        "XDG_STATE_HOME": root + "/other-state",
+                        "TMPDIR": root + "/private-tmp",
+                    },
+                ),
+            ):
+                account.return_value.pw_dir = root
+                self.assertEqual(
+                    lease_directory(), Path(root) / ".local/state/open-bloom/leases"
+                )
+
+    def test_processes_with_distinct_tmpdirs_share_ownership(self):
+        code = (
+            "import sys; from xbloom_studio.ownership import AddressLease; "
+            "AddressLease(sys.argv[1]).acquire()"
+        )
+        with tempfile.TemporaryDirectory() as other_tmp:
+            for resource in ("machine", "application"):
+                with self.subTest(resource=resource):
+                    key = f"{resource}:{uuid.uuid4().hex}"
+                    lease = AddressLease(key)
+                    lease.acquire()
+                    try:
+                        outcome = subprocess.run(
+                            [sys.executable, "-c", code, key],
+                            env={**os.environ, "TMPDIR": other_tmp},
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertNotEqual(outcome.returncode, 0)
+                        self.assertIn("Another library process", outcome.stderr)
+                    finally:
+                        lease.release()
+
     def test_another_process_cannot_take_lease_and_release_is_reusable(self):
         lease = AddressLease("process-test")
         lease.acquire()

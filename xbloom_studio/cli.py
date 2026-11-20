@@ -1,0 +1,711 @@
+"""The ``xbloom`` command: local SQLite, a private daemon, or an SSH endpoint.
+
+Every command routes to one :meth:`~xbloom_studio.facade.Application.call`
+method, including the same registry and binding for database-free recipe calls.
+Machine work runs in the daemon (``xbloom serve``) when its socket exists,
+through ``--ssh`` on a remote daemon, or attached in this process with
+``--direct`` when no daemon is running. ``xbloom relay`` is the restricted
+stdio endpoint that SSH forced commands run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import importlib
+import json
+import os
+import signal
+import sys
+from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
+from typing import Any
+
+from .connector import Connector, normalize_identity
+from .errors import error_detail
+from .facade import PURE_METHODS, Application, bind_parameters
+from .grind_profiles import grind_profile
+from .provider_exports import load_export
+from .rpc import LocalServer, call, default_socket
+from .serialization import dumps
+from .storage import ConflictError, Store
+from .tea_guidance import FAMILIES
+
+DEVICE_ENVIRONMENT = "BLOOM_DEVICE"
+TARGETS = ("host", "coffee", "tea")
+ACTIVE = ("accepted", "running", "waiting_for_user")
+RETAINED_CONNECTION_METHODS = (
+    "machine_connect",
+    "machine_command",
+    "recipe_upload",
+    "recipe_start_uploaded",
+    "recipe_cancel_uploaded",
+)
+PURE_ACTIONS = (
+    "grind-profile",
+    "tea-references",
+    "validate",
+    "tea-validate",
+    "preview",
+    "constraints",
+    "templates",
+    "examples",
+)
+# The simulator has no physical timing, so sessions skip settle delays.
+SIMULATOR_OPTIONS = {"settle": 0, "subscription_settle": 0, "transition_delay": 0}
+
+Invoke = Callable[..., Awaitable[Any]]
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="xbloom",
+        description="Open Bloom recipes, complete history and owned machine operations",
+    )
+    p.add_argument("--db", type=Path)
+    p.add_argument("--socket", type=Path, help="Local private daemon socket")
+    p.add_argument(
+        "--ssh",
+        help="SSH host/config alias for the fixed remote RPC endpoint; never falls "
+        "back to local execution",
+    )
+    p.add_argument(
+        "--ssh-config",
+        type=Path,
+        help="Optional local OpenSSH configuration file; requires --ssh",
+    )
+    p.add_argument("--device", default=os.environ.get(DEVICE_ENVIRONMENT))
+    p.add_argument(
+        "--connector",
+        help="Byte link for serve or --direct: 'simulator', or module:factory "
+        "called with the device; defaults to local Bluetooth",
+    )
+    p.add_argument(
+        "--direct",
+        action="store_true",
+        help="Use attached local execution; never compete with a daemon",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+    daemon = sub.add_parser("serve", help="Run the private Unix socket daemon")
+    daemon.add_argument(
+        "--recover-stale-socket",
+        action="store_true",
+        help="Lease-checked recovery of an unchanged refused same-user Unix socket",
+    )
+    daemon.add_argument(
+        "--capture-idle-telemetry",
+        action="store_true",
+        help="Persist raw notifications while connected without an active operation",
+    )
+    relay = sub.add_parser(
+        "relay", help="Restricted one-shot stdio relay for SSH forced commands"
+    )
+    relay.add_argument("--socket", dest="relay_socket")
+    sub.add_parser("mcp", help="Use the separate xbloom-mcp command")
+    c = sub.add_parser("call", help="Call one application method by name")
+    c.add_argument("method")
+    c.add_argument("--params", type=Path)
+    for group in ("recipe", "history", "machine", "operation"):
+        q = sub.add_parser(group)
+        actions = q.add_subparsers(dest="action", required=True)
+        if group == "recipe":
+            _recipe_actions(actions)
+        elif group == "history":
+            _history_actions(actions)
+        elif group == "machine":
+            _machine_actions(actions)
+        else:
+            lookup = actions.add_parser("lookup")
+            lookup.add_argument("idempotency_key")
+            for name in ("get", "watch", "stop", "pause", "resume", "acknowledge"):
+                a = actions.add_parser(name)
+                a.add_argument("operation_id")
+                if name == "acknowledge":
+                    a.add_argument("token")
+    for name in ("water", "grind", "brew"):
+        a = sub.add_parser(name)
+        control_flags(a)
+        if name == "water":
+            a.add_argument("--volume-ml", type=float, required=True)
+            a.add_argument("--temperature-c", type=float, default=20)
+            a.add_argument("--flow-ml-s", type=float, default=3)
+            a.add_argument(
+                "--pattern", choices=["center", "ring", "spiral"], default="center"
+            )
+        elif name == "grind":
+            a.add_argument("--size", type=int, required=True)
+            a.add_argument("--rpm", type=int, required=True)
+            a.add_argument("--duration-s", type=float, required=True)
+        else:
+            a.add_argument("reference", nargs="?")
+            a.add_argument("--file", type=Path)
+            a.add_argument("--revision", type=int)
+    return p
+
+
+def _recipe_actions(actions: Any) -> None:
+    a = actions.add_parser("validate")
+    a.add_argument("file", type=Path)
+    a = actions.add_parser("tea-references")
+    a.add_argument("--family", choices=FAMILIES)
+    a = actions.add_parser("tea-validate")
+    a.add_argument("file", type=Path)
+    a.add_argument("--expected-output-ml", type=int)
+    a = actions.add_parser("grind-profile")
+    a.add_argument("name")
+    a.add_argument("--size", type=int, required=True)
+    a.add_argument("--rpm", type=int, required=True)
+    a.add_argument("--duration-s", type=float, required=True)
+    a = actions.add_parser("preview")
+    a.add_argument("file", type=Path)
+    actions.add_parser("constraints")
+    actions.add_parser("templates")
+    a = actions.add_parser("create")
+    a.add_argument("file", type=Path)
+    a.add_argument("--temporary", action="store_true")
+    for name in ("get", "compile", "archive", "alias", "update", "refresh"):
+        a = actions.add_parser(name)
+        a.add_argument("reference")
+        if name in ("get", "compile"):
+            a.add_argument("--revision", type=int)
+        if name in ("archive", "update"):
+            a.add_argument("--expected-revision", type=int, required=True)
+        if name == "update":
+            a.add_argument("file", type=Path)
+        if name == "alias":
+            a.add_argument("alias")
+        if name == "refresh":
+            a.add_argument("--flow-ml-s", type=float)
+            a.add_argument("--target", choices=TARGETS)
+    a = actions.add_parser("list")
+    a.add_argument("--query", default="")
+    a.add_argument("--include-temporary", action="store_true")
+    list_flags(a)
+    a = actions.add_parser("import")
+    a.add_argument("url")
+    a.add_argument("--flow-ml-s", type=float)
+    a.add_argument("--temporary", action="store_true")
+    a.add_argument("--target", choices=TARGETS)
+    a = actions.add_parser("import-export")
+    a.add_argument("file", type=Path)
+    a.add_argument("--target", choices=TARGETS, default="host")
+    a.add_argument("--flow-ml-s", type=float)
+    a.add_argument("--temporary", action="store_true")
+    a = actions.add_parser("search-online")
+    a.add_argument("query")
+    a.add_argument("--page", type=int, default=1)
+    a = actions.add_parser("match")
+    a.add_argument("file", type=Path)
+    a.add_argument(
+        "--limit",
+        type=int,
+        help="Return the best 1..1000 matches; omitted returns the complete ranking",
+    )
+    a = actions.add_parser("examples")
+    a.add_argument("file", type=Path)
+    a.add_argument("--water-ml", type=float)
+    a.add_argument("--limit", type=int, default=5)
+
+
+def _history_actions(actions: Any) -> None:
+    a = actions.add_parser("list")
+    a.add_argument("--query", default="")
+    a.add_argument("--liked", action="store_true")
+    list_flags(a)
+    a.add_argument("--status", help="Filter recorded operation status; implies --page")
+    a.add_argument(
+        "--min-rating", type=int, help="Minimum explicit rating 1..5; implies --page"
+    )
+    for name in ("get", "events", "export", "feedback", "save-recipe", "repeat"):
+        a = actions.add_parser(name)
+        a.add_argument("operation_id")
+        if name in ("events", "export"):
+            a.add_argument("--after", type=int, default=0)
+        if name == "feedback":
+            a.add_argument("note")
+            a.add_argument("--rating", type=int)
+        if name == "save-recipe":
+            a.add_argument("name")
+        if name == "repeat":
+            control_flags(a)
+
+
+def _machine_actions(actions: Any) -> None:
+    for name in ("state", "capabilities", "connect", "disconnect"):
+        a = actions.add_parser(name)
+        if name == "connect":
+            a.add_argument("--allow-untested", action="store_true")
+    a = actions.add_parser("command")
+    a.add_argument("machine_command")
+    a.add_argument("--params", type=Path)
+    a.add_argument("--allow-control", action="store_true")
+    a.add_argument("--allow-untested", action="store_true")
+    a = actions.add_parser("upload")
+    a.add_argument("reference", nargs="?")
+    a.add_argument("--file", type=Path)
+    a.add_argument("--revision", type=int)
+    a.add_argument("--allow-control", action="store_true")
+    a.add_argument("--allow-untested", action="store_true")
+    a.add_argument("--expected-recipe-sha256")
+    a = actions.add_parser("start-uploaded")
+    a.add_argument("token")
+    control_flags(a)
+    a = actions.add_parser("cancel-uploaded")
+    a.add_argument("token")
+    a.add_argument("--allow-control", action="store_true")
+
+
+def list_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--limit",
+        type=int,
+        help="Maximum items: legacy list default 100, page default 25; range 1..1000",
+    )
+    p.add_argument(
+        "--page",
+        action="store_true",
+        help="Return a live-collection page envelope with items, has_more and "
+        "next_cursor",
+    )
+    p.add_argument(
+        "--cursor",
+        help="Continue a page with identical query/filters, even after empty items; "
+        "implies --page",
+    )
+    p.add_argument(
+        "--detail",
+        choices=("compact", "full"),
+        help="Page projection: full includes documents/plans; defaults compact and "
+        "implies --page",
+    )
+
+
+def list_route(
+    a: argparse.Namespace, history: bool = False
+) -> tuple[str, dict[str, Any]]:
+    params: dict[str, Any] = {"query": a.query}
+    params.update(
+        {"liked": a.liked} if history else {"include_temporary": a.include_temporary}
+    )
+    page = a.page or a.cursor is not None or a.detail is not None
+    if history:
+        page = page or a.status is not None or a.min_rating is not None
+    params["limit"] = a.limit if a.limit is not None else 25 if page else 100
+    if page:
+        params.update(
+            cursor=a.cursor, detail=a.detail if a.detail is not None else "compact"
+        )
+        if history:
+            params.update(status=a.status, min_rating=a.min_rating)
+    return ("history_" if history else "recipe_") + ("page" if page else "list"), params
+
+
+def control_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--allow-control", action="store_true")
+    p.add_argument("--allow-untested", action="store_true")
+    p.add_argument(
+        "--key",
+        required=True,
+        help="Idempotency key; reuse only to retrieve the same attempt",
+    )
+    p.add_argument(
+        "--wait", action="store_true", help="Follow daemon operation to completion"
+    )
+
+
+def load(path: Path) -> Any:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Unable to read JSON input file: {path}") from exc
+    return json.loads(text)
+
+
+def _recipe_source(a: argparse.Namespace) -> dict[str, Any]:
+    if bool(a.reference) == bool(a.file):
+        raise ValueError("Provide exactly one recipe reference or --file")
+    if a.reference:
+        return {"kind": "recipe", "reference": a.reference, "revision": a.revision}
+    return {"kind": "recipe", "document": load(a.file)}
+
+
+def _recipe_route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+    action = a.action
+    if action == "tea-references":
+        return "recipe_tea_references", {"family": a.family}
+    if action == "tea-validate":
+        return "recipe_tea_validate", {
+            "document": load(a.file),
+            "expected_output_ml": a.expected_output_ml,
+        }
+    if action in ("preview", "validate"):
+        return "recipe_" + action, {"document": load(a.file)}
+    if action in ("constraints", "templates"):
+        return "recipe_" + action, {}
+    if action == "examples":
+        return "recipe_examples", {
+            "coffee": load(a.file),
+            "water_ml": a.water_ml,
+            "limit": a.limit,
+        }
+    if action == "grind-profile":
+        document = grind_profile(a.name, a.size, a.rpm, a.duration_s)
+        return "recipe_validate", {"document": document}
+    if action == "create":
+        return "recipe_create", {"document": load(a.file), "temporary": a.temporary}
+    if action == "update":
+        return "recipe_update", {
+            "reference": a.reference,
+            "document": load(a.file),
+            "expected_revision": a.expected_revision,
+        }
+    if action in ("get", "compile"):
+        return "recipe_" + action, {"reference": a.reference, "revision": a.revision}
+    if action == "archive":
+        return "recipe_archive", {
+            "reference": a.reference,
+            "expected_revision": a.expected_revision,
+        }
+    if action == "alias":
+        return "recipe_alias", {"reference": a.reference, "alias": a.alias}
+    target = {"target": a.target} if getattr(a, "target", None) is not None else {}
+    if action == "refresh":
+        return "recipe_refresh", {
+            "reference": a.reference,
+            "flow_ml_s": a.flow_ml_s,
+            **target,
+        }
+    if action == "list":
+        return list_route(a)
+    if action == "import-export":
+        return "recipe_import_export", {
+            "document": load_export(a.file),
+            "flow_ml_s": a.flow_ml_s,
+            "temporary": a.temporary,
+            **target,
+        }
+    if action == "import":
+        return "recipe_import", {
+            "url": a.url,
+            "flow_ml_s": a.flow_ml_s,
+            "temporary": a.temporary,
+            **target,
+        }
+    if action == "search-online":
+        return "provider_search", {"query": a.query, "page": a.page}
+    limit = {"limit": a.limit} if a.limit is not None else {}
+    return "recipe_match", {"coffee": load(a.file), **limit}
+
+
+def _machine_route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+    if a.action == "command":
+        return "machine_command", {
+            "command": a.machine_command,
+            "params": load(a.params) if a.params else {},
+            "allow_control": a.allow_control,
+            "allow_untested": a.allow_untested,
+        }
+    if a.action == "upload":
+        return "recipe_upload", {
+            "request": _recipe_source(a),
+            "allow_control": a.allow_control,
+            "allow_untested": a.allow_untested,
+            "expected_recipe_sha256": a.expected_recipe_sha256,
+        }
+    if a.action == "start-uploaded":
+        return "recipe_start_uploaded", {
+            "token": a.token,
+            "idempotency_key": a.key,
+            "allow_control": a.allow_control,
+        }
+    if a.action == "cancel-uploaded":
+        return "recipe_cancel_uploaded", {
+            "token": a.token,
+            "allow_control": a.allow_control,
+        }
+    connect = {"allow_untested": a.allow_untested} if a.action == "connect" else {}
+    return "machine_" + a.action, connect
+
+
+def _operation_route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+    if a.action == "lookup":
+        return "operation_lookup", {"idempotency_key": a.idempotency_key}
+    if a.action in ("get", "watch"):
+        return "history_get", {"ident": a.operation_id}
+    if a.action in ("pause", "resume"):
+        return "operation_pause_resume", {
+            "operation_id": a.operation_id,
+            "resume": a.action == "resume",
+        }
+    token = {"token": a.token} if a.action == "acknowledge" else {}
+    return "operation_" + a.action, {"operation_id": a.operation_id, **token}
+
+
+def route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+    """Map parsed arguments to one application method and its parameters."""
+    if a.command == "call":
+        return a.method, load(a.params) if a.params else {}
+    if a.command == "recipe":
+        return _recipe_route(a)
+    if a.command == "machine":
+        return _machine_route(a)
+    if a.command == "operation":
+        return _operation_route(a)
+    if a.command == "history":
+        if a.action == "list":
+            return list_route(a, history=True)
+        if a.action == "get":
+            return "history_get", {"ident": a.operation_id}
+        if a.action in ("events", "export"):
+            return "history_events", {"operation_id": a.operation_id, "after": a.after}
+        if a.action == "feedback":
+            return "history_feedback", {
+                "ident": a.operation_id,
+                "note": a.note,
+                "rating": a.rating,
+            }
+        if a.action == "save-recipe":
+            return "history_save_recipe", {
+                "operation_id": a.operation_id,
+                "name": a.name,
+            }
+        request: dict[str, Any] = {"kind": "repeat", "operation_id": a.operation_id}
+    elif a.command == "brew":
+        request = _recipe_source(a)
+    else:
+        fields = (
+            ("volume_ml", "temperature_c", "flow_ml_s", "pattern")
+            if a.command == "water"
+            else ("size", "rpm", "duration_s")
+        )
+        request = {"kind": a.command, **{field: getattr(a, field) for field in fields}}
+    return "operation_start", {
+        "request": request,
+        "idempotency_key": a.key,
+        "allow_control": a.allow_control,
+        "allow_untested": a.allow_untested,
+    }
+
+
+def load_connector(spec: str, device: str | None) -> tuple[Connector, dict[str, Any]]:
+    """Build a connector from ``simulator`` or an importable ``module:factory``.
+
+    A factory is called with the configured device (or ``None``) and must
+    return a :class:`~xbloom_studio.Connector` for that machine.
+    """
+    if spec == "simulator":
+        from .simulator import ScriptedConnector
+
+        return ScriptedConnector(device or "SIMULATED-STUDIO"), dict(SIMULATOR_OPTIONS)
+    module, _, name = spec.partition(":")
+    if not module or not name.isidentifier():
+        raise ValueError("--connector must be 'simulator' or module:factory")
+    connector = getattr(importlib.import_module(module), name)(device)
+    if not isinstance(connector, Connector):
+        raise TypeError("The connector factory must return a Connector")
+    return connector, {}
+
+
+def output(value: Any) -> None:
+    print(dumps({"ok": True, "data": value}), flush=True)
+
+
+def _check_options(a: argparse.Namespace) -> None:
+    if a.command == "relay":
+        raise ValueError("xbloom relay takes no global options")
+    if a.command == "mcp":
+        raise ValueError("Use xbloom-mcp for the optional MCP adapter")
+    if a.ssh_config is not None and a.ssh is None:
+        raise ValueError("--ssh-config requires --ssh")
+
+
+def _same_device(configured: str | None, served: object) -> bool:
+    if not configured:
+        return True
+    try:
+        return normalize_identity(configured) == normalize_identity(served)
+    except ValueError:
+        return False
+
+
+async def run(a: argparse.Namespace) -> int:
+    _check_options(a)
+    app: Application | None = None
+    invoke: Invoke
+    if a.ssh is not None:
+        from .ssh_rpc import ssh_call, validate_host
+
+        validate_host(a.ssh)
+        if (
+            a.command == "serve"
+            or a.direct
+            or a.db is not None
+            or a.socket is not None
+            or a.connector is not None
+        ):
+            raise ValueError(
+                "--ssh cannot be combined with serve, --direct, --db, --socket or "
+                "--connector; the remote endpoint fixes its database and link"
+            )
+        remote = True
+
+        async def invoke(method: str, params: dict[str, Any] | None = None) -> Any:
+            return await ssh_call(a.ssh, method, params, config_file=a.ssh_config)
+
+    else:
+        a.socket = a.socket or default_socket()
+        remote = a.socket.exists() and not a.direct
+        if a.direct and a.socket.exists():
+            raise ValueError("Daemon socket exists; do not bypass its owner")
+
+        async def invoke(method: str, params: dict[str, Any] | None = None) -> Any:
+            if remote:
+                return await call(a.socket, method, params)
+            assert app is not None
+            return await app.call(method, params)
+
+    if not remote and (
+        (a.command == "recipe" and a.action in PURE_ACTIONS)
+        or (a.command == "call" and a.method in PURE_METHODS)
+    ):
+        method, params = route(a)
+        fn, _ = PURE_METHODS[method]
+        result = fn(**bind_parameters(fn, params))
+        output(result)
+        validation = method in ("recipe_validate", "recipe_tea_validate")
+        return 2 if validation and not result["valid"] else 0
+    if remote and a.command != "serve":
+        if a.connector is not None:
+            raise ValueError(
+                "A running daemon owns the link; --connector applies to serve and "
+                "--direct"
+            )
+        identity = await invoke("service_info")
+        if not _same_device(a.device, identity["device"]):
+            raise ValueError("Configured daemon targets a different device")
+        if a.db and a.db.expanduser().resolve() != Path(identity["database"]):
+            raise ValueError("Configured daemon uses a different database")
+    store = None
+    try:
+        if not remote or a.command == "serve":
+            store = Store(a.db)
+            connector, options = (
+                load_connector(a.connector, a.device)
+                if a.connector is not None
+                else (None, {})
+            )
+            app = Application(
+                store,
+                a.device,
+                connector=connector,
+                interaction_options=options,
+                capture_idle_telemetry=getattr(a, "capture_idle_telemetry", False),
+            )
+        if a.command == "serve":
+            assert app is not None
+            return await serve(
+                app, a.socket or default_socket(), a.recover_stale_socket
+            )
+        return await _execute(a, invoke, remote, store, app)
+    finally:
+        try:
+            if app is not None:
+                await app.close()
+        finally:
+            if store is not None:
+                store.close()
+
+
+async def serve(app: Application, socket_path: Path, recover_stale: bool) -> int:
+    server = LocalServer(app, socket_path, recover_stale=recover_stale)
+    await server.start()
+    stopped = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stopped.set)
+    output({"serving": str(server.path), "connected": False})
+    try:
+        await stopped.wait()
+    finally:
+        await server.close()
+    return 0
+
+
+async def _execute(
+    a: argparse.Namespace,
+    invoke: Invoke,
+    remote: bool,
+    store: Store | None,
+    app: Application | None,
+) -> int:
+    method, params = route(a)
+    if not remote and method in RETAINED_CONNECTION_METHODS:
+        raise ValueError(
+            "Retained connections require a running daemon; start xbloom serve first"
+        )
+    if not remote and method == "operation_start":
+        assert store is not None and app is not None
+        existing = await asyncio.to_thread(
+            store.operation_by_key, params["idempotency_key"]
+        )
+        if existing is None:
+            preview = await app.call("machine_prepare", {"request": params["request"]})
+            if preview["requires_user"]:
+                raise ValueError(
+                    "Host preparation gates require a running daemon; start xbloom "
+                    "serve first"
+                )
+            supplied_digest = params.get("expected_recipe_sha256")
+            digest = preview["recipe_sha256"]
+            if supplied_digest is not None and supplied_digest != digest:
+                raise ConflictError(
+                    "Prepared recipe changed; preview it again before starting"
+                )
+            params["expected_recipe_sha256"] = digest
+    result = await invoke(method, params)
+    if a.command == "history" and a.action == "export":
+        while result:
+            for event in result:
+                print(dumps(event))
+            params["after"] = result[-1]["id"]
+            result = await invoke(method, params)
+        return 0
+    output(result)
+    if method in ("recipe_validate", "recipe_tea_validate"):
+        return 0 if result["valid"] else 2
+    started = method in ("operation_start", "recipe_start_uploaded")
+    watch = (started and (not remote or getattr(a, "wait", False))) or (
+        a.command == "operation" and a.action == "watch"
+    )
+    if not watch:
+        return 0
+    ident, last = result["id"], None
+    while result["status"] in ACTIVE:
+        if result["status"] == "waiting_for_user" and not remote:
+            raise ValueError(
+                "Host preparation gates require a daemon caller to acknowledge "
+                "their exact tokens"
+            )
+        await asyncio.sleep(1 if a.ssh is not None else 0.1)
+        result = await invoke("history_get", {"ident": ident})
+        text = dumps(result)
+        if text != last:
+            output(result)
+            last = text
+    return 0 if result["status"] == "completed" else 2
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["relay"]:
+        from .ssh_rpc import main as relay_main
+
+        return relay_main(args[1:])
+    try:
+        return asyncio.run(run(parser().parse_args(args)))
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        detail = error_detail(exc, log_unexpected=False)
+        print(dumps({"ok": False, "error": detail}), file=sys.stderr)
+        return 2

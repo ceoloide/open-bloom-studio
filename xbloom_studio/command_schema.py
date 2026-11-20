@@ -15,6 +15,10 @@ Schema = dict[str, Any]
 MAX_OPERATION_TIMEOUT = 3600
 
 
+def recipe_configuration_untested(bypass_ml: float, cup_limits: object) -> bool:
+    return bool(bypass_ml or cup_limits is not None)
+
+
 def water_timeout(volume_ml: float, flow_ml_s: float) -> float:
     return volume_ml / flow_ml_s + 45
 

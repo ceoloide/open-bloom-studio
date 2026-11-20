@@ -394,6 +394,9 @@ class Interaction(MachineControls, ReadOnlyClient):
         self._entered = False
         self._scale_mode = False
         self._uncertain = False
+        # Commands whose delivery or effect stayed unconfirmed, as opposed to
+        # refusals that sent nothing; never reset, compared across a step.
+        self._unconfirmed_deliveries = 0
         self._event_revision = 0
         self._received_events: deque[tuple[int, Packet]] = deque(maxlen=256)
         # Latest revision per event (and per reported state), kept apart from
@@ -933,11 +936,14 @@ class Interaction(MachineControls, ReadOnlyClient):
                 # A missing ACK leaves command effects uncertain; never retry.
                 # A guard rejection sent nothing. A cancellation is uncertain
                 # once the frame could have reached the machine unacknowledged.
-                if isinstance(exc, Exception):
-                    if not progress.rejected:
-                        self._uncertain = True
-                elif progress.transmitted_at is not None and not _confirmed(future):
+                if (
+                    not progress.rejected
+                    if isinstance(exc, Exception)
+                    else progress.transmitted_at is not None and not _confirmed(future)
+                ):
                     self._uncertain = True
+                    if progress.transmitted_at is not None and not progress.withheld:
+                        self._unconfirmed_deliveries += 1
                 # A begun frame whose final chunk was never attempted would
                 # absorb the next bytes; a final attempt stays merely unknown.
                 if progress.unfinished() and self._withholds_final_chunk():

@@ -21,6 +21,8 @@ from .serialization import digest, dumps, now
 __all__ = ["ConflictError", "Store", "default_db", "digest", "dumps", "now"]
 
 ACTIVE_STATUSES = ("accepted", "running", "waiting_for_user")
+TERMINAL_STATUSES = ("completed", "failed", "stopped", "unknown")
+TRANSITION_STATUSES = ("running", "waiting_for_user", *TERMINAL_STATUSES)
 WAL_BUSY_SECONDS = 10
 
 
@@ -418,10 +420,31 @@ class Store(Pagination):
         return result
 
     def finish(self, ident: str, status: str, result: Any = None) -> None:
+        """Record a transition of an accepted operation.
+
+        Only known statuses are accepted, and ``accepted`` is only ever written
+        on creation. A terminal outcome, including one recovery recorded as
+        ``unknown``, is final: repeating it identically is a no-op, and any
+        other transition is a conflict that leaves it unchanged.
+        """
+        if status not in TRANSITION_STATUSES:
+            raise ValueError("status must be one of " + ", ".join(TRANSITION_STATUSES))
+        encoded = dumps(result) if result is not None else None
         with self.transaction() as db:
+            row = db.execute(
+                "SELECT status,result FROM operations WHERE id=?", (ident,)
+            ).fetchone()
+            if row is None:
+                raise KeyError("Operation not found")
+            if row["status"] in TERMINAL_STATUSES:
+                if (row["status"], row["result"]) == (status, encoded):
+                    return
+                raise ConflictError(
+                    "Operation already has a terminal outcome; it is never overwritten"
+                )
             db.execute(
                 "UPDATE operations SET status=?,result=?,updated_at=? WHERE id=?",
-                (status, dumps(result) if result is not None else None, now(), ident),
+                (status, encoded, now(), ident),
             )
             self._insert_event(
                 db, "operation." + status, {"result": result}, operation_id=ident
