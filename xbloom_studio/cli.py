@@ -1,7 +1,7 @@
 """The ``xbloom`` command: local SQLite, a private daemon, or an SSH endpoint.
 
 Every command routes to one :meth:`~xbloom_studio.facade.Application.call`
-method, so the CLI, Python, the daemon and MCP share one dispatch path.
+method, including the same registry and binding for database-free recipe calls.
 Machine work runs in the daemon (``xbloom serve``) when its socket exists,
 through ``--ssh`` on a remote daemon, or attached in this process with
 ``--direct`` when no daemon is running. ``xbloom relay`` is the restricted
@@ -23,17 +23,13 @@ from typing import Any
 
 from .connector import Connector, normalize_identity
 from .errors import error_detail
-from .facade import Application, bundled_examples, bundled_tea_references
+from .facade import PURE_METHODS, Application, bind_parameters
 from .grind_profiles import grind_profile
 from .provider_exports import load_export
-from .recipe_validation import check_recipe, recipe_constraints
-from .recipes import compile_recipe
 from .rpc import LocalServer, call, default_socket
 from .serialization import dumps
 from .storage import ConflictError, Store
 from .tea_guidance import FAMILIES
-from .tea_validation import validate_tea_recipe
-from .templates import recipe_templates
 
 DEVICE_ENVIRONMENT = "BLOOM_DEVICE"
 TARGETS = ("host", "coffee", "tea")
@@ -45,15 +41,6 @@ RETAINED_CONNECTION_METHODS = (
     "recipe_start_uploaded",
     "recipe_cancel_uploaded",
 )
-PURE: dict[str, Callable[..., Any]] = {
-    "recipe_validate": check_recipe,
-    "recipe_constraints": recipe_constraints,
-    "recipe_templates": recipe_templates,
-    "recipe_tea_references": bundled_tea_references,
-    "recipe_examples": bundled_examples,
-    "recipe_tea_validate": validate_tea_recipe,
-    "recipe_preview": compile_recipe,
-}
 PURE_ACTIONS = (
     "grind-profile",
     "tea-references",
@@ -579,10 +566,11 @@ async def run(a: argparse.Namespace) -> int:
 
     if not remote and (
         (a.command == "recipe" and a.action in PURE_ACTIONS)
-        or (a.command == "call" and a.method in PURE)
+        or (a.command == "call" and a.method in PURE_METHODS)
     ):
         method, params = route(a)
-        result = PURE[method](**params)
+        fn, _ = PURE_METHODS[method]
+        result = fn(**bind_parameters(fn, params))
         output(result)
         validation = method in ("recipe_validate", "recipe_tea_validate")
         return 2 if validation and not result["valid"] else 0

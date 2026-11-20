@@ -134,6 +134,21 @@ class ParityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.structured_content["request"], short)
         self.assertEqual(self.machine.codes().count(4506), 1)
 
+    async def test_saved_reference_replays_across_rpc_and_mcp(self):
+        saved = self.store.create_recipe(DOCUMENT)
+        request = {"kind": "recipe", "reference": saved["id"]}
+        params = {
+            "request": {**request, "revision": None},
+            "idempotency_key": "saved",
+            "allow_control": True,
+        }
+        first = await call(self.socket, "operation_start", params)
+        await asyncio.wait_for(asyncio.shield(self.app.machine.task), 5)
+        result = await self.mcp("operation_start", {**params, "request": request})
+        self.assertEqual(result["id"], first["id"])
+        self.assertEqual(result["request"], params["request"])
+        self.assertEqual(self.machine.codes().count(4506), 1)
+
     async def test_machine_writes_route_through_the_same_owner(self):
         started = await call(
             self.socket,

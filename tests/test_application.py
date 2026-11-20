@@ -13,7 +13,9 @@ from unittest.mock import patch
 from tests.frames import reply, u32
 from tests.machine import Machine, until
 from xbloom_studio.application import MachineService, RecordingConnector
+from xbloom_studio.client import SessionError
 from xbloom_studio.control import BusyError
+from xbloom_studio.errors import error_detail
 from xbloom_studio.journal import Recorder
 from xbloom_studio.machine_api import same_attempt, same_request
 from xbloom_studio.storage import ConflictError, Store
@@ -115,8 +117,12 @@ class LifecycleTests(ServiceCase):
         await until(lambda: "session.disconnected" in self.kinds())
         gap = [e for e in self.store.events() if e["kind"] == "session.disconnected"]
         self.assertEqual(gap[0]["data"], {"capture_gap": True})
-        with self.assertRaisesRegex(RuntimeError, "fresh session"):
+        with self.assertRaisesRegex(SessionError, "fresh session") as raised:
             await self.service.start(WATER, "after-loss", True)
+        detail = error_detail(raised.exception)
+        self.assertEqual(detail["code"], "connection_unavailable")
+        self.assertIn("fresh session", detail["message"])
+        self.assertIn("disconnect/reconnect", detail["next_step"])
         self.assertIsNone(self.store.operation_by_key("after-loss"))
 
     async def test_information_reads_are_recorded(self):
@@ -164,6 +170,28 @@ class LifecycleTests(ServiceCase):
         self.assertNotIn(POUR, self.machine.codes())
         with self.assertRaises(BusyError):
             await self.service.stop(ident)
+
+    async def test_replay_returns_an_earlier_attempt_during_active_work(self):
+        self.service.options["write_timeout"] = 3
+        first = await self.service.start(WATER, "first", True)
+        self.assertEqual((await self.finish())["status"], "completed")
+        current = await self.service.start(
+            recipe({"kind": "user", "instruction": "Place cup"}), "current", True
+        )
+        await until(lambda: self.service.gate is not None)
+        async with self.service.guard:
+            self.assertEqual(
+                self.store.operation(current["id"])["status"], "waiting_for_user"
+            )
+        duplicate = await self.service.start(WATER, "first", True)
+        self.assertEqual(duplicate["id"], first["id"])
+        self.assertEqual(duplicate["status"], "completed")
+        with self.assertRaises(ConflictError):
+            await self.service.start({**WATER, "volume_ml": 70}, "first", True)
+        stopped = await self.service.stop(current["id"])
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertNotIn("stop_result", stopped["result"])
+        self.assertEqual(self.machine.codes().count(POUR), 1)
 
     async def test_busy_machine_never_queues_another_start(self):
         await self.service.start(recipe({"kind": "wait", "duration_s": 60}), "w", True)
@@ -345,7 +373,7 @@ class AdmissionTests(ServiceCase):
         explicit = {**WATER, "flow_ml_s": 3.0, "pattern": "center"}
         again = await self.service.start(explicit, "active", True)
         self.assertEqual(again["id"], first["id"])
-        with self.assertRaises(BusyError):
+        with self.assertRaises(ConflictError):
             await self.service.start({**WATER, "pattern": "ring"}, "active", True)
         self.machine.emit(40511)
         self.machine.state(1)
@@ -438,7 +466,7 @@ class AdmissionTests(ServiceCase):
         try:
             with self.assertRaisesRegex(ValueError, "machine address"):
                 await service.start(WATER, "none", True)
-            with self.assertRaisesRegex(RuntimeError, "connect first"):
+            with self.assertRaisesRegex(SessionError, "connect first"):
                 service._recorder  # noqa: B018
         finally:
             await service.close()
@@ -587,9 +615,13 @@ class UncertaintyTests(ServiceCase):
 
         original = self.service.session.stop
         self.service.session.stop = broken
-        with patch.object(
-            MachineService, "_run_step", side_effect=RuntimeError("boom")
-        ):
+        run_step = self.service._run_step
+
+        async def fail_after_launch(*args, **kwargs):
+            await run_step(*args, **kwargs)
+            raise RuntimeError("boom")
+
+        with patch.object(self.service, "_run_step", side_effect=fail_after_launch):
             await self.service.start(WATER, "boom", True)
             done = await self.finish()
         self.service.session.stop = original
@@ -747,6 +779,22 @@ class CallerLossAndRecoveryTests(ServiceCase):
             release.set()
             await successor.close()
             other.close()
+
+    async def test_closed_service_start_cannot_reacquire_ownership(self):
+        await self.service.connect()
+        await self.service.close()
+        with self.assertRaisesRegex(BusyError, "closed"):
+            await self.service.start(WATER, "closed", True)
+        with self.assertRaisesRegex(BusyError, "closed"):
+            await self.service.start_uploaded("token", "closed-upload", True)
+        self.assertFalse(self.service.lease.held)
+        self.assertFalse(self.service.owned)
+        rival = self.make(Machine("00:00:5E:00:53:02"))
+        try:
+            await rival.connect()
+            self.assertTrue(rival.owned)
+        finally:
+            await rival.close()
 
     async def test_one_owner_per_database_and_per_machine(self):
         await self.service.connect()

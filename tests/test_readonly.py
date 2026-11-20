@@ -1,8 +1,11 @@
 import asyncio
+import os
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
+import uuid
 from contextlib import aclosing
 from unittest import mock
 
@@ -875,6 +878,29 @@ class PlanTests(unittest.TestCase):
 
 
 class LeaseTests(unittest.TestCase):
+    def test_processes_with_distinct_tmpdirs_share_ownership(self):
+        code = (
+            "import sys; from xbloom_studio.ownership import AddressLease; "
+            "AddressLease(sys.argv[1]).acquire()"
+        )
+        with tempfile.TemporaryDirectory() as other_tmp:
+            for resource in ("machine", "application"):
+                with self.subTest(resource=resource):
+                    key = f"{resource}:{uuid.uuid4().hex}"
+                    lease = AddressLease(key)
+                    lease.acquire()
+                    try:
+                        outcome = subprocess.run(
+                            [sys.executable, "-c", code, key],
+                            env={**os.environ, "TMPDIR": other_tmp},
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertNotEqual(outcome.returncode, 0)
+                        self.assertIn("Another library process", outcome.stderr)
+                    finally:
+                        lease.release()
+
     def test_another_process_cannot_take_lease_and_release_is_reusable(self):
         lease = AddressLease("process-test")
         lease.acquire()

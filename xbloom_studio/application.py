@@ -23,10 +23,11 @@ from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
 
 from ._cleanup import wait_cleanup
+from .client import SessionError
 from .connector import Connector, normalize_identity
 from .control import BusyError, Interaction
 from .journal import JournalHooks, Recorder
-from .machine_api import MachineCommandAPI, encoded_step, same_attempt
+from .machine_api import MachineCommandAPI, encoded_step
 from .machine_controls import EncodedTeaRecipe
 from .ownership import AddressLease
 from .recipes import HistoryService, RecipeService, compile_recipe
@@ -152,7 +153,7 @@ class MachineService(MachineCommandAPI):
         self.history_service = HistoryService(store)
         self.interaction_factory = interaction_factory
         self.options = dict(interaction_options or {})
-        self.lease = AddressLease("application:" + str(store.path))
+        self.lease = AddressLease("application:" + str(store.path), resource="database")
         self.owned = False
         self.session: Interaction | None = None
         self.recorder: Recorder | None = None
@@ -175,13 +176,13 @@ class MachineService(MachineCommandAPI):
     @property
     def _session(self) -> Interaction:
         if self.session is None:
-            raise RuntimeError("No machine session; connect first")
+            raise SessionError("No machine session; connect first")
         return self.session
 
     @property
     def _recorder(self) -> Recorder:
         if self.recorder is None:
-            raise RuntimeError("No journal; connect first")
+            raise SessionError("No journal; connect first")
         return self.recorder
 
     def state(self) -> dict[str, Any]:
@@ -214,6 +215,7 @@ class MachineService(MachineCommandAPI):
 
     async def _own(self) -> None:
         """Hold the database's owner lease, then recover interrupted operations."""
+        self._require_open()
         if not self.owned:
             self.lease.acquire()
             try:
@@ -234,11 +236,10 @@ class MachineService(MachineCommandAPI):
         return BleakConnector(self.address)
 
     async def _connect(self, allow_untested: bool) -> None:
-        if self.closed or self.disconnecting:
-            raise RuntimeError("Machine service is closed or disconnecting")
+        self._require_open()
         if self.session:
             if not self.session.state.session_ready:
-                raise RuntimeError(
+                raise SessionError(
                     "Connection lost; explicitly disconnect and open a fresh session"
                 )
             if allow_untested and not self.session.allow_untested:
@@ -336,18 +337,16 @@ class MachineService(MachineCommandAPI):
         self._reject_queued_write()
         async with self.guard:
             # Replay lookup precedes resolution of mutable recipe names/revisions.
-            if self.task is not None and not self.task.done():
-                projection = self.projection or {}
-                if projection.get("idempotency_key") == idempotency_key and (
-                    same_attempt(projection.get("request"), request)
-                ):
-                    return deepcopy(projection)
-                raise BusyError("Machine already has an operation; nothing queued")
             await self._own()
             row = await asyncio.to_thread(self.store.operation_by_key, idempotency_key)
+            active = self.task is not None and not self.task.done()
             if row:
                 self._same_attempt(row, request)
+                if active and self.projection and row["id"] == self.projection["id"]:
+                    return deepcopy(self.projection)
                 return row
+            if active:
+                raise BusyError("Machine already has an operation; nothing queued")
             if self.prepared is not None:
                 raise BusyError(
                     "A recipe owns preparation; start, cancel or disconnect first"
@@ -399,6 +398,11 @@ class MachineService(MachineCommandAPI):
         status = "failed"
         result: dict[str, Any] | None = None
         unresolved = False
+        previous_operation = session.operation
+
+        def owned_step() -> Operation | None:
+            step = session.operation
+            return step if step is not previous_operation else None
 
         async def recording_failed(owner: asyncio.Task[Any]) -> None:
             await recorder.fault.wait()
@@ -475,10 +479,10 @@ class MachineService(MachineCommandAPI):
             else:
                 status = "completed"
         except asyncio.CancelledError:
-            low_op = session.operation
+            low_op = owned_step()
             active = low_op is not None and not low_op.done
-            stopped = await session.stop()
-            result = {"stop_result": stopped}
+            stopped = await session.stop() if low_op is not None else None
+            result = {"stop_result": stopped} if stopped is not None else {}
             confirmed = bool(
                 stopped
                 and stopped.get("stop_acknowledged")
@@ -492,8 +496,9 @@ class MachineService(MachineCommandAPI):
         except Exception as exc:
             result = {"error": str(exc), "type": type(exc).__name__}
             try:
-                stopped = await session.stop()
-                result["stop_result"] = stopped
+                stopped = await session.stop() if owned_step() is not None else None
+                if stopped is not None:
+                    result["stop_result"] = stopped
                 if session._uncertain or (
                     stopped and stopped.get("status") == "unknown"
                 ):

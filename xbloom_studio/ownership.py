@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import os
-import tempfile
+import stat
 from pathlib import Path
 from typing import TextIO
 
 
+class LeaseBusyError(ConnectionError):
+    """A cooperative lease is already held by another owner."""
+
+
 def lease_directory() -> Path:
-    return Path(tempfile.gettempdir()) / f"xbloom-{os.getuid()}"
+    # Launchers can give the same user different TMPDIRs.
+    return Path("/tmp") / f"xbloom-{os.getuid()}"
 
 
 class AddressLease:
@@ -20,8 +25,9 @@ class AddressLease:
     the same identity shares one lease. Requires POSIX ``fcntl``.
     """
 
-    def __init__(self, address: str) -> None:
+    def __init__(self, address: str, *, resource: str = "Bluetooth address") -> None:
         self.address = address
+        self.resource = resource
         self._file: TextIO | None = None
 
     @property
@@ -33,15 +39,30 @@ class AddressLease:
 
         directory = lease_directory()
         directory.mkdir(mode=0o700, exist_ok=True)
+        info = directory.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise PermissionError(
+                "Lease directory must be private and owned by this user"
+            )
         digest = hashlib.sha256(self.address.encode()).hexdigest()
-        handle = (directory / f"{digest}.lock").open("a+")
+        fd = os.open(
+            directory / f"{digest}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+        )
+        handle = os.fdopen(fd, "r+")
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            raise LeaseBusyError(
+                f"Another library process owns this {self.resource}"
+            ) from None
         except BaseException:
             handle.close()
-            raise ConnectionError(
-                "Another library process owns this Bluetooth address"
-            ) from None
+            raise
         self._file = handle
 
     def release(self) -> None:

@@ -110,7 +110,7 @@ replay it.
 For a daemon on another host, `xbloom --ssh <host-alias> ...` runs
 `xbloom relay` there over your existing SSH configuration with strict host-key
 checking. Pin the relay as a forced command for that key, for example
-`command="xbloom relay --socket /run/open-bloom/bloom.sock"`; it forwards only
+`restrict,command="xbloom relay --socket /run/open-bloom/bloom.sock"`; it forwards only
 a fixed method list, never backups. The MCP server needs the `mcp` extra and a
 running daemon:
 

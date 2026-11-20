@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from ._cleanup import wait_cleanup
 from .errors import error_detail
-from .rpc_types import RemoteError
+from .rpc_types import RemoteError, SocketDirectoryError
 from .rpc_wire import MAX_REQUEST, MAX_RESPONSE, frame
 from .rpc_wire import request as decode_request
 from .rpc_wire import response as decode_response
@@ -101,7 +101,7 @@ class LocalServer:
         self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         mode = self.path.parent.stat()
         if mode.st_uid != os.getuid() or stat.S_IMODE(mode.st_mode) & 0o077:
-            raise PermissionError(
+            raise SocketDirectoryError(
                 "Socket directory must be owned by this user and mode 0700"
             )
         occupied = self.path.exists() or self.path.is_symlink()

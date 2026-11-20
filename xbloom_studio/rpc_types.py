@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 
+class SocketDirectoryError(PermissionError):
+    """The daemon socket directory does not meet its owner-only requirements."""
+
+
 class RemoteError(RuntimeError):
     """A sanitized error envelope returned by the serving side."""
 

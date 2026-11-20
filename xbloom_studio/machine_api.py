@@ -193,6 +193,8 @@ def comparable_request(request: Any) -> Any:
             if "default" in rule:
                 result.setdefault(key, rule["default"])
         return result
+    if kind == "recipe" and "reference" in request and request.get("revision") is None:
+        return {key: value for key, value in request.items() if key != "revision"}
     if kind == "recipe" and isinstance(request.get("document"), dict):
         report = check_recipe(request["document"])
         if report["valid"]:
@@ -273,9 +275,12 @@ class MachineCommandAPI:
         if self.guard.locked():
             raise BusyError("Machine is handling another request; nothing queued")
 
-    def _require_unoccupied(self) -> None:
+    def _require_open(self) -> None:
         if self.closed or self.disconnecting:
-            raise RuntimeError("Machine service is closed or disconnecting")
+            raise BusyError("Machine service is closed or disconnecting")
+
+    def _require_unoccupied(self) -> None:
+        self._require_open()
         if self.task is not None and not self.task.done():
             raise BusyError("Machine already has an operation; nothing queued")
         if self.prepared is not None:

@@ -7,6 +7,7 @@ No guidance ever suggests automatically repeating a physical action.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -17,9 +18,10 @@ from .client import ProtocolCommandError, SessionError
 from .command_schema import CommandValidationError
 from .control import BusyError
 from .machine_controls import PresetWriteError, UntestedOperationError
+from .ownership import LeaseBusyError
 from .providers import ProviderError
 from .recipe_validation import RecipeValidationError
-from .rpc_types import RemoteError
+from .rpc_types import RemoteError, SocketDirectoryError
 from .storage import ConflictError
 
 CODES = frozenset(
@@ -139,6 +141,20 @@ def error_detail(exc: BaseException, *, log_unexpected: bool = True) -> dict[str
             "start.",
             {"protocol": exc.details},
         )
+    if isinstance(exc, LeaseBusyError):
+        return _detail(
+            name,
+            "busy",
+            str(exc),
+            "Use the existing owner or stop it cleanly before starting a new service.",
+        )
+    if isinstance(exc, SocketDirectoryError):
+        return _detail(
+            name,
+            "permission_required",
+            str(exc),
+            "Select a private socket directory owned by the daemon user (mode 0700).",
+        )
     if isinstance(exc, BusyError):
         return _detail(
             name,
@@ -212,7 +228,7 @@ def error_detail(exc: BaseException, *, log_unexpected: bool = True) -> dict[str
             "Start or check xbloom serve and its configured socket. Do not open a "
             "competing Bluetooth connection.",
         )
-    if isinstance(exc, (TimeoutError, ConnectionError)):
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
         return _detail(
             name,
             "connection_unavailable",

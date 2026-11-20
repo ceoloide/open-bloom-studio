@@ -40,6 +40,27 @@ def bundled_tea_references(family: str | None = None) -> dict[str, Any]:
     return recipe_tea_references(family)
 
 
+PURE_METHODS: dict[str, tuple[Callable[..., Any], bool]] = {
+    "recipe_validate": (check_recipe, True),
+    "recipe_constraints": (recipe_constraints, False),
+    "recipe_templates": (recipe_templates, True),
+    "recipe_examples": (bundled_examples, True),
+    "recipe_tea_references": (bundled_tea_references, True),
+    "recipe_tea_validate": (validate_tea_recipe, True),
+    "recipe_preview": (compile_recipe, True),
+}
+
+
+def bind_parameters(
+    fn: Callable[..., Any], params: dict[str, Any] | None
+) -> dict[str, Any]:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("Parameters must be an object")
+    arguments = params or {}
+    inspect.signature(fn).bind(**arguments)
+    return arguments
+
+
 class Application:
     """Recipes, history and one machine owner behind one method allowlist."""
 
@@ -72,12 +93,10 @@ class Application:
         machine_api = self.machine
         # (callable, run blocking I/O off-loop). No arbitrary method dispatch.
         self.methods: dict[str, tuple[Callable[..., Any], bool]] = {
+            **PURE_METHODS,
             "service_info": (self.service_info, False),
             "recipe_create": (store.create_recipe, True),
             "recipe_get": (store.get_recipe, True),
-            "recipe_validate": (check_recipe, True),
-            "recipe_constraints": (recipe_constraints, False),
-            "recipe_templates": (recipe_templates, True),
             "recipe_list": (store.recipes, True),
             "recipe_update": (store.update_recipe, True),
             "recipe_page": (store.recipe_page, True),
@@ -88,10 +107,6 @@ class Application:
             "recipe_import_export": (self.imports.import_export, True),
             "recipe_match": (self.recipes.match, True),
             "recipe_import": (self.imports.import_recipe, True),
-            "recipe_examples": (bundled_examples, True),
-            "recipe_tea_references": (bundled_tea_references, True),
-            "recipe_tea_validate": (validate_tea_recipe, True),
-            "recipe_preview": (compile_recipe, True),
             "recipe_import_get": (store.get_import, True),
             "recipe_refresh": (self.imports.refresh_recipe, True),
             "provider_search": (self.providers.search, True),
@@ -128,12 +143,8 @@ class Application:
     async def call(self, method: str, params: dict[str, Any] | None = None) -> Any:
         if not isinstance(method, str) or method not in self.methods:
             raise ValueError("Unknown application method")
-        if params is not None and not isinstance(params, dict):
-            raise ValueError("Parameters must be an object")
         fn, blocking = self.methods[method]
-        arguments = params or {}
-        # Reject unknown/missing arguments consistently across adapters.
-        inspect.signature(fn).bind(**arguments)
+        arguments = bind_parameters(fn, params)
         if blocking:
             return await asyncio.to_thread(fn, **arguments)
         result = fn(**arguments)

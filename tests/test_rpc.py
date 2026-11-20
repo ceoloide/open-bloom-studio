@@ -204,8 +204,11 @@ class LocalServerTests(ServerCase):
     async def test_unsafe_directories_and_existing_paths_are_refused(self):
         self.path.parent.mkdir(mode=0o755)
         os.chmod(self.path.parent, 0o755)
-        with self.assertRaises(PermissionError):
+        with self.assertRaises(PermissionError) as raised:
             await LocalServer(self.app, self.path).start()
+        detail = error_detail(raised.exception)
+        self.assertEqual(detail["code"], "permission_required")
+        self.assertIn("0700", detail["next_step"])
         os.chmod(self.path.parent, 0o700)
         self.path.write_text("not a socket")
         with self.assertRaises(FileExistsError):
