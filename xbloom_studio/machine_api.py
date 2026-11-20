@@ -107,9 +107,10 @@ def command_capabilities() -> dict[str, Any]:
         "contents, never machine readback.",
         "prepared_recipe": "Single native coffee/tea step; session-local single-use "
         "token, no automatic expiry or retry. For a plan that can be uploaded, "
-        "upload needs allow_untested unless the machine_prepare preview reports "
-        "upload_requires_untested=false; that upload then needs the preview's "
-        "expected_recipe_sha256. A direct operation_start keeps requires_untested.",
+        "follow the machine_prepare preview's upload_requires_untested. "
+        "If it is false and requires_untested is true, pass the preview's "
+        "recipe_sha256 as expected_recipe_sha256 when uploading without "
+        "allow_untested. A direct operation_start keeps requires_untested.",
         "native_stage_advance": False,
         "calibration_exposed": False,
         "grinder_upload": {

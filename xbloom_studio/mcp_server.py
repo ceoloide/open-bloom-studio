@@ -630,9 +630,10 @@ def _machine_tools(  # noqa: C901
     ) -> dict[str, Any]:
         """Upload exactly one native coffee/tea step without starting. Pins the
         compiled plan/hash. Request uses the machine_prepare format. Pass
-        allow_untested only when the preview's upload_requires_untested is true;
-        when it is false for an experimental plan, expected_recipe_sha256 from
-        that preview is required and checked before connecting. If a daemon
+        allow_untested when the preview's upload_requires_untested is true.
+        If upload_requires_untested is false and requires_untested is true, pass
+        the preview's recipe_sha256 as expected_recipe_sha256 when uploading
+        without allow_untested. The digest is checked before connecting. If a daemon
         omits the field, follow requires_untested. A session-local
         single-use token reserves the owner until start/cancel/disconnect; no
         automatic expiry. Physical controls may invalidate it. Does not prove
