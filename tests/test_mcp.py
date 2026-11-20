@@ -60,6 +60,10 @@ class ContractTests(ToolCase):
         self.assertIn("set_brightness", command["properties"]["command"]["enum"])
         self.assertNotIn("start_water", command["properties"]["command"]["enum"])
         self.assertIn("oneOf", command)
+        description = tools["machine_command"].description
+        self.assertIn("allow_control=True", description)
+        self.assertIn("check machine_capabilities", description)
+        self.assertIn("commands also require allow_untested", description)
         start = tools["operation_start"]
         self.assertTrue(start.annotations.destructive_hint)
         self.assertTrue(start.annotations.idempotent_hint)

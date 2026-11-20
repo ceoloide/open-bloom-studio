@@ -4,7 +4,8 @@
   "gates": {
     "handshake": "Sent by every session after subscribing.",
     "control": "Requires allow_control=True.",
-    "untested": "Requires allow_control=True and allow_untested=True."
+    "untested": "Requires allow_control=True and allow_untested=True.",
+    "parameter": "An empty query requires allow_control=True. Initialization with a value also requires allow_untested=True."
   },
   "commands": [
     {
@@ -373,7 +374,7 @@
       "hex": "0x2cf2",
       "direction": "outgoing",
       "function": 2,
-      "gate": "untested",
+      "gate": "parameter",
       "summary": "Read the pour radius with an empty payload or initialize it with a value."
     },
     {
@@ -391,7 +392,7 @@
       "hex": "0x2cf4",
       "direction": "outgoing",
       "function": 2,
-      "gate": "untested",
+      "gate": "parameter",
       "summary": "Read the vibration strength with an empty payload or initialize it with a value."
     },
     {
@@ -400,7 +401,7 @@
       "hex": "0x2cf5",
       "direction": "outgoing",
       "function": 2,
-      "gate": "untested",
+      "gate": "control",
       "summary": "Set the vibration strength."
     },
     {

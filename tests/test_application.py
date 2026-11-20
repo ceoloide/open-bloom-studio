@@ -930,6 +930,30 @@ class UploadTests(ServiceCase):
 
 
 class CommandTests(ServiceCase):
+    async def test_parameter_queries_require_control_without_experimental_opt_in(self):
+        commands = self.service.capabilities()["commands"]
+        for name, expected in (("read_pour_radius", 700), ("read_vibration", 1300)):
+            with self.subTest(name=name):
+                self.assertTrue(commands[name]["requires_allow_control"])
+                self.assertFalse(commands[name]["requires_allow_untested"])
+                with self.assertRaisesRegex(ValueError, "allow_control"):
+                    await self.service.command(name)
+                result = await self.service.command(name, allow_control=True)
+                self.assertTrue(result["readback_verified"])
+                self.assertEqual(result["value"], expected)
+
+    async def test_vibration_level_requires_control_without_experimental_opt_in(self):
+        command = self.service.capabilities()["commands"]["set_vibration_level"]
+        self.assertTrue(command["requires_allow_control"])
+        self.assertFalse(command["requires_allow_untested"])
+        with self.assertRaisesRegex(ValueError, "allow_control"):
+            await self.service.command("set_vibration_level", {"level": 1})
+        result = await self.service.command(
+            "set_vibration_level", {"level": 1}, allow_control=True
+        )
+        self.assertTrue(result["acknowledged"])
+        self.assertEqual(self.machine.payloads(11509), [u32(1100)])
+
     async def test_command_journals_request_then_intent_then_result(self):
         result = await self.service.command("set_brightness", {"level": 5}, True)
         self.assertTrue(result["acknowledged"])

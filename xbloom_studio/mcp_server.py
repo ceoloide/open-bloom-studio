@@ -602,13 +602,14 @@ def _machine_tools(  # noqa: C901
         allow_control: bool = False,
         allow_untested: bool = False,
     ) -> dict[str, Any]:
-        """Run one named settings/scale command through the daemon owner; inspect
-        machine_capabilities first. Excludes calibration and operation starters.
-        Rejects active/prepared recipes, does not queue. Presets use
+        """Run one named settings/scale command through the daemon owner.
+        Pass allow_control=True and check machine_capabilities for which
+        commands also require allow_untested. Excludes calibration and operation
+        starters. Rejects active/prepared recipes, does not queue. Presets use
         {slot,payload_hex,flags} objects and caller-supplied backup objects; the
         service chooses private backup paths. A backup is not readback.
-        Experimental opt-in remains required. Read-radius/vibration helpers also
-        prepare/home the machine. Scale enter/tare/exit retains the connection.
+        Radius and vibration queries prepare the machine and return it home.
+        Scale enter/tare/exit retains the connection.
         ACK confirms receipt, not physical effect or persistence.
         """
         return await invoke(

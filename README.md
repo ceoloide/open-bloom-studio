@@ -65,6 +65,10 @@ start whose delivery stays unconfirmed is recorded as `unknown`.
 Controls require `--allow-control` (`allow_control=True` in Python); commands
 that are not hardware-tested additionally require `--allow-untested`.
 Read-only sessions never change settings.
+The pour radius and vibration queries and the vibration level setter require
+`--allow-control` because they prepare the machine and return it home.
+Initializing either parameter or changing pour radius also requires
+`--allow-untested`.
 
 `xbloom-studio serve` keeps one owner of the machine and the database behind a
 private Unix socket; other `xbloom-studio` commands and `xbloom-studio-mcp`

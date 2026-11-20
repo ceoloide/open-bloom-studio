@@ -203,13 +203,10 @@ class MachineControls:
         "write_preset",
         "write_presets",
         "set_water_source",
-        "read_pour_radius",
-        "read_vibration",
         "initialize_pour_radius",
         "set_pour_radius",
         "set_pour_radius_level",
         "initialize_vibration",
-        "set_vibration_level",
         "set_cup_limits",
         "start_tea",
         "set_preset_count",
@@ -591,7 +588,7 @@ class MachineControls:
         return await self._read_parameter(11508)
 
     async def _read_parameter(self, code: int) -> dict[str, Any]:
-        result = await self._setting(code, function=2, untested=True)
+        result = await self._setting(code, function=2)
         payload = bytes.fromhex(result["response_payload_hex"])
         if len(payload) != 4:
             self._uncertain = True
@@ -635,7 +632,7 @@ class MachineControls:
     async def set_vibration_level(self, level: int) -> dict[str, Any]:
         _uint("vibration level", level, 5)
         return await self._setting(
-            11509, struct.pack("<I", 1000 + level * 100), function=2, untested=True
+            11509, struct.pack("<I", 1000 + level * 100), function=2
         )
 
     async def set_cup_limits(self, minimum: float, maximum: float) -> dict[str, Any]:

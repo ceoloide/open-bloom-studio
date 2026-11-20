@@ -75,12 +75,11 @@ class CatalogTests(unittest.TestCase):
                 11512,
                 40525,
                 40526,
-                11506,
                 11507,
-                11508,
-                11509,
             },
         )
+        parameter = {c for c, e in self.outgoing().items() if e["gate"] == "parameter"}
+        self.assertEqual(parameter, {11506, 11508})
 
     def test_every_decoded_incoming_code_is_named(self):
         incoming = {e["code"] for e in self.entries if e["direction"] == "incoming"}
