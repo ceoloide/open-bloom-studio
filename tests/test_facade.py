@@ -115,9 +115,9 @@ class ParityTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(tool_result, daemon)
 
-    async def test_mcp_defaults_make_a_different_request_for_the_same_key(self):
+    async def test_mcp_defaults_replay_the_same_attempt_across_adapters(self):
         short = {"kind": "water", "volume_ml": 50, "temperature_c": 20}
-        await call(
+        started = await call(
             self.socket,
             "operation_start",
             {"request": short, "idempotency_key": "short", "allow_control": True},
@@ -128,8 +128,10 @@ class ParityTests(unittest.IsolatedAsyncioTestCase):
             "operation_start",
             {"request": short, "idempotency_key": "short", "allow_control": True},
         )
-        self.assertTrue(result.is_error)
-        self.assertEqual(result.structured_content["error"]["code"], "conflict")
+        self.assertFalse(result.is_error, result.structured_content)
+        self.assertEqual(result.structured_content["id"], started["id"])
+        # The stored request is the one first accepted; nothing was rewritten.
+        self.assertEqual(result.structured_content["request"], short)
         self.assertEqual(self.machine.codes().count(4506), 1)
 
     async def test_machine_writes_route_through_the_same_owner(self):

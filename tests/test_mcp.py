@@ -13,6 +13,7 @@ from xbloom_studio import mcp_server
 from xbloom_studio.facade import Application
 from xbloom_studio.mcp_contracts import compact_state
 from xbloom_studio.mcp_server import create_server
+from xbloom_studio.recipe_validation import HOST_STEPS
 from xbloom_studio.storage import Store
 
 FAST = {"settle": 0, "subscription_settle": 0, "transition_delay": 0}
@@ -142,6 +143,79 @@ class ContractTests(ToolCase):
             },
         )
         self.assertTrue(value["acknowledged"])
+
+    async def test_request_contract_follows_the_shared_step_rules(self):
+        tools = {tool.name: tool for tool in await self.server.list_tools()}
+        schema = tools["operation_start"].input_schema["$defs"]
+        for kind, model in (("water", "WaterRequest"), ("grind", "GrindRequest")):
+            properties = schema[model]["properties"]
+            required = set(schema[model]["required"])
+            for name, rule in HOST_STEPS[kind].items():
+                with self.subTest(kind=kind, field=name):
+                    self.assertEqual(name in required, bool(rule.get("required")))
+                    if "default" in rule:
+                        self.assertEqual(properties[name]["default"], rule["default"])
+                    if "minimum" in rule:
+                        values = properties[name].get("anyOf", [properties[name]])[0]
+                        self.assertEqual(values["minimum"], rule["minimum"])
+                        self.assertEqual(values["maximum"], rule["maximum"])
+        accepted = [
+            {"kind": "grind", "size": 20.0, "rpm": 80.0, "duration_s": 2},
+            {**WATER, "timeout": 60},
+            {**WATER, "volume_ml": 1000, "flow_ml_s": 0.1, "timeout": 3600},
+        ]
+        for request in accepted:
+            with self.subTest(request=request):
+                error, value = await self.tool("machine_prepare", {"request": request})
+                self.assertFalse(error, value)
+                self.assertEqual(self.calls[-1][1]["request"]["kind"], request["kind"])
+        self.assertEqual(self.calls[0][1]["request"]["size"], 20.0)
+        self.calls.clear()
+        rejected = [
+            ({"kind": "water", "volume_ml": 50}, "/request/water/temperature_c"),
+            ({**WATER, "volume_ml": 1000, "flow_ml_s": 0.1}, "/request/water"),
+            ({**WATER, "timeout": 0}, "/request/water/timeout"),
+            (
+                {"kind": "grind", "size": 20.5, "rpm": 80, "duration_s": 2},
+                "/request/grind/size",
+            ),
+            (
+                {"kind": "grind", "size": True, "rpm": 80, "duration_s": 2},
+                "/request/grind/size",
+            ),
+        ]
+        for request, path in rejected:
+            with self.subTest(request=request):
+                error, value = await self.tool("machine_prepare", {"request": request})
+                self.assertTrue(error)
+                self.assertEqual(value["error"]["code"], "invalid_argument")
+                paths = [e["path"] for e in value["error"]["details"]["errors"]]
+                self.assertIn(path, paths)
+                # The application refuses the same request with the same rules.
+                with self.assertRaises(ValueError):
+                    self.app.machine.prepare(request)
+        self.assertEqual(self.calls, [])
+
+    async def test_mcp_defaults_replay_the_attempt_from_other_adapters(self):
+        error, started = await self.tool(
+            "operation_start",
+            {"request": WATER, "idempotency_key": "cross", "allow_control": True},
+        )
+        self.assertFalse(error, started)
+        sent = self.calls[-1][1]["request"]
+        self.assertEqual(sent, {**WATER, "flow_ml_s": 3, "pattern": "center"})
+        await self.app.machine.task
+        direct = await self.app.call(
+            "operation_start",
+            {"request": WATER, "idempotency_key": "cross", "allow_control": True},
+        )
+        self.assertEqual(direct["id"], started["id"])
+        error, again = await self.tool(
+            "operation_start",
+            {"request": WATER, "idempotency_key": "cross", "allow_control": True},
+        )
+        self.assertEqual(again["id"], started["id"])
+        self.assertEqual(self.machine.codes().count(4506), 1)
 
     async def test_output_contract_failures_keep_the_operation_identity(self):
         async def odd(method, params):

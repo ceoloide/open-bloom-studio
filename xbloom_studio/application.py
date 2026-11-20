@@ -26,7 +26,7 @@ from ._cleanup import wait_cleanup
 from .connector import Connector, normalize_identity
 from .control import BusyError, Interaction
 from .journal import JournalHooks, Recorder
-from .machine_api import MachineCommandAPI, encoded_step, same_request
+from .machine_api import MachineCommandAPI, encoded_step, same_attempt
 from .machine_controls import EncodedTeaRecipe
 from .ownership import AddressLease
 from .recipes import HistoryService, RecipeService, compile_recipe
@@ -40,6 +40,21 @@ if TYPE_CHECKING:
 __all__ = ["HistoryService", "MachineService", "RecordingConnector"]
 
 InteractionFactory = Callable[..., Interaction]
+UNRESOLVED = (
+    "A command's delivery or effect is unresolved; inspect the machine and do "
+    "not retry automatically"
+)
+
+
+async def _join(task: asyncio.Task[None]) -> None:
+    """Wait for the worker without cancelling it, then surface its error.
+
+    A worker cancelled during finalization still recorded its outcome; that
+    cancellation was its own, not the joining caller's.
+    """
+    await asyncio.wait({task})
+    if not task.cancelled():
+        task.result()
 
 
 class RecordingConnector:
@@ -151,6 +166,8 @@ class MachineService(MachineCommandAPI):
         self.disconnecting = False
         self._disconnect_task: asyncio.Task[dict[str, Any]] | None = None
         self.stopping = False
+        # The worker is recording its terminal outcome: join it, never cancel.
+        self.finalizing = False
         self.worker_started: asyncio.Event | None = None
         self.prepared: dict[str, Any] | None = None
         self._prepared_plan: dict[str, Any] | None = None
@@ -200,7 +217,12 @@ class MachineService(MachineCommandAPI):
         if not self.owned:
             self.lease.acquire()
             try:
-                await asyncio.to_thread(self.store.recover)
+                # The worker thread cannot be cancelled: release the lease only
+                # after it ends, or a successor's new active rows could be
+                # marked unknown by this owner's late recovery.
+                await wait_cleanup(
+                    asyncio.ensure_future(asyncio.to_thread(self.store.recover))
+                )
             except BaseException:
                 self.lease.release()
                 raise
@@ -317,7 +339,7 @@ class MachineService(MachineCommandAPI):
             if self.task is not None and not self.task.done():
                 projection = self.projection or {}
                 if projection.get("idempotency_key") == idempotency_key and (
-                    same_request(projection.get("request"), request)
+                    same_attempt(projection.get("request"), request)
                 ):
                     return deepcopy(projection)
                 raise BusyError("Machine already has an operation; nothing queued")
@@ -376,6 +398,7 @@ class MachineService(MachineCommandAPI):
         results: list[dict[str, Any]] = []
         status = "failed"
         result: dict[str, Any] | None = None
+        unresolved = False
 
         async def recording_failed(owner: asyncio.Task[Any]) -> None:
             await recorder.fault.wait()
@@ -423,6 +446,7 @@ class MachineService(MachineCommandAPI):
                         await session.exit_scale()
                     value = {"status": "completed"}
                 else:
+                    deliveries = session._unconfirmed_deliveries
                     low = await self._run_step(step, prepared_token)
                     prepared_token = None
                     while not low.done:
@@ -431,6 +455,7 @@ class MachineService(MachineCommandAPI):
                             raise RuntimeError("Recording failed; stopped operation")
                         await asyncio.sleep(0.02)
                     value = await low.wait()
+                    unresolved = session._unconfirmed_deliveries != deliveries
                 results.append(value)
                 recorder.emit("step.finished", {"index": index, "result": value})
                 if (
@@ -440,6 +465,12 @@ class MachineService(MachineCommandAPI):
                     status = (
                         value["status"] if value["status"] != "completed" else "failed"
                     )
+                    # A definite refusal or error stays failed. A command that
+                    # may have reached the machine unconfirmed leaves its
+                    # effect unresolved; the step keeps its own evidence.
+                    if status != "unknown" and unresolved:
+                        status = "unknown"
+                        result = {"reason": UNRESOLVED}
                     break
             else:
                 status = "completed"
@@ -470,14 +501,34 @@ class MachineService(MachineCommandAPI):
             except Exception:
                 status = "unknown"
         finally:
+            # From here stop and disconnect join the worker instead of
+            # cancelling it, and any other cancellation waits for the
+            # terminal row and journal cleanup before it is re-raised.
+            self.finalizing = True
             if prepared_token is not None:
                 session._invalidate_preparation("prepared_start_not_sent")
                 session._uncertain = True
             watcher.cancel()
-            await asyncio.gather(watcher, return_exceptions=True)
             self.gate = None
             self.gate_event = None
             result = {**(result or {}), "steps": results, "state": session.get_state()}
+            await wait_cleanup(
+                asyncio.ensure_future(
+                    self._finalize(ident, status, result, recorder, watcher)
+                )
+            )
+
+    async def _finalize(
+        self,
+        ident: str,
+        status: str,
+        result: dict[str, Any],
+        recorder: Recorder,
+        watcher: asyncio.Task[None],
+    ) -> None:
+        """Journal and persist one terminal outcome; runs to completion."""
+        try:
+            await asyncio.gather(watcher, return_exceptions=True)
             recorder.emit("operation.finished", {"status": status, "result": result})
             try:
                 await recorder.flush()
@@ -485,6 +536,7 @@ class MachineService(MachineCommandAPI):
                 status = "unknown"
                 result["recording_error"] = str(exc)
             await self._transition(ident, status, result)
+        finally:
             recorder.operation_id = None
 
     async def _transition(
@@ -518,16 +570,20 @@ class MachineService(MachineCommandAPI):
             event.set()
             return {"acknowledged": True}
 
+    def _cancel_worker(self, task: asyncio.Task[None]) -> None:
+        """Request a stop once; a worker recording its outcome is only joined."""
+        if not self.stopping and not self.finalizing:
+            self.stopping = True
+            task.cancel()
+
     async def stop(self, operation_id: str) -> dict[str, Any]:
         async with self.guard:
             task = self._active(operation_id)
             self.gate = None
-            if not self.stopping:
-                self.stopping = True
-                assert self.worker_started is not None
-                await self.worker_started.wait()
-                task.cancel()
-        await asyncio.shield(task)
+            assert self.worker_started is not None
+            await self.worker_started.wait()
+            self._cancel_worker(task)
+        await _join(task)
         return await asyncio.to_thread(self.store.operation, operation_id)
 
     async def pause_resume(
@@ -557,14 +613,13 @@ class MachineService(MachineCommandAPI):
                 self.prepared = None
                 self._prepared_plan = None
                 task = self.task
-                if task is not None and not task.done() and not self.stopping:
-                    self.stopping = True
+                if task is not None and not task.done():
                     self.gate = None
                     assert self.worker_started is not None
                     await self.worker_started.wait()
-                    task.cancel()
+                    self._cancel_worker(task)
             if task is not None:
-                await asyncio.shield(task)
+                await _join(task)
         finally:
             try:
                 if self.session is not None:

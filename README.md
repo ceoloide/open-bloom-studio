@@ -100,9 +100,12 @@ xbloom water --volume-ml 100 --key second --allow-control --wait
 ```
 
 Every start needs an idempotency key. Reusing a key returns the recorded
-attempt and never starts the machine again; after any uncertainty, inspect
-`xbloom operation lookup <key>` instead of starting with a new key. A daemon
-that restarts marks interrupted work `unknown` and does not replay it.
+attempt and never starts the machine again, whichever adapter sends it and
+whether declared defaults are omitted or spelled out; after any uncertainty,
+inspect `xbloom operation lookup <key>` instead of starting with a new key. A
+start whose command delivery stays unconfirmed is recorded `unknown`, not
+`failed`. A daemon that restarts marks interrupted work `unknown` and does not
+replay it.
 
 For a daemon on another host, `xbloom --ssh <host-alias> ...` runs
 `xbloom relay` there over your existing SSH configuration with strict host-key

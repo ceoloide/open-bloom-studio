@@ -26,6 +26,7 @@ from .machine_controls import (
     PresetWriteError,
     SavedPreset,
 )
+from .recipe_validation import HOST_STEPS, check_recipe
 from .storage import ConflictError
 
 if TYPE_CHECKING:
@@ -173,6 +174,37 @@ def same_request(first: Any, second: Any) -> bool:
     return type(first) is type(second) and bool(first == second)
 
 
+def comparable_request(request: Any) -> Any:
+    """The comparison form of a start request; never stored, hashed or resolved.
+
+    Adapters may omit a declared default or spell it out (the MCP contract
+    adds them), so both forms are filled in before comparison: a bounded
+    step's defaults and name, and an inline document's validator
+    normalization. A recipe reference is compared as given, never resolved
+    against the mutable library. Anything else, including a legacy request
+    the current rules no longer accept, compares exactly as recorded.
+    """
+    if not isinstance(request, dict):
+        return request
+    kind = request.get("kind")
+    if kind in ("water", "grind"):
+        result = {"name": kind, **request}
+        for key, rule in HOST_STEPS[kind].items():
+            if "default" in rule:
+                result.setdefault(key, rule["default"])
+        return result
+    if kind == "recipe" and isinstance(request.get("document"), dict):
+        report = check_recipe(request["document"])
+        if report["valid"]:
+            return {**request, "document": report["normalized"]}
+    return request
+
+
+def same_attempt(recorded: Any, request: Any) -> bool:
+    """Whether ``request`` replays the attempt recorded as ``recorded``."""
+    return same_request(comparable_request(recorded), comparable_request(request))
+
+
 def encoded_step(step: dict[str, Any]) -> EncodedRecipe | EncodedTeaRecipe:
     """Rebuild the retained machine content of one native coffee or tea step."""
     limits = step.get("cup_limits")
@@ -200,6 +232,7 @@ class MachineCommandAPI:
     closed: bool
     disconnecting: bool
     stopping: bool
+    finalizing: bool
     task: asyncio.Task[None] | None
     operation_id: str | None
     projection: dict[str, Any] | None
@@ -422,8 +455,12 @@ class MachineCommandAPI:
             return result
 
     def _same_attempt(self, row: dict[str, Any], request: Any) -> None:
-        """A replayed key must name the identical request on this machine."""
-        if not same_request(row["request"], request) or not self._owns_device(
+        """A replayed key must name the same request on this machine.
+
+        Equivalent omitted and explicit defaults are one request; the stored
+        request and its fingerprint stay exactly as first accepted.
+        """
+        if not same_attempt(row["request"], request) or not self._owns_device(
             row["device"]
         ):
             raise ConflictError("Idempotency key belongs to another request")
@@ -474,6 +511,7 @@ class MachineCommandAPI:
                 self.prepared = None
                 self._prepared_plan = None
             self.stopping = False
+            self.finalizing = False
             self.operation_id = op["id"]
             self.projection = deepcopy(op)
             self._recorder.operation_id = op["id"]

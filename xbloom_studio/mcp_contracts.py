@@ -17,6 +17,7 @@ from typing import Annotated, Any, Literal, Union, cast, get_type_hints
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 from .pagination import MAX_CURSOR_LENGTH
+from .recipe_validation import HOST_STEPS, check_recipe
 
 Model = type[BaseModel]
 
@@ -91,48 +92,93 @@ class RepeatRequest(Input):
     )
 
 
-class WaterRequest(Input):
-    kind: Literal["water"] = Field(description="One bounded manual water operation.")
-    volume_ml: float = Field(
-        ge=1, le=1000, description="Requested water dose in ml; not measured cup yield."
-    )
-    temperature_c: float = Field(
-        20,
-        ge=20,
-        le=99,
-        description="Requested Celsius target; 20 is not a measured room-temperature "
-        "guarantee.",
-    )
-    flow_ml_s: float = Field(3, ge=0.1, le=10, description="Requested flow in ml/s.")
-    pattern: Literal["center", "ring", "spiral"] = Field(
-        "center", description="Manual water pour pattern."
-    )
-    name: str | None = Field(
-        None, min_length=1, description="Optional name for this temporary operation."
+STEP_DESCRIPTIONS = {
+    "water": {
+        "kind": "One bounded manual water operation.",
+        "volume_ml": "Requested water dose in ml; not measured cup yield.",
+        "temperature_c": "Requested Celsius target; 20 is not a measured "
+        "room-temperature guarantee.",
+        "flow_ml_s": "Requested flow in ml/s.",
+        "pattern": "Manual water pour pattern.",
+        "timeout": "Optional operation deadline in seconds; required when "
+        "volume_ml/flow_ml_s+45 exceeds the operation limit.",
+    },
+    "grind": {
+        "kind": "One bounded manual grinder pulse.",
+        "size": "Known grinder setting, whole number 1..80; do not infer an "
+        "espresso profile.",
+        "rpm": "Configured grinder RPM, whole number 60..120.",
+        "duration_s": "Bounded grinder pulse duration in seconds.",
+    },
+}
+
+
+class HostStepRequest(Input):
+    """A bounded step checked by the shared recipe rules, never a copy of them."""
+
+    @model_validator(mode="after")
+    def shared_rules(self) -> HostStepRequest:
+        step = self.model_dump(exclude_none=True)
+        step.pop("name", None)
+        report = check_recipe({"name": "request", "steps": [step]})
+        if not report["valid"]:
+            raise ValueError(
+                "; ".join(
+                    (e["path"].removeprefix("/steps/0") or "/") + ": " + e["message"]
+                    for e in report["errors"]
+                )
+            )
+        return self
+
+
+def _step_field(rule: dict[str, Any], description: str) -> tuple[Any, Any]:
+    """One host step rule as a strict field with the same bounds and default."""
+    options: dict[str, Any] = {}
+    typ: Any
+    if "enum" in rule:
+        typ = Literal[tuple(rule["enum"])]
+    else:
+        # A number field accepts integers; whole numbers also accept 20.0.
+        typ = float
+        options.update(ge=rule["minimum"], le=rule["maximum"])
+        if rule.get("whole_number"):
+            options["multiple_of"] = 1
+    if rule.get("required"):
+        default = ...
+    elif "default" in rule:
+        default = rule["default"]
+    else:
+        typ, default = optional(typ), None
+    return typ, Field(default, description=description, **options)
+
+
+def _step_request(kind: str) -> Any:
+    descriptions = STEP_DESCRIPTIONS[kind]
+    fields: dict[str, Any] = {
+        "kind": (Literal[kind], Field(description=descriptions["kind"])),
+        **{
+            name: _step_field(rule, descriptions[name])
+            for name, rule in HOST_STEPS[kind].items()
+        },
+        "name": (
+            optional(str),
+            Field(
+                None,
+                min_length=1,
+                description="Optional name for this temporary operation.",
+            ),
+        ),
+    }
+    return create_model(
+        kind.capitalize() + "Request", __base__=HostStepRequest, **fields
     )
 
 
-class GrindRequest(Input):
-    kind: Literal["grind"] = Field(description="One bounded manual grinder pulse.")
-    size: int = Field(
-        ge=1,
-        le=80,
-        description="Known grinder setting, integer 1..80; do not infer an espresso "
-        "profile.",
-    )
-    rpm: int = Field(
-        ge=60, le=120, description="Configured grinder RPM, integer 60..120."
-    )
-    duration_s: float = Field(
-        ge=0.1, le=120, description="Bounded grinder pulse duration in seconds."
-    )
-    name: str | None = Field(
-        None, min_length=1, description="Optional name for this temporary operation."
-    )
+WaterRequest = _step_request("water")
+GrindRequest = _step_request("grind")
 
-
-Request = Annotated[
-    Union[RecipeRequest, RepeatRequest, WaterRequest, GrindRequest],  # noqa: UP007
+Request: Any = Annotated[
+    one_of(RecipeRequest, RepeatRequest, WaterRequest, GrindRequest),
     Field(discriminator="kind"),
 ]
 

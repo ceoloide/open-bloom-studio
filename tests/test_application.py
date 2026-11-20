@@ -5,16 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.frames import reply
+from tests.frames import reply, u32
 from tests.machine import Machine, until
 from xbloom_studio.application import MachineService, RecordingConnector
 from xbloom_studio.control import BusyError
 from xbloom_studio.journal import Recorder
-from xbloom_studio.machine_api import same_request
+from xbloom_studio.machine_api import same_attempt, same_request
 from xbloom_studio.storage import ConflictError, Store
 
 FAST = {
@@ -297,6 +298,9 @@ class AdmissionTests(ServiceCase):
         ):
             with self.subTest(first=first):
                 self.assertFalse(same_request(first, second))
+                self.assertFalse(same_attempt(first, second))
+        self.assertTrue(same_attempt([1], [1.0]))
+        self.assertFalse(same_attempt(WATER, [WATER]))
 
     async def test_replay_with_numeric_spelling_returns_the_attempt(self):
         first = await self.service.start(WATER, "spelling", True)
@@ -306,6 +310,94 @@ class AdmissionTests(ServiceCase):
         )
         self.assertEqual(again["id"], first["id"])
         self.assertEqual(self.machine.codes().count(POUR), 1)
+
+    async def test_replay_with_omitted_or_explicit_defaults_returns_the_attempt(self):
+        explicit = {**WATER, "flow_ml_s": 3, "pattern": "center", "name": "water"}
+        first = await self.service.start(WATER, "defaults", True)
+        await self.finish()
+        again = await self.service.start(explicit, "defaults", True)
+        self.assertEqual(again["id"], first["id"])
+        # Stored data and its fingerprint stay exactly as first accepted.
+        self.assertEqual(self.store.operation(first["id"])["request"], WATER)
+        second = await self.service.start(explicit, "explicit-first", True)
+        await self.finish()
+        again = await self.service.start(WATER, "explicit-first", True)
+        self.assertEqual(again["id"], second["id"])
+        self.assertEqual(self.store.operation(second["id"])["request"], explicit)
+        self.assertEqual(self.machine.codes().count(POUR), 2)
+        for changed in (
+            {**WATER, "flow_ml_s": 4},
+            {**WATER, "pattern": "ring"},
+            {**WATER, "flow_ml_s": True},
+            {**WATER, "name": "other"},
+            {**WATER, "timeout": 61.0},
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ConflictError):
+                await self.service.start(changed, "defaults", True)
+        self.assertEqual(self.machine.codes().count(POUR), 2)
+
+    async def test_replay_of_the_active_attempt_accepts_explicit_defaults(self):
+        self.machine.studio.auto_complete = False
+        first = await self.service.start(WATER, "active", True)
+        await until(lambda: POUR in self.machine.codes(), 2)
+        explicit = {**WATER, "flow_ml_s": 3.0, "pattern": "center"}
+        again = await self.service.start(explicit, "active", True)
+        self.assertEqual(again["id"], first["id"])
+        with self.assertRaises(BusyError):
+            await self.service.start({**WATER, "pattern": "ring"}, "active", True)
+        self.machine.emit(40511)
+        self.machine.state(1)
+        self.assertEqual((await self.finish())["status"], "completed")
+        self.assertEqual(self.machine.codes().count(POUR), 1)
+
+    async def test_inline_document_defaults_name_one_attempt(self):
+        omitted = recipe(WATER)
+        explicit = {
+            "kind": "recipe",
+            "document": {
+                "schema_version": 1,
+                "mode": "host",
+                "name": "Steps",
+                "steps": [{**WATER, "flow_ml_s": 3.0, "pattern": "center"}],
+            },
+        }
+        first = await self.service.start(omitted, "inline", True)
+        await self.finish()
+        self.assertEqual(
+            (await self.service.start(explicit, "inline", True))["id"], first["id"]
+        )
+        with self.assertRaises(ConflictError):
+            await self.service.start(recipe({**WATER, "flow_ml_s": 4}), "inline", True)
+        # A mutable reference is never resolved to compare it.
+        saved = self.store.create_recipe(omitted["document"])
+        by_name = {"kind": "recipe", "reference": "Steps"}
+        await self.service.start(by_name, "reference", True)
+        await self.finish()
+        for other in (
+            {"kind": "recipe", "reference": saved["id"]},
+            {**by_name, "revision": 1},
+        ):
+            with self.subTest(other=other), self.assertRaises(ConflictError):
+                await self.service.start(other, "reference", True)
+        self.assertEqual(self.machine.codes().count(POUR), 2)
+
+    async def test_legacy_persisted_requests_are_still_replayed(self):
+        plan = self.service.prepare(WATER)
+        mcp_style = {**WATER, "flow_ml_s": 3, "pattern": "center"}
+        legacy, _ = self.store.create_operation(
+            "00:00:5E:00:53:01", mcp_style, plan, "legacy"
+        )
+        self.store.finish(legacy["id"], "completed", {})
+        self.assertEqual(
+            (await self.service.start(WATER, "legacy", True))["id"], legacy["id"]
+        )
+        odd = {"kind": "recipe", "document": {"name": "Old", "steps": "retired"}}
+        old, _ = self.store.create_operation("00:00:5E:00:53:01", odd, plan, "odd")
+        self.store.finish(old["id"], "completed", {})
+        self.assertEqual((await self.service.start(odd, "odd", True))["id"], old["id"])
+        with self.assertRaises(ConflictError):
+            await self.service.start(recipe(WATER), "odd", True)
+        self.assertNotIn(POUR, self.machine.codes())
 
     def test_construction_validates_identity_and_options(self):
         with self.assertRaises(ValueError):
@@ -341,16 +433,48 @@ class UncertaintyTests(ServiceCase):
         self.machine.fail_commands[POUR] = ConnectionError("link dropped mid-write")
         await self.service.start(WATER, "fail", True)
         done = await self.finish()
-        # The step mirrors the machine layer; possible delivery stays explicit.
-        self.assertEqual(done["status"], "failed")
+        # Possible delivery is unresolved: the attempt is unknown, never failed.
+        self.assertEqual(done["status"], "unknown")
+        self.assertIn("unresolved", done["result"]["reason"])
+        # The step keeps the machine layer's own outcome and evidence.
         step = done["result"]["steps"][0]
+        self.assertEqual(step["status"], "failed")
+        self.assertIn("link dropped", step["error"])
         self.assertEqual(step["cleanup_status"], "skipped_uncertain")
         self.assertFalse(step["start_observed"])
+        self.assertIn("stop_acknowledged", step)
         self.assertTrue(done["result"]["state"]["recovery_required"])
         self.assertTrue(self.service.state()["machine"]["recovery_required"])
         kinds = self.kinds(done["id"])
         self.assertIn("command.write_failed", kinds)
+        self.assertIn("operation.unknown", kinds)
         self.assertNotIn("operation.completed", kinds)
+        self.assertNotIn("operation.failed", kinds)
+
+    async def test_configuration_write_failure_is_unknown(self):
+        self.machine.fail_commands[4510] = ConnectionError("lost during configure")
+        await self.service.start(WATER, "configure", True)
+        done = await self.finish()
+        self.assertEqual(done["status"], "unknown")
+        self.assertEqual(done["result"]["steps"][0]["status"], "failed")
+        self.assertNotIn(POUR, self.machine.codes())
+
+    async def test_definite_refusal_before_the_start_stays_failed(self):
+        def low_water(packet):
+            # Acknowledge the configuration, then report low water.
+            return [*self.machine.studio(packet), reply(40522, u32(0))]
+
+        self.machine.overrides[4510] = low_water
+        await self.service.start(WATER, "refused", True)
+        done = await self.finish()
+        self.assertEqual(done["status"], "failed")
+        self.assertNotIn("reason", done["result"])
+        step = done["result"]["steps"][0]
+        self.assertEqual(step["status"], "failed")
+        self.assertIn("Water sufficiency", step["error"])
+        self.assertEqual(step["cleanup_status"], "completed")
+        self.assertFalse(done["result"]["state"]["recovery_required"])
+        self.assertNotIn(POUR, self.machine.codes())
 
     async def test_missing_acknowledgment_is_not_completion(self):
         self.machine.studio.silent.add(POUR)
@@ -462,6 +586,123 @@ class CallerLossAndRecoveryTests(ServiceCase):
         self.assertIn("operation.recovered_unknown", kinds)
         with self.assertRaises(ConflictError):
             self.store.finish(old["id"], "completed", {})
+
+    def block_append(self, kind):
+        """Hold the journal writer thread before it commits ``kind``."""
+        # Finalization, not link timing, is under test: no fsync-bound expiry.
+        self.service.options.update(ack_timeout=5, write_timeout=10)
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        append = self.store.append
+
+        def blocked(event_kind, *args, **kwargs):
+            if event_kind == kind and not release.is_set():
+                entered.set()
+                release.wait(5)
+            return append(event_kind, *args, **kwargs)
+
+        self.store.append = blocked
+        return entered, release
+
+    async def test_stop_joins_an_operation_already_finalizing(self):
+        entered, release = self.block_append("operation.finished")
+        op = await self.service.start(WATER, "final-stop", True)
+        await until(entered.is_set, 2)
+        task = self.service.task
+        stopper = asyncio.create_task(self.service.stop(op["id"]))
+        await asyncio.sleep(0.05)
+        self.assertFalse(stopper.done())
+        release.set()
+        stopped = await asyncio.wait_for(stopper, 5)
+        self.assertEqual(stopped["status"], "completed", stopped["result"])
+        self.assertFalse(task.cancelled())
+        self.assertIsNone(self.service.recorder.operation_id)
+        self.assertIn("operation.completed", self.kinds(op["id"]))
+
+    async def test_cancelling_a_finalizing_worker_still_persists_its_outcome(self):
+        entered, release = self.block_append("operation.finished")
+        op = await self.service.start(WATER, "final-cancel", True)
+        await until(entered.is_set, 2)
+        task = self.service.task
+        task.cancel()
+        await asyncio.sleep(0.05)
+        self.assertFalse(task.done())
+        release.set()
+        await asyncio.wait({task}, timeout=5)
+        self.assertEqual(self.store.operation(op["id"])["status"], "completed")
+        self.assertIsNone(self.service.recorder.operation_id)
+        with self.assertRaises(BusyError):
+            await self.service.stop(op["id"])
+
+    async def test_close_during_finalization_persists_then_releases_ownership(self):
+        entered, release = self.block_append("operation.finished")
+        op = await self.service.start(WATER, "final-close", True)
+        await until(entered.is_set, 2)
+        closer = asyncio.create_task(self.service.close())
+        await asyncio.sleep(0.05)
+        closer.cancel()  # A further cancellation must not cut persistence short.
+        await asyncio.sleep(0.05)
+        self.assertFalse(closer.done())
+        self.assertTrue(self.service.lease.held)
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(closer, 5)
+        self.assertEqual(self.store.operation(op["id"])["status"], "completed")
+        self.assertFalse(self.service.lease.held)
+        self.assertIsNone(self.service.session)
+        self.assertEqual(self.kinds()[-1], "session.closed")
+        successor = self.make(Machine("00:00:5E:00:53:01"))
+        try:
+            await successor.connect()
+            self.assertEqual(self.store.operation(op["id"])["status"], "completed")
+        finally:
+            await successor.close()
+
+    async def test_cancelled_recovery_drains_before_a_successor_owns(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        recover = self.store.recover
+
+        def slow_recover():
+            entered.set()
+            release.wait(5)
+            return recover()
+
+        self.store.recover = slow_recover
+        first = asyncio.create_task(self.service.connect())
+        await until(entered.is_set, 2)
+        first.cancel()
+        await asyncio.sleep(0.05)
+        machine = Machine("00:00:5E:00:53:01")
+        other = Store(self.root / "bloom.sqlite3")
+        successor = self.make(machine, store=other)
+        try:
+            started = None
+            try:
+                started = await successor.start(WATER, "successor", True)
+            except ConnectionError:
+                pass  # The cancelled owner keeps its lease until recovery ends.
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(first, 5)
+            self.assertFalse(self.service.lease.held)
+            self.assertIsNone(self.service.session)
+            if started is None:
+                started = await successor.start(WATER, "successor", True)
+            await until(lambda: POUR in machine.codes(), 2)
+            # The earlier recovery never reaches the successor's active row.
+            self.assertEqual(other.operation(started["id"])["status"], "running")
+            self.assertNotIn("operation.recovered_unknown", self.kinds(started["id"]))
+            machine.emit(40511)
+            machine.state(1)
+            await asyncio.wait_for(asyncio.shield(successor.task), 5)
+            done = other.operation(started["id"])
+            self.assertEqual(done["status"], "completed")
+            self.assertEqual(machine.codes().count(POUR), 1)
+        finally:
+            release.set()
+            await successor.close()
+            other.close()
 
     async def test_one_owner_per_database_and_per_machine(self):
         await self.service.connect()
