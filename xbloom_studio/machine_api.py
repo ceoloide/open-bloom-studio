@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import uuid
+from contextlib import suppress
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ._cleanup import wait_cleanup
 from .client import SessionError
 from .command_schema import (
     command_schema,
@@ -29,13 +31,16 @@ from .machine_controls import (
     SavedPreset,
 )
 from .preset_writes import (
-    ACKNOWLEDGED,
+    EVIDENCE_KINDS,
     FINISHED,
     MAX_ATTEMPTS,
     STARTED,
+    SUPERSEDED,
     PresetWriteRefused,
     admit,
     fold,
+    saved_after_transmission,
+    supersede,
 )
 from .recipe_validation import HOST_STEPS, NATIVE, check_recipe
 from .recipes import upload_requires_untested
@@ -58,7 +63,9 @@ COMMANDS = {
     "an incomplete write may be resubmitted identically, at most "
     f"{MAX_ATTEMPTS} attempts per machine and slot. Optional backup is not "
     "readback.",
-    "write_presets": "Write A/B/C once each; requires caller-supplied backups.",
+    "write_presets": "Write A/B/C once each; requires caller-supplied backups. "
+    "Refused over an incomplete write_preset; supersedes the slots' recorded "
+    "writes.",
     "set_water_source": "Select tank/tap source by the existing validated argument "
     "contract.",
     "read_pour_radius": "Query current raw value; also prepares/home the machine.",
@@ -338,11 +345,21 @@ class MachineCommandAPI:
         self._reject_queued_write()
         async with self.guard:
             self._require_unoccupied()
-            # Policy refusals come before any connection; the guard holds the
-            # decision until the attempt is committed.
+            # Policy refusals come before any connection, under the database
+            # owner lease, so no other owner changes the ledger between this
+            # decision and the committed attempt; the guard holds it here.
             admitted = None
-            if command == "write_preset":
-                admitted = await self._admit_preset_write(values["preset"], acknowledge)
+            superseded: list[dict[str, Any]] = []
+            if command in ("write_preset", "write_presets"):
+                await self._own()
+                ledger = await asyncio.to_thread(self._preset_ledger)
+                if command == "write_preset":
+                    preset = values["preset"]
+                    current = ledger.get(preset.slot)
+                    admitted = (current, *admit(current, preset.to_dict(), acknowledge))
+                else:
+                    slots = [preset.slot for preset in values["presets"]]
+                    superseded = supersede(ledger, slots)
             await self._connect(allow_untested)
             recorder, session = self._recorder, self._session
             recorder.emit(
@@ -361,6 +378,11 @@ class MachineCommandAPI:
                     attempt = await self._begin_preset_write(
                         values["preset"], acknowledge, *admitted
                     )
+                if superseded:
+                    # Durable before any batch frame could change these slots.
+                    for record in superseded:
+                        recorder.emit(SUPERSEDED, record)
+                    await recorder.flush()
                 with recorder.capturing():
                     result: dict[str, Any] = await getattr(session, command)(**values)
             except PresetWriteError as exc:
@@ -373,15 +395,19 @@ class MachineCommandAPI:
                 }
             except BaseException as exc:
                 if attempt is not None:
-                    self._finish_preset_write(attempt, before)
+                    self._finish_preset_write(attempt, before, exc)
                 recorder.emit(
                     "machine.command_failed",
                     {"command": command, "type": type(exc).__name__, "error": str(exc)},
                 )
+                if admitted is not None:
+                    # The outcome is committed before the guard admits a reader.
+                    with suppress(Exception):
+                        await wait_cleanup(asyncio.ensure_future(recorder.flush()))
                 raise
             if attempt is not None:
                 outcome = self._finish_preset_write(attempt, before)
-                await recorder.flush()
+                await wait_cleanup(asyncio.ensure_future(recorder.flush()))
                 write = (await asyncio.to_thread(self._preset_ledger))[attempt["slot"]]
                 result["attempt"] = {
                     "attempt_id": attempt["attempt_id"],
@@ -398,7 +424,14 @@ class MachineCommandAPI:
         if not self.device:
             raise ValueError("Configure a machine address for preset writes")
         rows = self.store.preset_write_events(self.device)
-        return fold(rows, self.preset_attempt)
+        return fold(rows, self.preset_attempt, self._saved_evidence)
+
+    def _saved_evidence(self, session_id: str | None, sequence: int | None) -> bool:
+        """A committed save in an unfinished attempt's own session after it began."""
+        if session_id is None or sequence is None:
+            return False
+        rows = self.store.session_events_after(session_id, sequence, EVIDENCE_KINDS)
+        return saved_after_transmission(rows)
 
     def preset_writes(self, slot: str | None = None) -> dict[str, Any]:
         """The latest recorded single-slot write per slot; never connects.
@@ -414,12 +447,6 @@ class MachineCommandAPI:
             "max_attempts": MAX_ATTEMPTS,
             "writes": [write for key, write in writes.items() if slot in (None, key)],
         }
-
-    async def _admit_preset_write(
-        self, preset: SavedPreset, acknowledge: str | None
-    ) -> tuple[dict[str, Any] | None, str | None, bool]:
-        current = (await asyncio.to_thread(self._preset_ledger)).get(preset.slot)
-        return (current, *admit(current, preset.to_dict(), acknowledge))
 
     async def _begin_preset_write(
         self,
@@ -454,23 +481,37 @@ class MachineCommandAPI:
             "attempt_id": uuid.uuid4().hex,
             **preset.to_dict(),
         }
-        if acknowledge is not None:
-            recorder.emit(ACKNOWLEDGED, {"write_id": acknowledge, "slot": preset.slot})
-        recorder.emit(STARTED, attempt)
+        # The acknowledgment is part of the new write's first record, so it
+        # never commits alone.
+        started = (
+            attempt if acknowledge is None else {**attempt, "acknowledges": acknowledge}
+        )
+        recorder.emit(STARTED, started)
         self.preset_attempt = attempt["attempt_id"]
         try:
             await recorder.flush()
-        except BaseException:
-            self._finish_preset_write(attempt, session._last_preset_write)
+        except BaseException as exc:
+            self._finish_preset_write(attempt, session._last_preset_write, exc)
             raise
         return attempt
 
-    def _finish_preset_write(self, attempt: dict[str, Any], before: Any) -> str:
-        """Record this attempt's outcome; a call that never began sent nothing."""
+    def _finish_preset_write(
+        self, attempt: dict[str, Any], before: Any, exc: BaseException | None = None
+    ) -> str:
+        """Record this attempt's outcome; frames sent are recorded beside it.
+
+        The session's own classification wins (an observed save first); a call
+        that never reached it was cancelled or sent nothing.
+        """
         latest = self._session._last_preset_write
-        outcome = "refused"
-        if latest is not None and latest is not before and latest["outcome"]:
-            outcome = latest["outcome"]
+        mine: dict[str, Any] = {}
+        if latest is not None and latest is not before:
+            mine = latest
+        outcome: str = "refused"
+        if mine.get("outcome"):
+            outcome = mine["outcome"]
+        elif isinstance(exc, asyncio.CancelledError):
+            outcome = "cancelled"
         self._recorder.emit(
             FINISHED,
             {
@@ -478,6 +519,8 @@ class MachineCommandAPI:
                 "attempt_id": attempt["attempt_id"],
                 "slot": attempt["slot"],
                 "outcome": outcome,
+                "transmitted_write_count": mine.get("transmitted_write_count", 0),
+                "partial_frame": bool(mine.get("partial_frame")),
             },
         )
         self.preset_attempt = None

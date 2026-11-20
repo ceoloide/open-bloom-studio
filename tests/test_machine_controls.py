@@ -673,6 +673,77 @@ class PresetAttemptTests(Base):
         self.assertEqual(result["outcome"], "rejected")
         self.assertIn("not a save", result["error"])
 
+    async def evidence_during_second_journal(self, evidence):
+        m = Machine()
+        intents = []
+
+        class Hooks:
+            async def before_write(self, packet, frame):
+                if packet.command == 11510:
+                    intents.append(packet)
+                    if len(intents) == 2:
+                        # After the cursor the old code captured, before any
+                        # byte of the second frame.
+                        m.state(evidence)
+                        await asyncio.sleep(0.01)
+
+            def write_completed(self, packet):
+                pass
+
+            def write_failed(self, packet, error):
+                pass
+
+        result = await self.attempt(m, command_hooks=Hooks())
+        self.assertEqual(len(intents), 2)
+        return m, result
+
+    async def test_evidence_while_the_next_frame_journal_waits_stops_it(self):
+        for evidence, outcome in ((0x44, "rejected"), (0x25, "saved_cleanup_failed")):
+            with self.subTest(outcome=outcome):
+                m, result = await self.evidence_during_second_journal(evidence)
+                self.assertEqual(m.codes().count(11510), 1)
+                self.assertEqual(result["transmitted_write_count"], 1)
+                self.assertFalse(result["partial_frame"])
+                self.assertEqual(result["outcome"], outcome)
+
+    async def test_a_save_before_the_first_frame_is_not_correlated(self):
+        m = Machine()
+
+        class Hooks:
+            async def before_write(self, packet, frame):
+                if packet.command == 11510 and 11510 not in m.codes():
+                    m.state(0x25)  # Stale: before this attempt's first frame.
+
+            def write_completed(self, packet):
+                pass
+
+            def write_failed(self, packet, error):
+                pass
+
+        async with interaction(m, allow_untested=True, command_hooks=Hooks()) as s:
+            result = await s.write_preset(SavedPreset("A", b"new", 4))
+        # The stale save neither stopped the planned frames nor completed them.
+        self.assertEqual(m.codes().count(11510), 3)
+        self.assertEqual(result["outcome"], "saved")
+        stale = [r for r, p in s._received_events if p.payload == u32(0x25)]
+        self.assertEqual(len(stale), 2)
+        self.assertGreaterEqual(result["save_event"]["after_event_revision"], stale[0])
+
+    async def test_cancellation_before_any_preset_frame_is_cancelled(self):
+        m = Machine()
+        m.block_code = MODE
+        async with interaction(m, allow_untested=True) as session:
+            task = asyncio.create_task(session.write_preset(SavedPreset("A", b"n", 4)))
+            await until(lambda: m.blocked.is_set())
+            task.cancel()
+            m.release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            result = session._last_preset_write
+        self.assertEqual(result["transmitted_write_count"], 0)
+        self.assertEqual(result["outcome"], "cancelled")
+        self.assertNotIn(11510, m.codes())
+
     async def test_prepare_failure_sends_no_preset_frame(self):
         m = Machine()
         m.fail_commands[MODE] = ConnectionError("gone")

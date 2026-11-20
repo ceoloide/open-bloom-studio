@@ -19,7 +19,8 @@ from xbloom_studio.control import BusyError
 from xbloom_studio.errors import error_detail
 from xbloom_studio.journal import Recorder
 from xbloom_studio.machine_api import same_attempt, same_request
-from xbloom_studio.preset_writes import PresetWriteRefused
+from xbloom_studio.ownership import LeaseBusyError
+from xbloom_studio.preset_writes import STARTED, PresetWriteRefused
 from xbloom_studio.storage import ConflictError, Store
 
 FAST = {
@@ -1158,7 +1159,10 @@ class PresetRetryTests(ServiceCase):
         self.assertTrue(result["saved_observed"])
         self.assertNotEqual(result["attempt"]["write_id"], attempt["write_id"])
         self.assertEqual(result["attempt"]["attempts_used"], 1)
-        self.assertIn("preset_write.acknowledged", self.kinds())
+        # The acknowledgment is part of the new write's first record.
+        self.assertNotIn("preset_write.acknowledged", self.kinds())
+        started = [e for e in self.store.events(limit=10000) if e["kind"] == STARTED]
+        self.assertEqual(started[-1]["data"]["acknowledges"], attempt["write_id"])
 
     async def test_incomplete_write_blocks_only_its_own_slot(self):
         self.machine.studio.reject_preset_attempts = 1
@@ -1289,9 +1293,170 @@ class PresetRetryTests(ServiceCase):
         self.assertNotIn("attempt", result)
         writes = self.service.preset_writes()["writes"]
         self.assertEqual(
-            [(w["preset"]["slot"], w["attempts_used"]) for w in writes],
-            [("A", 1), ("B", 1)],
+            [(w["preset"]["slot"], w["attempts_used"], w["state"]) for w in writes],
+            [("A", 1, "superseded"), ("B", 1, "superseded")],
         )
+
+    def respond_then(self, code, action):
+        """Respond to ``code`` as simulated; run ``action`` on the third."""
+        count = []
+
+        def respond(packet):
+            count.append(packet)
+            if len(count) == 3:
+                action()
+            return self.machine.studio(packet)
+
+        self.machine.overrides[code] = respond
+
+    async def test_a_journaled_save_blocks_a_repeat_after_a_restart(self):
+        # The save arrives; the home frame that follows blocks after its intent
+        # committed everything queued before it, then the owner dies.
+        self.respond_then(11510, lambda: setattr(self.machine, "block_code", 8022))
+        task = asyncio.create_task(self.write())
+        await until(lambda: self.machine.blocked.is_set(), 5)
+        self.service.lease.release()  # The process is gone; FINISHED never commits.
+        successor = self.make(Machine("00:00:5E:00:53:01"))
+        try:
+            write = successor.preset_writes("A")["writes"][0]
+            self.assertEqual(write["attempts"][0]["outcome"], "saved_interrupted")
+            self.assertEqual((write["state"], write["retry_allowed"]), ("saved", False))
+            with self.assertRaisesRegex(PresetWriteRefused, "already observed a save"):
+                await successor.command(
+                    "write_preset", {"preset": A}, True, allow_untested=True
+                )
+            self.assertEqual(successor.connector.calls, [])
+        finally:
+            await successor.close()
+            self.service.lease.acquire()
+            self.machine.release.set()
+            await task
+
+    async def test_cancelled_preparation_stops_automatic_repeats(self):
+        self.machine.block_code = 11511
+        task = asyncio.create_task(self.write())
+        await until(lambda: self.machine.blocked.is_set(), 5)
+        task.cancel()
+        self.machine.release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        # The outcome committed before the guard admitted this reader.
+        write = self.latest()
+        self.assertEqual(self.frames(), 0)
+        self.assertEqual(
+            (write["state"], write["attempts"][-1]["outcome"], write["retry_allowed"]),
+            ("cancelled", "cancelled", False),
+        )
+        self.assertEqual(write["attempts"][-1]["transmitted_write_count"], 0)
+
+    async def test_cancellation_while_the_attempt_commits_is_cancelled(self):
+        append, entered, gate = self.store.append, threading.Event(), threading.Event()
+
+        def slow(kind, data, **context):
+            if kind == STARTED:
+                entered.set()
+                gate.wait(5)
+            return append(kind, data, **context)
+
+        with patch.object(self.store, "append", slow):
+            task = asyncio.create_task(self.write())
+            await until(entered.is_set, 5)
+            task.cancel()
+            gate.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        write = self.latest()
+        self.assertEqual(self.frames(), 0)
+        self.assertEqual((write["state"], write["attempts_used"]), ("cancelled", 1))
+
+    async def test_the_ledger_is_read_only_under_the_database_lease(self):
+        await self.service.connect()
+        other = self.make(Machine("00:00:5E:00:53:01"))
+        reads = []
+        ledger = other._preset_ledger
+
+        def read():
+            reads.append(other.lease.held)
+            return ledger()
+
+        other._preset_ledger = read
+        try:
+            with self.assertRaises(LeaseBusyError):
+                await other.command(
+                    "write_preset", {"preset": A}, True, allow_untested=True
+                )
+            self.assertEqual((reads, other.connector.calls), ([], []))
+            await self.service.close()
+            result = await other.command(
+                "write_preset", {"preset": A}, True, allow_untested=True
+            )
+            self.assertEqual(result["attempt"]["state"], "saved")
+            self.assertEqual(reads[0], True)
+        finally:
+            await other.close()
+
+    async def batch(self, *slots):
+        presets = [{**A, "slot": slot, "payload_hex": "62"} for slot in slots]
+        return await self.service.command(
+            "write_presets",
+            {"presets": presets, "backup": presets},
+            True,
+            allow_untested=True,
+        )
+
+    async def test_a_batch_supersedes_saved_writes_before_its_first_frame(self):
+        await self.write()
+        await self.service.disconnect()
+        # A partial batch: its first preset frame fails.
+        self.machine.fail_commands[11510] = ConnectionError("lost mid-batch")
+        result = await self.batch("A", "B", "C")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["details"]["transmitted_write_count"], 1)
+        kinds = self.kinds()
+        self.assertLess(
+            kinds.index("preset_write.superseded"),
+            max(i for i, k in enumerate(kinds) if k == "command.intent"),
+        )
+        self.assertEqual(self.latest()["state"], "superseded")
+        del self.machine.fail_commands[11510]
+        await self.service.disconnect()
+        # The identical write is not "already saved" any more.
+        result = await self.write()
+        self.assertEqual(result["attempt"]["state"], "saved")
+        self.assertEqual(result["attempt"]["attempts_used"], 1)
+
+    async def test_a_batch_never_overwrites_an_unresolved_write(self):
+        self.machine.studio.reject_preset_attempts = 1
+        await self.write()
+        await self.service.disconnect()
+        connects, frames = self.machine.calls.count("connect"), self.frames()
+        with self.assertRaisesRegex(PresetWriteRefused, "batch would overwrite"):
+            await self.batch("A", "B", "C")
+        self.assertEqual(self.machine.calls.count("connect"), connects)
+        self.assertEqual(self.frames(), frames)
+        write = self.latest()
+        self.assertEqual((write["state"], write["retry_allowed"]), ("retryable", True))
+
+    async def test_a_replacement_that_sends_nothing_keeps_the_old_write(self):
+        self.machine.studio.reject_preset_attempts = 3
+        for _ in range(3):
+            exhausted = (await self.write())["attempt"]
+            await self.service.disconnect()
+        self.machine.fail_commands[8022] = ConnectionError("lost before writing")
+        other = {**A, "flags": 5}
+        result = await self.write(other, acknowledge_incomplete=exhausted["write_id"])
+        self.assertEqual(result["attempt"]["outcome"], "refused")
+        del self.machine.fail_commands[8022]
+        await self.service.disconnect()
+        write = self.latest()
+        self.assertEqual(
+            (write["write_id"], write["state"]), (exhausted["write_id"], "exhausted")
+        )
+        for preset in (other, A):
+            with self.subTest(preset=preset), self.assertRaises(PresetWriteRefused):
+                await self.write(preset)
+        result = await self.write(other, acknowledge_incomplete=exhausted["write_id"])
+        self.assertEqual(result["attempt"]["state"], "saved")
 
 
 if __name__ == "__main__":

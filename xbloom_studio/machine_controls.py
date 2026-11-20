@@ -52,10 +52,11 @@ def preset_outcome(result: dict[str, Any], exc: BaseException | None) -> str:
     """Classify one write attempt from its evidence; never a content readback."""
     if result["saved_observed"]:
         return "saved" if exc is None else "saved_cleanup_failed"
-    if not result["transmitted_write_count"] and not result["partial_frame"]:
-        return "refused"
+    # A cancellation ends automatic repetition even before the first frame.
     if isinstance(exc, asyncio.CancelledError):
         return "cancelled"
+    if not result["transmitted_write_count"] and not result["partial_frame"]:
+        return "refused"
     return "rejected" if result["rejection_evidence"] else "unconfirmed"
 
 
@@ -559,24 +560,42 @@ class MachineControls:
                 }
 
             def transmitted() -> None:
+                # Correlation starts when a frame can reach the machine, not
+                # when its journal hook began waiting.
+                nonlocal start, cursor
+                cursor = self._event_revision
+                if start is None:
+                    start = cursor
                 result["transmitted_write_count"] += 1
+
+            def terminal() -> None:
+                """Stop before any byte of the next frame on terminal evidence.
+
+                Also the frame's command guard, so it is rechecked after the
+                frame's journal hook and immediately before its first byte.
+                """
+                if not single or start is None:
+                    return
+                if since(start, is_save) is not None:
+                    raise SessionError(
+                        "Preset completion arrived before the final planned "
+                        "write; no further writes sent"
+                    )
+                if since(start, is_rejection) is not None:
+                    raise SessionError(
+                        "Machine reported a rejection state; no further writes sent"
+                    )
 
             try:
                 await self._prepare()
-                start = cursor = self._event_revision
                 for index, preset in enumerate(presets):
-                    if single and index and since(cursor, is_save) is not None:
-                        raise SessionError(
-                            "Preset completion arrived before the final planned "
-                            "write; no further writes sent"
-                        )
-                    if single and since(start, is_rejection) is not None:
-                        raise SessionError(
-                            "Machine reported a rejection state; no further writes sent"
-                        )
-                    cursor = self._event_revision
+                    terminal()
                     packet = await self._command(
-                        11510, preset.body(), 2, on_transmit=transmitted
+                        11510,
+                        preset.body(),
+                        2,
+                        before_write=terminal,
+                        on_transmit=transmitted,
                     )
                     if packet.payload:
                         evidence.append(
@@ -596,6 +615,7 @@ class MachineControls:
                         acknowledged.append(preset.slot)
                     result["acknowledged_write_count"] += 1
                     await asyncio.sleep(0.1 if self.transition_delay else 0)
+                assert cursor is not None  # Every planned frame was transmitted.
                 packet = await self._wait_event(
                     cursor,
                     lambda packet: is_save(packet) or (single and is_rejection(packet)),
@@ -609,10 +629,13 @@ class MachineControls:
                 result["outcome"] = preset_outcome(result, None)
                 return {**result, "acknowledged_slots": acknowledged.copy()}
             except BaseException as exc:
+                # Any save after a single-slot attempt's first transmission
+                # wins; a batch correlates only with its last frame.
                 if start is not None and cursor is not None:
-                    late = since(cursor, is_save)
+                    after = start if single else cursor
+                    late = since(after, is_save)
                     if late is not None:
-                        record_save(late, cursor)
+                        record_save(late, after)
                     state = since(start, is_rejection)
                     if state is not None:
                         evidence.append(

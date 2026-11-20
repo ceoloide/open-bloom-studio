@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -342,9 +342,26 @@ class Store(Pagination):
         """
         with self.lock:
             rows = self.db.execute(
-                "SELECT id,at,kind,data FROM events WHERE device=? "
-                "AND kind GLOB 'preset_write.*' ORDER BY id",
+                "SELECT id,at,session_id,sequence,kind,data FROM events WHERE "
+                "device=? AND kind GLOB 'preset_write.*' ORDER BY id",
                 (device,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def session_events_after(
+        self, session_id: str, sequence: int, kinds: Sequence[str]
+    ) -> list[dict[str, Any]]:
+        """One session's events of ``kinds`` after ``sequence``, in order.
+
+        Uses the session index, so it never reads other sessions' history;
+        ``data`` stays undecoded.
+        """
+        marks = ",".join("?" * len(kinds))
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT kind,data FROM events WHERE session_id=? AND sequence>? "
+                f"AND kind IN ({marks}) ORDER BY sequence",
+                (session_id, sequence, *kinds),
             ).fetchall()
         return [dict(row) for row in rows]
 

@@ -133,7 +133,8 @@ reads a preset back: even a success reports `readback_verified=false`.
 
 One `write_preset` call is one attempt of three planned frames. Its result's
 `attempt` field gives the `outcome` (`saved`, `saved_cleanup_failed`,
-`rejected`, `unconfirmed`, `cancelled` or `refused`), `attempts_used`,
+`rejected`, `unconfirmed`, `cancelled` or `refused`; `interrupted` or
+`saved_interrupted` when the daemon stopped first), `attempts_used`,
 `retry_allowed` and `next_step`. When `retry_allowed` is true for a write the
 user asked for, call `machine_disconnect`, then submit `write_preset` again
 with exactly the same slot, flags and payload. Never recompile or change the
@@ -144,7 +145,9 @@ attempts are used up. Only after their direction, pass
 `acknowledge_incomplete` with the reported `write_id` to start a new write. A
 fresh caller finds the exact contents and counts with
 `machine_preset_writes(slot)`, which never connects. Batch preset writes,
-brew starts and other commands are never repeated automatically.
+brew starts and other commands are never repeated automatically. A batch is
+refused while a target slot has an incomplete write, and leaves the slots'
+writes `superseded`.
 
 ## Errors
 
