@@ -1,6 +1,8 @@
 ---
 name: bloom-operate
-description: Prepare, start, watch, stop and recover xBloom Studio operations (water, grinding, stored or inline recipes, exact repeats) and settings or scale commands through the Open Bloom daemon. Use for machine actions, not recipe authoring.
+description: Prepare, start, watch, stop and recover xBloom Studio machine actions (water, grinding, stored or inline recipes, exact repeats, settings and scale) through the Open Bloom daemon. Use when the user asks the machine to do something or asks about a running or uncertain operation, not for recipe authoring.
+license: MIT
+compatibility: Needs a running open-bloom-studio daemon (xbloom serve) reached through the machine tools of xbloom-mcp or the xbloom command, and access to the machine.
 ---
 
 # Operate the machine

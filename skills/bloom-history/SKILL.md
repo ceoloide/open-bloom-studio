@@ -1,6 +1,8 @@
 ---
 name: bloom-history
-description: Find past Open Bloom brews, record tasting feedback, inspect what was sent and save a past brew as a recipe. Use when the user refers to an earlier brew; repeating it belongs to bloom-operate.
+description: Find past Open Bloom brews, record tasting feedback, inspect what was sent and save a past brew as a recipe. Use when the user refers to an earlier brew, says how one tasted or asks what was brewed. Repeating a brew belongs to bloom-operate.
+license: MIT
+compatibility: Needs the open-bloom-studio xbloom command or the history tools of xbloom-mcp.
 ---
 
 # Open Bloom history

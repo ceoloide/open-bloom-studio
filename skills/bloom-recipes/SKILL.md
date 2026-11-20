@@ -1,6 +1,8 @@
 ---
 name: bloom-recipes
-description: Draft, validate, store, match and import coffee and tea recipes for an xBloom Studio with Open Bloom. Use for recipe authoring and the local recipe library; brewing belongs to bloom-operate.
+description: Draft, validate, store, match and import coffee and tea recipes with Open Bloom for an xBloom Studio. Use when the user wants a new or adjusted coffee recipe, or wants to save, find, compare, edit or import recipes. Crafting tea belongs to bloom-tea and brewing to bloom-operate.
+license: MIT
+compatibility: Needs the open-bloom-studio xbloom command or the recipe tools of xbloom-mcp. Public recipe search and import need network access.
 ---
 
 # Open Bloom recipes

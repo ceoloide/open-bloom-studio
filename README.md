@@ -127,12 +127,13 @@ in three groups, so a client can be given only the roles it needs:
 }
 ```
 
-The `skills/` folder holds four Agent Skills (`SKILL.md` folders) that
-teach an agent to use these tools safely: `bloom-recipes` (author, store and
-import recipes), `bloom-tea` (craft tea drafts), `bloom-history` (find past
-brews and add feedback) and `bloom-operate` (run, watch, stop and recover
-machine work). Copy the folders into your agent's skills directory, for
-example `~/.claude/skills/` for Claude Code. The skills ask for explicit user
+The `skills/` folder holds four standalone skills that follow the
+[Agent Skills specification](https://agentskills.io/specification) and teach
+an agent to use these tools safely: `bloom-recipes` (author, store and import
+recipes), `bloom-tea` (craft tea drafts), `bloom-history` (find past brews and
+add feedback) and `bloom-operate` (run, watch, stop and recover machine work).
+Copy the folders into your agent's skills directory, for example
+`~/.claude/skills/` for Claude Code. The skills ask for explicit user
 permission before any physical action and never retry an uncertain start.
 
 ## Development

@@ -1,6 +1,8 @@
 ---
 name: bloom-tea
-description: Craft a native xBloom Studio tea recipe from a tea's family, label or taste feedback, then validate and preview it without saving. Use bloom-recipes to store it and bloom-operate to brew it.
+description: Craft a native xBloom Studio tea recipe with Open Bloom, then validate and preview it without saving. Use when the user names a tea, tea family or label, or gives feedback on a tea brew and wants settings. Storing belongs to bloom-recipes and brewing to bloom-operate.
+license: MIT
+compatibility: Needs the open-bloom-studio xbloom command or the recipe tools of xbloom-mcp. Works offline.
 ---
 
 # Open Bloom tea

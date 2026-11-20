@@ -14,6 +14,7 @@ import io
 import json
 import re
 import shlex
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,12 @@ TOOL = re.compile(
 )
 SPAN = re.compile(r"`(xbloom(?:-mcp)? [^`]+)`")
 FENCE = re.compile(r"```(\w+)\n(.*?)```", re.S)
-FRONT_MATTER = re.compile(r"\A---\nname: ([a-z0-9-]+)\ndescription: (.+?)\n---\n")
+# Agent Skills specification (agentskills.io/specification) fields we use,
+# each written as a single-line plain YAML scalar.
+FIELDS = {"name": 64, "description": 1024, "license": 3, "compatibility": 500}
+SKILL_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+PLAIN_START = tuple("-?:,[]{}#&*!|>'\"%@`")
+LINK = re.compile(r"\]\(([^)\s]+)\)")
 PLACEHOLDERS = {"FAMILY": "green", "N": "1"}
 
 
@@ -52,6 +58,44 @@ def role_tools() -> dict[str, set[str]]:
         "bloom-history": group["history"],
         "bloom-operate": group["machine"] | (group["history"] & READ_ONLY),
     }
+
+
+def spec_problems(root: Path) -> list[str]:
+    """Agent Skills specification checks for one standalone skill directory."""
+    skill = root / "SKILL.md"
+    if not skill.is_file() or skill.is_symlink():
+        return ["missing SKILL.md"]
+    text = skill.read_text(encoding="utf-8")
+    head, separator, body = text.partition("\n---\n")
+    if not head.startswith("---\n") or not separator:
+        return ["missing front matter"]
+    problems, fields = [], {}
+    for line in head[4:].splitlines():
+        key, colon, value = line.partition(": ")
+        if key not in FIELDS or key in fields or not colon:
+            problems.append(f"unsupported front matter line: {key}")
+        elif value.startswith(PLAIN_START) or ": " in value or " #" in value:
+            problems.append(f"{key} is not a plain YAML scalar")
+        elif not 1 <= len(value) <= FIELDS[key]:
+            problems.append(f"{key} must have 1 to {FIELDS[key]} characters")
+        fields[key] = value
+    if not SKILL_NAME.fullmatch(fields.get("name", "")):
+        problems.append("name must be lower-case words joined by single hyphens")
+    if fields.get("name") != root.name:
+        problems.append("name must match the directory")
+    if "description" not in fields:
+        problems.append("missing description")
+    if fields.get("license") != "MIT":
+        problems.append("license must be MIT")
+    if len(text.splitlines()) >= 500:
+        problems.append("SKILL.md must stay under 500 lines")
+    for target in LINK.findall(body):
+        if re.match(r"[a-z]+:|#", target):
+            continue
+        path = (root / target.split("#")[0]).resolve()
+        if not path.is_relative_to(root.resolve()) or not path.exists():
+            problems.append(f"reference does not resolve inside the skill: {target}")
+    return problems
 
 
 def tool_problems(
@@ -108,13 +152,35 @@ class SkillTests(unittest.TestCase):
         found = sorted(path.name for path in SKILLS.iterdir())
         self.assertEqual(found, sorted(roles))
         for name in found:
-            files = sorted(p.name for p in (SKILLS / name).iterdir())
-            self.assertEqual(files, ["SKILL.md"])
-            text = (SKILLS / name / "SKILL.md").read_text(encoding="utf-8")
-            header = FRONT_MATTER.match(text)
-            assert header is not None, name
-            self.assertEqual(header.group(1), name)
-            self.assertLessEqual(len(header.group(2)), 1024)
+            self.assertEqual(spec_problems(SKILLS / name), [], name)
+
+    def test_spec_checks_reject_invalid_skills(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name) / "bad--skill"
+        root.mkdir()
+        self.assertEqual(spec_problems(root), ["missing SKILL.md"])
+        (root / "SKILL.md").write_text("# No front matter\n")
+        self.assertEqual(spec_problems(root), ["missing front matter"])
+        (root / "SKILL.md").write_text(
+            "---\nname: bad--skill\nlicense: Apache-2.0\nversion: 1\n"
+            "compatibility: a: b\n---\n[x](../escape.md) [y](missing.md)"
+            " [z](https://example.com) [w](#top)\n" + "line\n" * 500
+        )
+        self.assertEqual(
+            spec_problems(root),
+            [
+                "license must have 1 to 3 characters",
+                "unsupported front matter line: version",
+                "compatibility is not a plain YAML scalar",
+                "name must be lower-case words joined by single hyphens",
+                "missing description",
+                "license must be MIT",
+                "SKILL.md must stay under 500 lines",
+                "reference does not resolve inside the skill: ../escape.md",
+                "reference does not resolve inside the skill: missing.md",
+            ],
+        )
 
     def test_skills_name_only_their_role_tools_and_real_arguments(self):
         schemas, roles = tools(), role_tools()
