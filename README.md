@@ -30,6 +30,9 @@ python3 -m venv .venv
 python -m pip install ".[ble,mcp]"
 ```
 
+Activate `.venv` from the checkout in each terminal before running the
+commands below.
+
 The earlier `0.0.1-alpha` tag predates these names: it installs the
 `open-bloom-studio` distribution with the `xbloom` and `xbloom-mcp` commands.
 
@@ -67,9 +70,11 @@ daemon in its own terminal:
 xbloom-studio --device "$XBLOOM_STUDIO_DEVICE" serve
 ```
 
-After the daemon prints a JSON response with `serving`, use a second terminal:
+After the daemon prints a JSON response with `serving`, open a second terminal
+in the checkout:
 
 ```sh
+. .venv/bin/activate
 xbloom-studio machine connect
 xbloom-studio water --volume-ml 100 --key second --allow-control --wait
 ```
@@ -152,6 +157,10 @@ come in three groups, so a client can be given only the roles it needs:
   }
 }
 ```
+
+If the MCP host does not inherit the activated virtual environment's
+`PATH`, set each `command` to the absolute path of
+`.venv/bin/xbloom-studio-mcp` in your checkout.
 
 If the MCP host uses a different environment from the daemon, add
 `--socket` and the daemon's absolute socket path to each local server's
