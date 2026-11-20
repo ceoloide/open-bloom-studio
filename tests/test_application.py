@@ -25,7 +25,8 @@ FAST = {
     "subscription_settle": 0,
     "transition_delay": 0,
     "ack_timeout": 0.2,
-    "write_timeout": 0.5,
+    # These simulator writes include a durable SQLite flush.
+    "write_timeout": 3,
 }
 WATER = {"kind": "water", "volume_ml": 50, "temperature_c": 20}
 POUR = 4506
@@ -172,7 +173,6 @@ class LifecycleTests(ServiceCase):
             await self.service.stop(ident)
 
     async def test_replay_returns_an_earlier_attempt_during_active_work(self):
-        self.service.options["write_timeout"] = 3
         first = await self.service.start(WATER, "first", True)
         self.assertEqual((await self.finish())["status"], "completed")
         current = await self.service.start(
@@ -392,7 +392,8 @@ class AdmissionTests(ServiceCase):
             },
         }
         first = await self.service.start(omitted, "inline", True)
-        await self.finish()
+        completed = await self.finish()
+        self.assertEqual(completed["status"], "completed", completed["result"])
         self.assertEqual(
             (await self.service.start(explicit, "inline", True))["id"], first["id"]
         )
@@ -402,7 +403,8 @@ class AdmissionTests(ServiceCase):
         saved = self.store.create_recipe(omitted["document"])
         by_name = {"kind": "recipe", "reference": "Steps"}
         await self.service.start(by_name, "reference", True)
-        await self.finish()
+        completed = await self.finish()
+        self.assertEqual(completed["status"], "completed", completed["result"])
         for other in (
             {"kind": "recipe", "reference": saved["id"]},
             {**by_name, "revision": 1},
@@ -528,7 +530,6 @@ class UncertaintyTests(ServiceCase):
         self.assertNotIn(POUR, self.machine.codes())
 
     async def test_withheld_final_start_chunk_is_failed_with_recovery_required(self):
-        self.service.options["write_timeout"] = 3
         self.machine.block_code = POUR
         await self.service.start(WATER, "partial-start", True)
         try:
