@@ -51,6 +51,16 @@ def _socket_path_errors() -> Iterator[None]:
         raise
 
 
+def socket_path_exists(path: Path, *, follow_symlinks: bool = True) -> bool:
+    """Check occupancy while retaining actionable filesystem path errors."""
+    with _socket_path_errors():
+        try:
+            os.stat(path, follow_symlinks=follow_symlinks)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+    return True
+
+
 async def call(
     socket_path: str | os.PathLike[str],
     method: str,
@@ -114,8 +124,9 @@ class LocalServer:
         self._close_task: asyncio.Task[None] | None = None
 
     async def start(self) -> LocalServer:
-        self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        mode = self.path.parent.lstat()
+        with _socket_path_errors():
+            self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            mode = self.path.parent.lstat()
         if (
             not stat.S_ISDIR(mode.st_mode)
             or mode.st_uid != os.getuid()
@@ -124,7 +135,7 @@ class LocalServer:
             raise SocketDirectoryError(
                 "Socket directory must be owned by this user and mode 0700"
             )
-        occupied = self.path.exists() or self.path.is_symlink()
+        occupied = socket_path_exists(self.path, follow_symlinks=False)
         if occupied and not self.recover_stale:
             raise FileExistsError(
                 "Socket already exists; use explicit stale recovery after "
@@ -182,9 +193,10 @@ class LocalServer:
                 "or regular file"
             )
         try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(str(self.path)), 1
-            )
+            with _socket_path_errors():
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_unix_connection(str(self.path)), 1
+                )
         except ConnectionRefusedError:
             pass
         else:

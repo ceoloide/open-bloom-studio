@@ -26,7 +26,7 @@ from .errors import error_detail
 from .facade import PURE_METHODS, Application, bind_parameters
 from .grind_profiles import grind_profile
 from .provider_exports import load_export
-from .rpc import LocalServer, call, default_socket
+from .rpc import LocalServer, call, default_socket, socket_path_exists
 from .serialization import dumps
 from .storage import ConflictError, Store
 from .tea_guidance import FAMILIES
@@ -560,8 +560,8 @@ async def run(a: argparse.Namespace) -> int:
 
     else:
         a.socket = (a.socket or default_socket()).expanduser()
-        remote = a.socket.exists() and not a.direct
-        if a.direct and a.socket.exists():
+        remote = socket_path_exists(a.socket)
+        if a.direct and remote:
             raise ValueError("Daemon socket exists; do not bypass its owner")
 
         async def invoke(method: str, params: dict[str, Any] | None = None) -> Any:

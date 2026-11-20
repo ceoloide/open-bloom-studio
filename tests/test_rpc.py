@@ -179,6 +179,25 @@ class ServerCase(unittest.IsolatedAsyncioTestCase):
 
 
 class LocalServerTests(ServerCase):
+    async def test_overlong_filename_is_an_actionable_socket_error(self):
+        path = self.root / ("x" * 256)
+        with self.assertRaises(SocketPathError):
+            await LocalServer(self.app, path).start()
+        self.assertFalse(self.app.machine.owned)
+
+    async def test_stale_recovery_rejects_overlong_alias_without_unlinking(self):
+        parent = self.root / ("directory-" * 10)
+        parent.mkdir(mode=0o700)
+        alias = self.root / "short"
+        alias.symlink_to(parent, target_is_directory=True)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(alias / "bloom.sock"))
+        path = parent / "bloom.sock"
+        with self.assertRaises(SocketPathError):
+            await LocalServer(self.app, path, recover_stale=True).start()
+        self.assertTrue(path.is_socket())
+        self.assertFalse(self.app.machine.owned)
+
     async def test_overlong_socket_path_has_actionable_error(self):
         path = self.root / "run" / ("x" * 110 + ".sock")
         with self.assertRaises(SocketPathError) as bind_error:

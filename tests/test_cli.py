@@ -59,6 +59,12 @@ class CliCase(unittest.TestCase):
 
 
 class RouteTests(CliCase):
+    def test_serve_reports_overlong_socket_filename(self):
+        code, _, errors = run_cli("--socket", str(self.root / ("x" * 256)), "serve")
+        self.assertEqual(code, 2)
+        self.assertEqual(errors[0]["error"]["code"], "invalid_argument")
+        self.assertIn("shorter --socket path", errors[0]["error"]["next_step"])
+
     def route(self, *args):
         return cli.route(cli.parser().parse_args(list(args)))
 
