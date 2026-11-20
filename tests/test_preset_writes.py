@@ -253,6 +253,74 @@ class FoldTests(unittest.TestCase):
             admit(current, A, W)
         self.assertEqual(fold(rows + [started("b", X)])["A"]["write_id"], X)
 
+    def test_a_supersession_lapses_only_on_proof_that_no_preset_byte_was_sent(
+        self,
+    ):
+        saved = [started("a"), finished("a", "saved")]
+        record = {**row(SUPERSEDED, write_id=W, slot="A"), "session_id": "s"}
+        asked = []
+
+        def proving(*proofs):
+            def evidence(session, sequence, cancellation=True):
+                asked.append((session, sequence, cancellation))
+                return proofs[sequence]
+
+            return evidence
+
+        # The batch's frame for the slot was withheld (or never intended):
+        # the saved write stays in force and blocks an identical replay.
+        current = fold([*saved, {**record, "sequence": 0}], evidence=proving("unsent"))[
+            "A"
+        ]
+        self.assertEqual(asked, [("s", 0, False)])
+        self.assertEqual((current["write_id"], current["state"]), (W, "saved"))
+        with self.assertRaises(PresetWriteRefused):
+            admit(current, A, None)
+        self.assertEqual(supersede({"A": current}, "A"), [{"write_id": W, "slot": "A"}])
+        # Anything else, any later batch that may have sent, or no session
+        # to read keeps it superseded.
+        for proof in ("sent", "saved", "cancelled"):
+            with self.subTest(proof=proof):
+                rows = [*saved, {**record, "sequence": 0}]
+                current = fold(rows, evidence=proving(proof))["A"]
+                self.assertEqual(current["state"], "superseded")
+        later = [{**record, "sequence": 0}, {**record, "sequence": 1}]
+        current = fold([*saved, *later], evidence=proving("unsent", "sent"))["A"]
+        self.assertEqual(current["state"], "superseded")
+        asked.clear()
+        for rows, evidence in (
+            (
+                [*saved, {**record, "session_id": None, "sequence": 0}],
+                proving("unsent"),
+            ),
+            ([*saved, {**record, "sequence": 0}], None),
+        ):
+            with self.subTest(rows=rows):
+                self.assertEqual(
+                    fold(rows, evidence=evidence)["A"]["state"], "superseded"
+                )
+        self.assertEqual(asked, [])
+
+    def test_a_committed_cancellation_stops_an_attempt_without_an_outcome(self):
+        rows = [{**started("a"), "session_id": "s", "sequence": 7}]
+        write = fold(rows, evidence=lambda *_: "cancelled")["A"]
+        self.assertEqual(
+            (write["attempts"][0]["outcome"], write["state"], write["retry_allowed"]),
+            ("cancelled", "cancelled", False),
+        )
+        with self.assertRaises(PresetWriteRefused):
+            admit(write, A, None)
+        # Never proof that it sent nothing: a replacement over a stopped
+        # write keeps its acknowledgment.
+        replaced = fold(
+            [
+                *exhausted(),
+                {**acknowledging("d", X, W, flags=5), "session_id": "s", "sequence": 9},
+            ],
+            evidence=lambda *_: "cancelled",
+        )["A"]
+        self.assertEqual((replaced["write_id"], replaced["state"]), (X, "cancelled"))
+
     def test_anything_unexpected_fails_closed(self):
         for rows in (
             [{"kind": STARTED, "at": "t", "data": "{"}],
@@ -527,6 +595,18 @@ class EvidenceTests(unittest.TestCase):
         ):
             with self.subTest(rows=rows):
                 self.assertNotEqual(attempt_evidence(evidence(*rows)), "saved")
+
+    def test_a_supersession_asks_only_whether_a_preset_byte_was_sent(self):
+        for rows, proof in (
+            ([*EXCLUDED, CANCELLED], "unsent"),
+            ([CANCELLED], "unsent"),
+            ([intent(), CANCELLED], "sent"),
+            ([intent(), chunk("aabb"), failed(), CANCELLED], "sent"),
+            ([intent(), chunk("aabb"), chunk("ccdd"), packet(), CANCELLED], "saved"),
+        ):
+            with self.subTest(rows=rows):
+                self.assertEqual(attempt_evidence(evidence(*rows), False), proof)
+        self.assertEqual(attempt_evidence(evidence(*EXCLUDED, CANCELLED)), "cancelled")
 
     def test_no_committed_preset_intent_proves_nothing_was_sent(self):
         for rows in ([], [packet()], [intent(8022, FRAME), chunk(FRAME)]):

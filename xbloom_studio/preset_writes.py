@@ -29,8 +29,10 @@ stops repetition, cancelled or interrupted with proof that no preset frame
 was sent. A different write over a saved one lapses the same way while all of
 its attempts were refused, so the saved write still blocks an identical
 replay. Before its first frame for a slot, a batch write records
-``superseded`` for that slot's write. Outcomes are machine evidence, never a
-readback of stored contents.
+``superseded`` for that slot's write; it lapses while that batch's session
+proves no byte of any preset frame was written from there on, so the write
+stays in force. Outcomes are machine evidence, never a readback of stored
+contents.
 """
 
 from __future__ import annotations
@@ -114,8 +116,9 @@ SAVE_PACKET = {
     "marker": 0xC1,
     "payload_hex": "25000000",
 }
-# What an attempt's session proves: "saved", "cancelled", "sent" or "unsent".
-Evidence = Callable[[str, int], str]
+# What a session proves after a record: "saved", "cancelled", "sent" or
+# "unsent"; with a third argument False, a cancellation is not reported.
+Evidence = Callable[..., str]
 
 
 class PresetWriteRefused(ConflictError):
@@ -149,7 +152,9 @@ def _saves(frames: FrameBuffer, chunk: str) -> bool:
     )
 
 
-def attempt_evidence(rows: Iterable[Mapping[str, Any]]) -> str:
+def attempt_evidence(
+    rows: Iterable[Mapping[str, Any]], cancellation: bool = True
+) -> str:
     """What committed session rows prove about one attempt.
 
     ``rows`` are one session's :data:`EVIDENCE_KINDS` rows after an attempt's
@@ -176,7 +181,9 @@ def attempt_evidence(rows: Iterable[Mapping[str, Any]]) -> str:
     frame's committed intent is followed by explicit proof that none of its
     bytes was written (its first chunk observed, withheld at once and the
     write failed, all emitted synchronously) and no row was lost. A bare
-    intent stays ambiguous: ``"sent"``.
+    intent stays ambiguous: ``"sent"``. Without ``cancellation`` a
+    cancellation is not reported, for a batch's :data:`SUPERSEDED` record:
+    what matters there is only whether a preset byte could be written.
     """
     frame: str | None = None
     sent = ""
@@ -262,7 +269,7 @@ def attempt_evidence(rows: Iterable[Mapping[str, Any]]) -> str:
         elif kind == "ble.incoming_chunk" and _saves(frames, data["hex"]):
             if transmitted:
                 return "saved"
-    if cancelled:
+    if cancelled and cancellation:
         return "cancelled"
     if proof is not None:
         ambiguous = True
@@ -281,7 +288,11 @@ def _outcome(
         if recorded not in SAVED and evidence is not None:
             proof = evidence(attempt["session_id"], attempt["sequence"])
         if recorded is None:
-            derived = "saved_interrupted" if proof == "saved" else "interrupted"
+            # Its own command's committed cancellation stops repetition even
+            # when its outcome never committed.
+            derived = {"saved": "saved_interrupted", "cancelled": "cancelled"}.get(
+                proof, "interrupted"
+            )
         elif proof == "saved":
             # A save takes precedence over any other recorded outcome.
             derived = "saved_late"
@@ -309,9 +320,34 @@ def _unsent(
     )
 
 
-def _state(write: dict[str, Any], outcomes: list[str]) -> str:
+def _superseded(write: dict[str, Any], evidence: Evidence | None) -> bool:
+    """Whether a batch may have changed the write's slot.
+
+    Each :data:`SUPERSEDED` record committed before the batch's first frame
+    for the slot, and its session's committed intents decide it: it lapses
+    only on proof that no byte of any later preset frame was written there,
+    explicitly withheld or never intended (an intent commits before any of
+    its bytes). Anything ambiguous keeps it.
+    """
+    for record in write["superseded"]:
+        if "unsent" not in record:
+            record["unsent"] = (
+                evidence is not None
+                and record["session_id"] is not None
+                and record["sequence"] is not None
+                and evidence(record["session_id"], record["sequence"], False)
+                == "unsent"
+            )
+        if not record["unsent"]:
+            return True
+    return False
+
+
+def _state(
+    write: dict[str, Any], outcomes: list[str], evidence: Evidence | None
+) -> str:
     counted = [outcome for outcome in outcomes if outcome != "refused"]
-    if write["superseded"]:
+    if _superseded(write, evidence):
         return "superseded"
     if SAVED & set(counted):
         return "saved"
@@ -363,7 +399,7 @@ def _summary(
         for attempt in write["attempts"]
     ]
     outcomes = [attempt["outcome"] for attempt in attempts]
-    state = _state(write, outcomes)
+    state = _state(write, outcomes, evidence)
     used = sum(outcome != "refused" for outcome in outcomes)
     remaining = MAX_ATTEMPTS - used if state in ("retryable", "not_sent") else 0
     preset = {key: write[key] for key in ("slot", "payload_hex", "flags")}
@@ -467,7 +503,8 @@ def fold(
                     write = writes[slot] = {
                         "write_id": write_id,
                         **preset,
-                        "superseded": False,
+                        # SUPERSEDED records, decided from their evidence.
+                        "superseded": [],
                         # A saved write stays in force under a different
                         # one that only ever refused, so it still blocks an
                         # identical replay.
@@ -505,7 +542,12 @@ def fold(
                 attempt["transmitted_write_count"] = data.get("transmitted_write_count")
                 attempt["partial_frame"] = data.get("partial_frame")
             elif row["kind"] == SUPERSEDED:
-                write["superseded"] = True
+                write["superseded"].append(
+                    {
+                        "session_id": row.get("session_id"),
+                        "sequence": row.get("sequence"),
+                    }
+                )
             else:
                 raise ValueError("unknown record")
     except (ValueError, KeyError, TypeError, StopIteration) as exc:

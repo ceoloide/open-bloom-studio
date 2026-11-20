@@ -102,7 +102,8 @@ write to that slot, or any write after a cancellation or the last attempt,
 waits for an explicit `acknowledge_incomplete` with the reported write ID.
 A batch write (`write_presets`) is never repeated, is refused while a target
 slot has an incomplete single-slot write, and marks each slot's recorded write
-superseded before its first frame for that slot.
+superseded before its first frame for that slot; the mark lapses when that
+frame provably sent no byte.
 `xbloom-studio machine preset-writes --slot A` shows the recorded write without
 connecting. A save event is not a readback of the stored preset.
 

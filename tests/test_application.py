@@ -1574,6 +1574,109 @@ class PresetRetryTests(ServiceCase):
         states = [w["state"] for w in self.service.preset_writes()["writes"]]
         self.assertEqual(states, ["superseded", "saved", "saved"])
 
+    def motion_at_preset_intent(self, number):
+        """Report grinding while the batch's ``number``-th preset intent commits."""
+        intents = []
+        motion = self.on_loop(lambda: self.machine.state(0x22))
+
+        def hook(kind, data):
+            if kind == "command.intent" and data["command"] == 11510:
+                intents.append(kind)
+                if len(intents) == number:
+                    motion()
+
+        return intents, self.on_append(hook)
+
+    def session_tail(self, kind):
+        """The current session's transcript rows after its last ``kind`` row."""
+        rows = [
+            e["kind"]
+            for e in self.store.events(limit=10000)
+            if e["session_id"] == self.service.recorder.session_id
+            and e["kind"] not in ("ble.incoming_chunk", "ble.packet")
+        ]
+        return rows[len(rows) - rows[::-1].index(kind) :]
+
+    async def test_motion_while_a_batchs_first_intent_commits_keeps_saved_writes(
+        self,
+    ):
+        for slot in "AB":
+            await self.write({**A, "slot": slot})
+            await self.service.disconnect()
+        frames = self.frames()
+        intents, hook = self.motion_at_preset_intent(1)
+        with hook:
+            result = await self.batch("A", "B", "C")
+        self.assertEqual(intents, ["command.intent"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["details"]["transmitted_write_count"], 0)
+        self.assertEqual(self.frames(), frames)
+        # Committed before the frame, whose guard then withheld its first chunk.
+        self.assertEqual(
+            self.session_tail("preset_write.superseded")[:4],
+            [
+                "command.intent",
+                "ble.outgoing_chunk",
+                "ble.outgoing_chunk_withheld",
+                "command.write_failed",
+            ],
+        )
+        for restart in (False, True):
+            if restart:
+                await self.service.close()
+                self.service = self.make(self.machine)
+            with self.subTest(restart=restart):
+                writes = self.service.preset_writes()["writes"]
+                self.assertEqual(
+                    [(w["preset"]["slot"], w["state"]) for w in writes],
+                    [("A", "saved"), ("B", "saved")],
+                )
+                for slot in "AB":
+                    with self.assertRaises(PresetWriteRefused):
+                        await self.write({**A, "slot": slot})
+        self.assertEqual(self.frames(), frames)
+
+    async def test_motion_before_a_batchs_second_frame_keeps_only_that_slot(self):
+        for slot in "ABC":
+            await self.write({**A, "slot": slot})
+            await self.service.disconnect()
+        frames = self.frames()
+        intents, hook = self.motion_at_preset_intent(2)
+        with hook:
+            result = await self.batch("A", "B", "C")
+        self.assertEqual(len(intents), 2)
+        self.assertEqual(result["details"]["transmitted_write_count"], 1)
+        self.assertEqual(self.frames(), frames + 1)
+        await self.service.close()
+        self.service = self.make(self.machine)
+        # A's frame was sent; B's was withheld; C was never at risk.
+        states = [w["state"] for w in self.service.preset_writes()["writes"]]
+        self.assertEqual(states, ["superseded", "saved", "saved"])
+        with self.assertRaises(PresetWriteRefused):
+            await self.write({**A, "slot": "B"})
+        result = await self.write()
+        self.assertEqual(result["attempt"]["state"], "saved")
+
+    async def test_a_batch_stopped_after_its_bare_intent_stays_superseded(self):
+        await self.write()
+        await self.service.disconnect()
+        crashed = []
+
+        def bare(kind, data):
+            if crashed:
+                return False
+            if kind == "command.intent" and data["command"] == 11510:
+                crashed.append(kind)  # Nothing after the intent commits.
+            return None
+
+        with self.on_append(bare):
+            await self.batch("A", "B", "C")
+        await self.service.close()
+        self.service = self.make(self.machine)
+        self.assertEqual(self.latest()["state"], "superseded")
+        result = await self.write()
+        self.assertEqual(result["attempt"]["state"], "saved")
+
     async def test_a_batch_never_overwrites_an_unresolved_write(self):
         self.machine.studio.reject_preset_attempts = 1
         await self.write()
@@ -2402,6 +2505,61 @@ class PresetRetryTests(ServiceCase):
             await self.service.close()
         self.service = self.make(self.machine)
         self.assertEqual(self.latest()["state"], "not_sent")
+
+    async def test_a_cancellation_while_a_start_is_unverified_stays_cancelled(self):
+        append, loop, started = self.store.append, asyncio.get_running_loop(), []
+        tasks: list[asyncio.Task] = []
+
+        def verify_fails(attempt_id):
+            # The caller cancels while the commit is checked; the check fails.
+            loop.call_soon_threadsafe(tasks[-1].cancel)
+            threading.Event().wait(0.05)
+            raise sqlite3.OperationalError("transient")
+
+        # An unverifiable start that never committed first, then one that did.
+        for commit in (False, True):
+
+            def append_reports_failure(kind, data, commit=commit, **context):
+                if kind != STARTED:
+                    return append(kind, data, **context)
+                started.append(data["attempt_id"])
+                if commit:
+                    append(kind, data, **context)
+                raise sqlite3.OperationalError("disk I/O error")
+
+            with self.subTest(committed=commit):
+                with (
+                    patch.object(self.store, "append", append_reports_failure),
+                    patch.object(self.service, "_started_committed", verify_fails),
+                ):
+                    tasks.append(asyncio.create_task(self.write()))
+                    with self.assertRaises(asyncio.CancelledError):
+                        await tasks[-1]
+                attempt_id = started[-1]
+                # Its command's cancellation is durable; no outcome is.
+                self.assertEqual(self.records(FINISHED, attempt_id), [])
+                failed = [
+                    e["data"]
+                    for e in self.store.events(limit=10000)
+                    if e["kind"] == "machine.command_failed"
+                ]
+                self.assertEqual(failed[-1]["type"], "CancelledError")
+                self.assertEqual(self.started_ids(), started[1:])
+                with contextlib.suppress(RuntimeError):
+                    await self.service.close()
+                self.service = self.make(self.machine)
+                writes = self.service.preset_writes()["writes"]
+                if not commit:
+                    self.assertEqual(writes, [])
+                    continue
+                [write] = writes
+                self.assertEqual(
+                    [write["state"], write["attempts"][-1]["outcome"]],
+                    ["cancelled", "cancelled"],
+                )
+                with self.assertRaises(PresetWriteRefused):
+                    await self.write()
+        self.assertEqual(self.frames(), 0)
 
 
 if __name__ == "__main__":

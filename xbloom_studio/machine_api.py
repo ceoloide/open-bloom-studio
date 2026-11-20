@@ -455,12 +455,14 @@ class MachineCommandAPI:
         rows = self.store.preset_write_events(self.device)
         return fold(rows, self.preset_attempt, self._attempt_evidence)
 
-    def _attempt_evidence(self, session_id: str | None, sequence: int | None) -> str:
-        """What an unfinished attempt's own session committed after it began."""
+    def _attempt_evidence(
+        self, session_id: str | None, sequence: int | None, cancellation: bool = True
+    ) -> str:
+        """What a record's own session committed after it."""
         if session_id is None or sequence is None:
             return "sent"
         rows = self.store.session_events_after(session_id, sequence, EVIDENCE_KINDS)
-        return attempt_evidence(rows)
+        return attempt_evidence(rows, cancellation)
 
     def preset_writes(self, slot: str | None = None) -> dict[str, Any]:
         """The latest recorded single-slot write per slot; never connects.
