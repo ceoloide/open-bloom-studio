@@ -106,9 +106,10 @@ def command_capabilities() -> dict[str, Any]:
         "preset_backup": "Service-generated private file; caller supplies previous "
         "contents, never machine readback.",
         "prepared_recipe": "Single native coffee/tea step; session-local single-use "
-        "token, no automatic expiry or retry. Upload needs allow_untested unless "
-        "the machine_prepare preview reports upload_requires_untested=false; a "
-        "direct operation_start keeps requires_untested.",
+        "token, no automatic expiry or retry. For a plan that can be uploaded, "
+        "upload needs allow_untested unless the machine_prepare preview reports "
+        "upload_requires_untested=false; that upload then needs the preview's "
+        "expected_recipe_sha256. A direct operation_start keeps requires_untested.",
         "native_stage_advance": False,
         "calibration_exposed": False,
         "grinder_upload": {
@@ -383,10 +384,18 @@ class MachineCommandAPI:
             untested = upload_requires_untested(plan)
             if untested and not allow_untested:
                 raise ValueError("Recipe requires allow_untested")
+            validated = plan["requires_untested"] and not untested
+            # Without the opt-in, that exemption holds only for the reviewed
+            # preview: its digest pins the exact content before any connection.
+            if validated and not allow_untested and expected_recipe_sha256 is None:
+                raise ValueError(
+                    "A validated prepared coffee upload without experimental "
+                    "opt-in needs expected_recipe_sha256 from its machine_prepare "
+                    "preview; nothing was sent"
+                )
             plan.pop("resolved_request", None)
             step = plan["execution"][0]
             encoded = encoded_step(step)
-            validated = plan["requires_untested"] and not untested
             await self._connect(allow_untested)
             recorder, session = self._recorder, self._session
             recorder.emit("recipe.upload_requested", {"request": request, "plan": plan})

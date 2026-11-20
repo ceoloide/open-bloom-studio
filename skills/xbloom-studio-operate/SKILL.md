@@ -102,15 +102,20 @@ token without proving preparation was cancelled, and a token is not a readback
 of the stored recipe.
 
 The preview carries two separate flags. `requires_untested` governs a direct
-`operation_start` of that request. `upload_requires_untested` governs
-`recipe_upload`: it is `false` only for the hardware-validated route, a
-structured coffee recipe (fresh or an exact repeat) for the xDripper with
-grinding, no bypass, no vibration, numeric pour temperatures and pours of at
-most 127 ml. For that route, upload with `allow_control=true` and the preview
-digest, without `allow_untested`, then use `recipe_start_uploaded`. Starting
-the same recipe directly with `operation_start` still needs
-`allow_untested=true`. If the preview has no `upload_requires_untested` field,
-the daemon is older: follow `requires_untested` for the upload too.
+`operation_start` of that request. `upload_requires_untested` is only the
+opt-in check for a plan that `recipe_upload` otherwise accepts (exactly one
+native coffee or tea step); it does not mean the plan can be uploaded. For an
+experimental plan it is `false` only on the hardware-validated route: a
+structured coffee recipe (fresh or an exact repeat) for the xDripper with the
+grind-size upload selected (command 8001, which does not by itself establish
+grinding), no bypass, no vibration, numeric pour temperatures and pours of 1
+to 127 ml. For that route, upload with `allow_control=true` and the preview's
+digest as `expected_recipe_sha256`, without `allow_untested`, then use
+`recipe_start_uploaded`. Without that digest, or with a changed one, the
+upload is refused before anything is sent. Starting the same recipe directly
+with `operation_start` still needs `allow_untested=true`. If the preview has
+no `upload_requires_untested` field, the daemon is older: follow
+`requires_untested` for the upload too.
 
 ## Settings and scale
 

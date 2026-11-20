@@ -14,9 +14,11 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest import mock
 
 from tests.machine import Machine, interaction
-from xbloom_studio import EncodedRecipe
+from xbloom_studio import EncodedRecipe, encode_coffee_recipe
+from xbloom_studio import recipes as recipes_module
 from xbloom_studio.application import MachineService
 from xbloom_studio.control import Interaction
 from xbloom_studio.facade import Application
@@ -39,6 +41,7 @@ FAST = {
     "write_timeout": 3,
 }
 COFFEE_V1 = "studio-coffee-android-2.2.3-v1"
+COFFEE_V2 = "studio-coffee-android-2.2.3-v2"
 VALIDATED_LIMITS = (90, 110)
 
 
@@ -63,6 +66,10 @@ def coffee(pours=None, **changes):
 
 def request(document):
     return {"kind": "recipe", "document": document}
+
+
+def digest(document):
+    return compile_recipe(document)["recipe_sha256"]
 
 
 # 18            body length (24)
@@ -99,6 +106,7 @@ def excluded():
         ),
         "vibration after": coffee([*named[:2], {**named[2], "vibration_after": True}]),
         "fragmented pour": coffee(big),
+        "zero-volume pour": coffee([{"volume_ml": 0, "temperature": 91}, *named]),
     }
 
 
@@ -179,6 +187,24 @@ class PredicateTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertTrue(upload_requires_untested(plan))
 
+    def test_a_new_current_encoder_does_not_inherit_the_exemption(self):
+        self.assertEqual(recipes_module.VALIDATED_COFFEE_ENCODER_VERSION, COFFEE_V2)
+        future = "studio-coffee-android-9.9.9-v3"
+        with (
+            mock.patch.dict(
+                recipes_module.COFFEE_ENCODERS, {future: encode_coffee_recipe}
+            ),
+            mock.patch.dict(recipes_module.COFFEE_LIMITATIONS, {future: "Future."}),
+            mock.patch.object(recipes_module, "COFFEE_ENCODER_VERSION", future),
+        ):
+            later = _compile_recipe(coffee(), coffee_encoder_version=future)
+            self.assertEqual(later["encoder_version"], future)
+            self.assertEqual(later["execution"], compile_recipe(coffee())["execution"])
+            self.assertTrue(upload_requires_untested(later))
+            # Plans recorded by the observed encoder keep their exemption.
+            observed = _compile_recipe(coffee(), coffee_encoder_version=COFFEE_V2)
+            self.assertFalse(upload_requires_untested(observed))
+
     def test_plans_that_never_needed_opt_in_are_unchanged(self):
         plain = compile_recipe(
             {
@@ -245,7 +271,9 @@ class PreparedRouteTests(ServiceCase):
         )
 
     async def test_upload_without_opt_in_sends_the_canonical_sequence_once(self):
-        prepared = await self.service.upload(request(coffee()), True)
+        prepared = await self.service.upload(
+            request(coffee()), True, expected_recipe_sha256=digest(coffee())
+        )
         self.assertFalse(self.service.session.allow_untested)
         self.assertFalse(prepared["readback_verified"])
         self.assertEqual(self.sent(), CANONICAL_SEQUENCE)
@@ -298,7 +326,9 @@ class PreparedRouteTests(ServiceCase):
         self.assertEqual(self.machine.calls, [])
 
     async def test_repeat_reuses_the_saved_plan_through_validated_admission(self):
-        prepared = await self.service.upload(request(coffee()), True)
+        prepared = await self.service.upload(
+            request(coffee()), True, expected_recipe_sha256=digest(coffee())
+        )
         first = await self.service.start_uploaded(prepared["token"], "one", True)
         original = await self.finish()
         repeat = {"kind": "repeat", "operation_id": first["id"]}
@@ -306,12 +336,70 @@ class PreparedRouteTests(ServiceCase):
         self.assertIs(preview["upload_requires_untested"], False)
         with self.assertRaisesRegex(ValueError, "allow_untested"):
             await self.service.start(repeat, "direct-repeat", True)
-        again = await self.service.upload(repeat, True)
+        with self.assertRaisesRegex(ValueError, "expected_recipe_sha256"):
+            await self.service.upload(repeat, True)
+        again = await self.service.upload(
+            repeat, True, expected_recipe_sha256=preview["recipe_sha256"]
+        )
         await self.service.start_uploaded(again["token"], "two", True)
         repeated = await self.finish()
         self.assertEqual(dumps(repeated["plan"]), dumps(original["plan"]))
         self.assertEqual(self.sent(), CANONICAL_SEQUENCE * 2)
         self.assertEqual(self.machine.codes().count(8002), 2)
+
+    async def test_promoted_upload_needs_the_preview_digest_before_connecting(self):
+        saved = self.store.create_recipe(coffee())
+        brewed = compile_recipe(coffee())
+        op, _ = self.store.create_operation(
+            "00:00:5E:00:53:01", {"kind": "recipe"}, brewed, "retained"
+        )
+        requests = {
+            "inline": request(coffee()),
+            "saved": {"kind": "recipe", "reference": saved["id"], "revision": None},
+            "retained repeat": {"kind": "repeat", "operation_id": op["id"]},
+        }
+        for name, req in requests.items():
+            with self.subTest(name):
+                with self.assertRaisesRegex(ValueError, "expected_recipe_sha256"):
+                    await self.service.upload(req, True)
+                for allow_untested in (False, True):
+                    with self.assertRaises(ConflictError):
+                        await self.service.upload(
+                            req,
+                            True,
+                            allow_untested=allow_untested,
+                            expected_recipe_sha256="0" * 64,
+                        )
+        # Nothing connected, wrote or was recorded before any refusal.
+        self.assertEqual(self.machine.calls, [])
+        self.assertIsNone(self.service.session)
+        self.assertEqual(
+            [e["kind"] for e in self.store.events()], ["operation.accepted"]
+        )
+        self.assertEqual(len(self.store.history()), 1)
+
+    async def test_older_clients_and_standard_uploads_may_omit_the_digest(self):
+        # A standard upload never needed a digest.
+        plain = {"name": "N", "mode": "native", "native": {"payload_hex": "01"}}
+        plain["native"]["dose_g"] = 9
+        prepared = await self.service.upload(request(plain), True)
+        await self.service.cancel_uploaded(prepared["token"], True)
+        await self.service.disconnect()
+        # A client unaware of the upload flag passes the explicit opt-in.
+        first = await self.service.upload(request(coffee()), True, allow_untested=True)
+        self.assertTrue(self.service.session.allow_untested)
+        standard = [(8102, struct.pack("<ffI", 0, 0, 9)), (8004, b"\x01")]
+        self.assertEqual(self.sent(), standard + CANONICAL_SEQUENCE)
+        started = await self.service.start_uploaded(first["token"], "old", True)
+        await self.finish()
+        retained = {"kind": "repeat", "operation_id": started["id"]}
+        again = await self.service.upload(retained, True, allow_untested=True)
+        await self.service.cancel_uploaded(again["token"], True)
+        excluded_variant = request(excluded()["bypass"])
+        other = await self.service.upload(excluded_variant, True, allow_untested=True)
+        await self.service.cancel_uploaded(other["token"], True)
+        self.assertEqual(self.sent()[:8], standard + CANONICAL_SEQUENCE * 2)
+        self.assertEqual(self.machine.codes().count(8002), 1)
 
     async def test_legacy_retained_plan_keeps_the_opt_in(self):
         plan = _compile_recipe(coffee(), coffee_encoder_version=COFFEE_V1)

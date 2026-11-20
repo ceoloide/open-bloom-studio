@@ -144,22 +144,33 @@ recipe revisions, aliases and every attempt with its exact plan, so a repeat
 reuses the stored plan byte for byte.
 
 Structured coffee and tea recipes are experimental on hardware. One upload
-route is validated: a structured coffee recipe for the xDripper with grinding
-enabled, no bypass, no vibration, numeric pour temperatures and pours of at
-most 127 ml each, uploaded with
-`xbloom-studio machine upload ID --allow-control --expected-recipe-sha256 DIGEST`
-and then started with
+route is validated: a structured coffee recipe for the xDripper with the
+grind-size upload selected (`grinder_enabled` or `set_grinder_size` true,
+sent as command 8001; the option selects that upload and does not by itself
+establish that the machine grinds), no bypass, no vibration, numeric pour
+temperatures and pours of 1 to 127 ml each. Its evidence is one observed brew
+(15 g, 240 ml at 91 C and 3 ml/s): the pinned upload succeeded, one start
+command ran it, and the machine returned to idle.
+
+Preview the request first: `machine_prepare` over MCP, or
+`xbloom-studio call machine_prepare --params FILE` with a JSON file holding
+`{"request": ...}`. The preview's `upload_requires_untested` is
+the opt-in check for a plan that the upload otherwise accepts (exactly one
+native coffee or tea step); it does not say that a plan can be uploaded. When
+it is `false` for an experimental plan, upload with `--allow-control` and the
+preview's digest, without `--allow-untested`:
+`xbloom-studio machine upload ID --allow-control --expected-recipe-sha256 DIGEST`,
+then
 `xbloom-studio machine start-uploaded TOKEN --key KEY --allow-control --wait`.
-Its evidence is one observed brew (15 g, 240 ml at 91 C
-and 3 ml/s): the pinned upload succeeded, one start command ran it, and the
-machine returned to idle. A preview (`machine_prepare`) reports this as
-`upload_requires_untested: false`; such an upload needs `--allow-control` but
-not `--allow-untested`, and a repeat of that brew uploads the same way. The
-plan's own `requires_untested` is unchanged and still governs a direct start
-(`brew`, `history repeat`, `operation_start`), which keeps needing
-`--allow-untested`. Every other recipe, including opaque `native` bytes with
-the same settings, keeps its opt-in. A daemon that predates this omits
-`upload_requires_untested`; then follow `requires_untested`.
+That upload is refused before any connection if the digest is missing or no
+longer matches; a repeat of that brew uploads the same way. Passing
+`--allow-untested` explicitly keeps the earlier rules, where the digest is
+optional. The plan's own `requires_untested` is unchanged and still governs
+a direct start (`brew`, `history repeat`, `operation_start`), which keeps
+needing `--allow-untested`. Every other recipe, including opaque `native`
+bytes with the same settings, keeps its opt-in. A daemon that predates this
+omits `upload_requires_untested` and requires the opt-in for this upload too:
+follow `requires_untested`.
 
 The bundled starter recipes, coffee examples and tea profiles are original to
 this project. Recipe imports are user-directed: one public recipe page at a

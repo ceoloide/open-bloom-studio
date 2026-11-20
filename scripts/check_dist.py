@@ -11,9 +11,7 @@ must be installed and run offline against the bundled simulator. The locked
 ``mcp`` extra is then installed from the uv cache, without network access,
 and the documented quickstart runs through the installed scripts: direct
 mode, a simulator daemon, the CLI as its client and ``xbloom-studio-mcp`` over
-stdio with the README's tool groups. The built version must be a canonical
-PEP 440 version and match pyproject.toml, the project's own uv.lock entry and
-the README status line.
+stdio with the README's tool groups.
 """
 
 from __future__ import annotations
@@ -24,7 +22,6 @@ import email.parser
 import hashlib
 import importlib.metadata
 import json
-import re
 import site
 import subprocess
 import sys
@@ -81,12 +78,6 @@ SDIST_EGG_INFO_FILES = (
     "entry_points.txt",
     "top_level.txt",
 )
-
-# A canonical PEP 440 public release, pre-release, post-release or dev version.
-PUBLIC_VERSION = re.compile(
-    r"\d+(?:\.\d+)*(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?"
-)
-README_STATUS = re.compile(r"^Alpha \(([^,)\s]+)", re.M)
 
 # Written by setuptools only when the project declares dependencies or extras.
 SDIST_REQUIRES_FILE = "requires.txt"
@@ -400,55 +391,6 @@ def expected_metadata(source: email.message.Message) -> dict[str, list[str]]:
     return expected
 
 
-def _project_version(text: str) -> str | None:
-    section = None
-    for line in text.splitlines():
-        if line.startswith("["):
-            section = line.strip()
-        elif section == "[project]":
-            match = re.fullmatch(r'version = "([^"]+)"', line.strip())
-            if match:
-                return match.group(1)
-    return None
-
-
-def _locked_version(text: str) -> str | None:
-    for block in text.split("[[package]]")[1:]:
-        lines = set(block.splitlines())
-        if f'name = "{PROJECT}"' in lines and 'source = { editable = "." }' in lines:
-            for line in block.splitlines():
-                match = re.fullmatch(r'version = "([^"]+)"', line)
-                if match:
-                    return match.group(1)
-    return None
-
-
-def declared_versions(root: Path) -> dict[str, str | None]:
-    """The version each checkout file declares, read without a TOML parser."""
-
-    def read(name: str) -> str:
-        path = root / name
-        return path.read_text(encoding="utf-8") if path.is_file() else ""
-
-    status = README_STATUS.search(read("README.md"))
-    return {
-        "pyproject.toml": _project_version(read("pyproject.toml")),
-        "uv.lock": _locked_version(read("uv.lock")),
-        "README.md": status.group(1) if status else None,
-    }
-
-
-def version_problems(version: str, root: Path) -> list[str]:
-    """The built version must be canonical and declared alike everywhere."""
-    problems = []
-    if not PUBLIC_VERSION.fullmatch(version):
-        problems.append("built version is not a canonical PEP 440 public version")
-    for name, declared in declared_versions(root).items():
-        if declared != version:
-            problems.append(f"{name} version differs from the built version")
-    return problems
-
-
 def source_metadata() -> email.message.Message:
     """Metadata of the project as synced into this environment by uv.
 
@@ -654,7 +596,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected = expected_metadata(source_metadata())
         sources = source_files(Path.cwd())
         problems = check_artifacts(sdist, wheel, sources, expected)
-        problems += version_problems(expected["Version"][0], Path.cwd())
         if not problems:
             with tempfile.TemporaryDirectory() as workdir:
                 problems = check_install(

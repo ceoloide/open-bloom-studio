@@ -65,6 +65,9 @@ COFFEE_ENCODERS: dict[str, Callable[[dict[str, Any]], EncodedRecipe]] = {
     COFFEE_ENCODER_VERSION: encode_coffee_recipe,
     LEGACY_COFFEE_ENCODER_VERSION: _encode_coffee_recipe_v1,
 }
+# The coffee encoder identifier of the hardware-observed prepared upload. It
+# is a stable recorded name, deliberately not COFFEE_ENCODER_VERSION.
+VALIDATED_COFFEE_ENCODER_VERSION = "studio-coffee-android-2.2.3-v2"
 TEA_ENCODERS: dict[str, Callable[[dict[str, Any]], EncodedTeaRecipe]] = {
     TEA_ENCODER_VERSION: encode_tea_recipe,
     LEGACY_TEA_ENCODER_VERSION: _encode_tea_recipe_v1,
@@ -193,13 +196,18 @@ def validate_retained_plan(plan: dict[str, Any]) -> None:
 def upload_requires_untested(plan: object) -> bool:
     """Whether uploading a resolved plan still needs experimental opt-in.
 
-    Pure and never persisted; a plan's own ``requires_untested`` keeps
-    governing a direct start. One upload profile was observed on hardware: a
-    structured coffee plan from the current encoder, still reproduced by it,
-    for the xDripper reference cup limits, with the grind-size upload, no
-    bypass, no vibration, numeric pour temperatures and pours of at most one
-    payload record. Every other plan keeps its recorded requirement, and a
-    malformed plan requires opt-in.
+    This is only the opt-in check for a plan that recipe_upload otherwise
+    accepts (exactly one native coffee or tea step); it does not say whether a
+    plan can be uploaded. Pure and never persisted; a plan's own
+    ``requires_untested`` keeps governing a direct start.
+
+    One upload profile was observed on hardware: a structured coffee plan
+    from the ``VALIDATED_COFFEE_ENCODER_VERSION`` encoder, still reproduced by
+    it, for the xDripper reference cup limits, with the grind-size upload
+    selected (command 8001), no bypass, no vibration, numeric pour
+    temperatures and pours of 1..127 ml, each a single payload record. Every
+    other plan keeps its recorded requirement, and a malformed plan requires
+    opt-in.
     """
     if not isinstance(plan, dict):
         return True
@@ -209,11 +217,13 @@ def upload_requires_untested(plan: object) -> bool:
 
 
 def _validated_prepared_coffee(plan: dict[str, Any]) -> bool:
-    if plan.get("encoder_version") != COFFEE_ENCODER_VERSION:
+    # The observed identifier, not "the current encoder": a later encoder
+    # never inherits this exemption without its own hardware evidence.
+    if plan.get("encoder_version") != VALIDATED_COFFEE_ENCODER_VERSION:
         return False
     try:
         # A freshly compiled plan passes trivially; a retained one must still
-        # be what the current encoder produces, byte for byte.
+        # be what its recorded encoder produces, byte for byte.
         validate_retained_plan(plan)
     except ValueError:
         return False
@@ -233,7 +243,7 @@ def _validated_prepared_coffee(plan: dict[str, Any]) -> bool:
         and step["bypass_ml"] == 0
         and all(
             not isinstance(pour["temperature"], str)
-            and pour["volume_ml"] <= MAX_POUR_FRAGMENT_ML
+            and 1 <= pour["volume_ml"] <= MAX_POUR_FRAGMENT_ML
             and pour["vibration_before"] is False
             and pour["vibration_after"] is False
             for pour in content["pours"]

@@ -631,7 +631,9 @@ def _machine_tools(  # noqa: C901
         """Upload exactly one native coffee/tea step without starting. Pins the
         compiled plan/hash. Request uses the machine_prepare format. Pass
         allow_untested only when the preview's upload_requires_untested is true;
-        if a daemon omits that field, follow requires_untested. A session-local
+        when it is false for an experimental plan, expected_recipe_sha256 from
+        that preview is required and checked before connecting. If a daemon
+        omits the field, follow requires_untested. A session-local
         single-use token reserves the owner until start/cancel/disconnect; no
         automatic expiry. Physical controls may invalidate it. Does not prove
         recipe readback or advance physical prompts. Preview first.
@@ -690,8 +692,8 @@ def _machine_tools(  # noqa: C901
     async def machine_prepare(request: dict[str, Any]) -> dict[str, Any]:
         """Preview offline. Start the returned resolved_request when present to pin
         ID/revision. requires_untested governs operation_start;
-        upload_requires_untested governs recipe_upload (absent from older daemons:
-        follow requires_untested).
+        upload_requires_untested is the recipe_upload opt-in check for a plan it
+        otherwise accepts (absent from older daemons: follow requires_untested).
 
         Request examples: {"kind":"recipe","reference":"B","revision":1};
         {"kind":"recipe","document":{"name":"Pour","steps":[{"kind":"water",
