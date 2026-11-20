@@ -752,7 +752,8 @@ class PresetAttemptTests(Base):
         m.fail_commands[MODE] = ConnectionError("gone")
         result = await self.attempt(m)
         self.assertEqual(
-            (result["outcome"], result["transmitted_write_count"]), ("refused", 0)
+            (result["outcome"], result["transmitted_write_count"]),
+            ("no_preset_frame", 0),
         )
         self.assertNotIn(11510, m.codes())
 

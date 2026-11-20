@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import sqlite3
@@ -1590,11 +1591,12 @@ class PresetRetryTests(ServiceCase):
         for _ in range(3):
             exhausted = (await self.write())["attempt"]
             await self.service.disconnect()
-        self.machine.fail_commands[8022] = ConnectionError("lost before writing")
         other = {**A, "flags": 5}
-        result = await self.write(other, acknowledge_incomplete=exhausted["write_id"])
-        self.assertEqual(result["attempt"]["outcome"], "refused")
-        del self.machine.fail_commands[8022]
+        # Refused before preparation: the acknowledgment lapses.
+        await self.service.connect(allow_untested=True)
+        self.machine.state(0x44)
+        with self.assertRaises(BusyError):
+            await self.write(other, acknowledge_incomplete=exhausted["write_id"])
         await self.service.disconnect()
         write = self.latest()
         self.assertEqual(
@@ -1603,8 +1605,26 @@ class PresetRetryTests(ServiceCase):
         for preset in (other, A):
             with self.subTest(preset=preset), self.assertRaises(PresetWriteRefused):
                 await self.write(preset)
+        # Preparation that fails before any preset frame counts against the
+        # acknowledged write, so the acknowledgment cannot drive it forever.
+        self.machine.fail_commands[8022] = ConnectionError("lost before writing")
         result = await self.write(other, acknowledge_incomplete=exhausted["write_id"])
-        self.assertEqual(result["attempt"]["state"], "saved")
+        self.assertEqual(result["attempt"]["outcome"], "no_preset_frame")
+        del self.machine.fail_commands[8022]
+        await self.service.disconnect()
+        write = self.latest()
+        self.assertEqual(
+            [write[k] for k in ("preset", "state", "attempts_used")],
+            [other, "retryable", 1],
+        )
+        with self.assertRaises(PresetWriteRefused):
+            await self.write(other, acknowledge_incomplete=exhausted["write_id"])
+        with self.assertRaises(PresetWriteRefused):
+            await self.write(A)
+        result = await self.write(other)
+        self.assertEqual(
+            [result["attempt"][k] for k in ("state", "attempts_used")], ["saved", 2]
+        )
 
     def unconfirmed(self):
         # Every frame is acknowledged; no save arrives within the attempt.
@@ -2233,6 +2253,155 @@ class PresetRetryTests(ServiceCase):
         self.assertNotEqual(write["write_id"], exhausted["write_id"])
         self.assertEqual([write[k] for k in ("state", "preset")], ["retryable", other])
         self.assertEqual(write["attempts"][-1]["outcome"], "interrupted")
+
+    async def test_motion_while_the_first_preset_intent_commits_sends_no_frame(self):
+        # A repeat's first preset intent is waiting to commit when the machine
+        # reports grinding: the guard after the journal hook sends nothing.
+        self.machine.studio.reject_preset_attempts = 1
+        await self.write()
+        await self.service.disconnect()
+        frames, injected = self.frames(), []
+        motion = self.on_loop(lambda: self.machine.state(0x22))
+
+        def hook(kind, data):
+            if kind == "command.intent" and data["command"] == 11510 and not injected:
+                injected.append(True)
+                motion()
+
+        with self.on_append(hook):
+            result = await self.write()
+        self.assertEqual(injected, [True])
+        self.assertEqual(self.frames(), frames)
+        self.assertEqual(result["details"]["transmitted_write_count"], 0)
+        attempt = result["attempt"]
+        self.assertEqual(
+            [attempt[k] for k in ("outcome", "state", "attempts_used")],
+            ["no_preset_frame", "retryable", 2],
+        )
+
+    async def test_motion_after_the_first_preset_frame_stops_the_rest(self):
+        sent = []
+
+        def respond(packet):
+            sent.append(packet)
+            replies = self.machine.studio(packet)
+            # Its own in-progress state follows the first frame; then motion.
+            return [*replies, reply(8023, u32(0x43 if len(sent) == 1 else 0x22))]
+
+        self.machine.overrides[11510] = respond
+        result = await self.write(save_timeout=0.05)
+        self.assertEqual(self.frames(), 2)
+        self.assertEqual(result["details"]["transmitted_write_count"], 2)
+        self.assertEqual(result["attempt"]["outcome"], "unconfirmed")
+
+    async def test_the_attempts_own_in_progress_state_is_not_refused(self):
+        def respond(packet):
+            replies = self.machine.studio(packet)
+            # 0x43 follows a lone preset frame on hardware; never idle.
+            return replies if len(replies) > 1 else [*replies, reply(8023, u32(0x43))]
+
+        self.machine.overrides[11510] = respond
+        result = await self.write()
+        self.assertEqual(result["attempt"]["state"], "saved")
+        self.assertEqual(self.frames(), 3)
+
+    async def test_a_replacement_without_preset_bytes_keeps_a_saved_write(self):
+        await self.write()
+        await self.service.disconnect()
+        frames, other = self.frames(), {**A, "flags": 5}
+        # Refused before preparation: the saved write stays in force.
+        await self.service.connect(allow_untested=True)
+        self.machine.state(0x44)
+        with self.assertRaises(BusyError):
+            await self.write(other)
+        await self.service.disconnect()
+        write = self.latest()
+        self.assertEqual((write["preset"], write["state"]), (A, "saved"))
+        # Its preparation fails before any preset frame: the replacement
+        # counts, so neither the old contents nor a third set is admitted.
+        self.machine.fail_commands[11511] = ConnectionError("lost while preparing")
+        result = await self.write(other)
+        del self.machine.fail_commands[11511]
+        await self.service.disconnect()
+        attempt = result["attempt"]
+        self.assertEqual(
+            [attempt[k] for k in ("outcome", "state", "attempts_used", "preset")],
+            ["no_preset_frame", "retryable", 1, other],
+        )
+        for preset in (A, {**A, "flags": 6}):
+            with self.subTest(preset=preset), self.assertRaises(PresetWriteRefused):
+                await self.write(preset)
+        self.assertEqual(self.frames(), frames)
+
+    async def test_repeated_preparation_timeouts_use_up_the_attempts(self):
+        self.machine.overrides[11511] = lambda packet: []  # No acknowledgment.
+        for _ in range(3):
+            result = await self.write()
+            await self.service.disconnect()
+        attempt = result["attempt"]
+        self.assertEqual(
+            [attempt[k] for k in ("state", "attempts_used", "remaining_attempts")],
+            ["exhausted", 3, 0],
+        )
+        self.assertFalse(attempt["retry_allowed"])
+        self.assertEqual(
+            [a["outcome"] for a in attempt["attempts"]], ["no_preset_frame"] * 3
+        )
+        self.assertIn("No attempt sent a preset frame", attempt["next_step"])
+        with self.assertRaises(PresetWriteRefused):
+            await self.write()
+        self.assertEqual((self.frames(), self.machine.codes().count(11511)), (0, 3))
+
+    def started_ids(self):
+        return [
+            e["data"]["attempt_id"]
+            for e in self.store.events(limit=10000)
+            if e["kind"] == STARTED
+        ]
+
+    async def test_an_attempt_whose_start_never_committed_records_no_outcome(self):
+        failed = []
+
+        def hook(kind, data):
+            if kind == STARTED and not failed:
+                failed.append(data["attempt_id"])
+                raise sqlite3.OperationalError("disk I/O error")
+
+        with self.on_append(hook), self.assertRaisesRegex(RuntimeError, "Journal"):
+            await self.write()
+        self.assertEqual((self.frames(), self.started_ids()), (0, []))
+        self.assertEqual(self.records(FINISHED, failed[0]), [])
+        with contextlib.suppress(RuntimeError):
+            await self.service.close()
+        self.service = self.make(self.machine)
+        self.assertEqual(self.service.preset_writes()["writes"], [])
+        result = await self.write()
+        self.assertEqual(result["attempt"]["state"], "saved")
+
+    async def test_a_committed_start_is_settled_when_its_flush_fails(self):
+        append = self.store.append
+
+        def committed_then_fails(kind, data, **context):
+            row = append(kind, data, **context)
+            if kind == STARTED:
+                raise sqlite3.OperationalError("reported after commit")
+            return row
+
+        with (
+            patch.object(self.store, "append", committed_then_fails),
+            self.assertRaisesRegex(RuntimeError, "Journal"),
+        ):
+            await self.write()
+        [attempt_id] = self.started_ids()
+        self.assertEqual(
+            [r["data"]["outcome"] for r in self.records(FINISHED, attempt_id)],
+            ["refused"],
+        )
+        self.assertEqual(self.frames(), 0)
+        with contextlib.suppress(RuntimeError):
+            await self.service.close()
+        self.service = self.make(self.machine)
+        self.assertEqual(self.latest()["state"], "not_sent")
 
 
 if __name__ == "__main__":

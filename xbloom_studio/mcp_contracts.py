@@ -603,7 +603,11 @@ PresetWrite = model(
         "retryable, exhausted, cancelled, saved, not_sent, in_progress or "
         "superseded (a batch may have changed the slot since).",
     ),
-    attempts_used=(int, ..., "Attempts that may have sent a frame."),
+    attempts_used=(
+        int,
+        ...,
+        "Attempts that reached preparation, including no_preset_frame ones.",
+    ),
     max_attempts=(int, ..., "Attempt limit per machine and slot."),
     remaining_attempts=(int, ..., "Identical attempts still allowed."),
     retry_allowed=(bool, ..., "Whether the identical write may be resubmitted."),

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import uuid
 from collections.abc import Callable
 from contextlib import ExitStack, suppress
@@ -501,7 +502,7 @@ class MachineCommandAPI:
                 raise PresetWriteRefused(
                     "Repeating a preset write needs a current idle report from "
                     "this connection; nothing was sent. Check the machine, "
-                    "disconnect and resubmit.",
+                    "disconnect and resubmit without a separate connect.",
                     current,
                 )
         attempt = {
@@ -545,7 +546,10 @@ class MachineCommandAPI:
         so it ends automatic repetition (unless a save was observed) and the
         caller's ``CancelledError`` matches the ledger. With ``exc`` the
         caller then re-raises it, unless a late cancellation is raised here;
-        journal failures then stay suppressed.
+        journal failures then stay suppressed. Nothing is recorded for an
+        attempt whose ``started`` record is not shown committed: an outcome
+        without it would make the whole ledger unreadable, and its failed
+        flush preceded every frame.
         """
         recorder, late = self._recorder, False
         cancel_recorded = isinstance(exc, asyncio.CancelledError)
@@ -568,6 +572,34 @@ class MachineCommandAPI:
                 {"command": command, "type": "CancelledError", "error": "", **marker},
             )
 
+        # Queued rows, the attempt's start first, finish appending here.
+        committed = True
+        try:
+            await settle(recorder.flush())
+        except Exception:
+            committed = False
+            with suppress(Exception):
+                committed = await settle(
+                    asyncio.to_thread(self._started_committed, attempt["attempt_id"])
+                )
+        if not committed:
+            self.preset_attempt = None
+            end_capture()
+            recorder.emit(
+                "machine.command_failed",
+                {
+                    "command": command,
+                    "type": "CancelledError" if late else type(exc).__name__,
+                    "error": "" if exc is None else str(exc),
+                },
+            )
+            with suppress(Exception):
+                await settle(recorder.flush())
+            if late and not isinstance(exc, asyncio.CancelledError):
+                raise asyncio.CancelledError() from exc
+            if exc is None:
+                raise RuntimeError("Journal failed; the attempt was not recorded")
+            return None
         outcome = self._finish_preset_write(attempt, before, exc)
         summary: dict[str, Any] | None = None
         # The first terminal record says CLOSED is to follow it, so a restart
@@ -652,6 +684,13 @@ class MachineCommandAPI:
             **summary,
         }
         return result
+
+    def _started_committed(self, attempt_id: str) -> bool:
+        return any(
+            row["kind"] == STARTED
+            and json.loads(row["data"])["attempt_id"] == attempt_id
+            for row in self.store.preset_write_events(self.device or "")
+        )
 
     def _finish_preset_write(
         self, attempt: dict[str, Any], before: Any, exc: BaseException | None = None

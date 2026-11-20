@@ -611,7 +611,8 @@ def _machine_tools(  # noqa: C901
         {slot,payload_hex,flags} objects and optional caller-supplied backup
         objects; the service chooses private backup paths. A backup is not
         readback. write_preset is one attempt: its result's attempt field says
-        whether the identical write may be resubmitted after a disconnect.
+        whether the identical write may be resubmitted after a disconnect
+        (submit directly; it connects itself).
         Radius and vibration queries prepare the machine and return it home.
         Scale enter/tare/exit retains the connection.
         ACK confirms receipt, not physical effect or persistence.

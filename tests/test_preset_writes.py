@@ -127,6 +127,56 @@ class FoldTests(unittest.TestCase):
                     (X, "cancelled", False),
                 )
 
+    def test_a_saved_write_survives_a_replacement_that_only_refused(self):
+        saved = [started("a"), finished("a", "saved")]
+        other = {"flags": 5}
+        refused = saved + [started("b", X, **other), finished("b", "refused", X)]
+        write = fold(refused)["A"]
+        self.assertEqual((write["write_id"], write["state"]), (W, "saved"))
+        with self.assertRaisesRegex(PresetWriteRefused, "already observed"):
+            admit(write, A, None)
+        # Still in force across further refused replacements.
+        twice = refused + [started("c", "3" * 32), finished("c", "refused", "3" * 32)]
+        self.assertEqual(fold(twice)["A"]["write_id"], W)
+        # Preparation without a preset frame counts and keeps the replacement.
+        prepared = saved + [
+            started("b", X, **other),
+            finished("b", "no_preset_frame", X),
+        ]
+        write = fold(prepared)["A"]
+        self.assertEqual(
+            [write[k] for k in ("write_id", "state", "attempts_used")],
+            [X, "retryable", 1],
+        )
+        self.assertIn("No attempt sent a preset frame", write["next_step"])
+        for preset in (A, {**A, "flags": 6}):
+            with self.subTest(preset=preset), self.assertRaises(PresetWriteRefused):
+                admit(write, preset, None)
+
+    def test_preparation_without_a_preset_frame_is_bounded(self):
+        rows = []
+        for attempt in "abc":
+            rows += [started(attempt), finished(attempt, "no_preset_frame")]
+        write = fold(rows)["A"]
+        self.assertEqual(
+            [write[k] for k in ("state", "remaining_attempts", "retry_allowed")],
+            ["exhausted", 0, False],
+        )
+        self.assertIn("No attempt sent a preset frame", write["next_step"])
+        # Under an acknowledgment it never lapses back to the stopped write.
+        replaced = fold(
+            exhausted()
+            + [acknowledging("d", X, W, flags=5), finished("d", "no_preset_frame", X)]
+        )["A"]
+        self.assertEqual((replaced["write_id"], replaced["state"]), (X, "retryable"))
+        with self.assertRaises(PresetWriteRefused):
+            admit(replaced, {**A, "flags": 5}, W)
+        mixed = fold(
+            [started("a"), finished("a", "rejected")]
+            + [started("b"), finished("b", "no_preset_frame")]
+        )["A"]
+        self.assertNotIn("No attempt sent a preset frame", mixed["next_step"])
+
     def test_journaled_save_evidence_resolves_an_interrupted_attempt(self):
         rows = [{**started("a"), "session_id": "s", "sequence": 7}]
         asked = []

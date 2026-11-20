@@ -16,17 +16,21 @@ record, unless that record is marked :data:`CLOSE_PENDING` (the process
 stopped before the close committed). Anything else unexpected fails closed.
 
 A write is the latest set of attempts for one machine and slot with identical
-flags and payload. At most :data:`MAX_ATTEMPTS` attempts that may have sent a
-frame belong to one write. Only an identical write may be repeated while it
-is incomplete; an observed save or cancellation ends automatic repetition,
-and only the user's explicit acknowledgment of the write ID (passed as
-``acknowledge_incomplete``) starts a new set over an incomplete one. The
-acknowledgment is part of the new write's first ``started`` record, and it
-lapses while that write has no attempt that may have sent a frame: refused,
-or, over a write that already stops repetition, cancelled or interrupted with
-proof that no preset frame was sent. Before its first frame for a slot, a
-batch write records ``superseded`` for that slot's write. Outcomes are machine
-evidence, never a readback of stored contents.
+flags and payload. At most :data:`MAX_ATTEMPTS` attempts that reached their
+preparation belong to one write, including ``no_preset_frame`` ones that sent
+only preparation frames, so caller-driven preparation is bounded too. Only
+an identical write may be repeated while it is incomplete; an observed save
+or cancellation ends automatic repetition, and only the user's explicit
+acknowledgment of the write ID (passed as ``acknowledge_incomplete``) starts
+a new set over an incomplete one. The acknowledgment is part of the new
+write's first ``started`` record, and it lapses while that write has no
+attempt that may have sent a frame: refused, or, over a write that already
+stops repetition, cancelled or interrupted with proof that no preset frame
+was sent. A different write over a saved one lapses the same way while all of
+its attempts were refused, so the saved write still blocks an identical
+replay. Before its first frame for a slot, a batch write records
+``superseded`` for that slot's write. Outcomes are machine evidence, never a
+readback of stored contents.
 """
 
 from __future__ import annotations
@@ -47,6 +51,8 @@ SUPERSEDED = "preset_write.superseded"
 OUTCOMES = frozenset(
     {
         "refused",
+        # Reached preparation, but provably sent no preset frame; it counts.
+        "no_preset_frame",
         "rejected",
         "unconfirmed",
         "cancelled",
@@ -54,7 +60,7 @@ OUTCOMES = frozenset(
         "saved_cleanup_failed",
     }
 )
-RETRYABLE = frozenset({"rejected", "unconfirmed", "interrupted"})
+RETRYABLE = frozenset({"no_preset_frame", "rejected", "unconfirmed", "interrupted"})
 # Derived: "saved_interrupted" is a journaled save, then no outcome;
 # "saved_late" a journaled save in the attempt's window despite its outcome.
 SAVED = frozenset({"saved", "saved_cleanup_failed", "saved_interrupted", "saved_late"})
@@ -324,7 +330,7 @@ NEXT_STEPS = {
     "saved": "A save event was observed (not a readback); no further write is "
     "needed. Identical contents are not written again without "
     "acknowledge_incomplete={write_id}.",
-    "not_sent": "No frame was sent; the identical write may be submitted.",
+    "not_sent": "No preset frame was sent; the identical write may be submitted.",
     "cancelled": "Cancelled: stop and ask the user. Only after their direction, "
     "start a new write with acknowledge_incomplete={write_id}.",
     "in_progress": "An attempt is running; wait for its result.",
@@ -332,9 +338,16 @@ NEXT_STEPS = {
     "and ask the user. Only after their direction, start a new write with "
     "acknowledge_incomplete={write_id}.",
     "retryable": "Disconnect, then resubmit write_preset with exactly this "
-    "preset in a fresh session; {remaining} attempt(s) remain. Different "
-    "contents need the user's direction and acknowledge_incomplete={write_id}.",
+    "preset; it opens the fresh session itself, so do not connect first (a "
+    "repeat needs an idle report under 5 s old). {remaining} attempt(s) "
+    "remain. Different contents need the user's direction and "
+    "acknowledge_incomplete={write_id}.",
 }
+# Appended when every counted attempt stopped before its first preset frame.
+NO_PRESET_FRAME = (
+    " No attempt sent a preset frame; each sent only preparation frames "
+    "(home and mode) or nothing."
+)
 
 
 def _summary(
@@ -354,6 +367,14 @@ def _summary(
     used = sum(outcome != "refused" for outcome in outcomes)
     remaining = MAX_ATTEMPTS - used if state in ("retryable", "not_sent") else 0
     preset = {key: write[key] for key in ("slot", "payload_hex", "flags")}
+    step = NEXT_STEPS[state].format(
+        write_id=write["write_id"], max=MAX_ATTEMPTS, remaining=remaining
+    )
+    counted = [outcome for outcome in outcomes if outcome != "refused"]
+    if state in ("retryable", "exhausted") and all(
+        outcome == "no_preset_frame" for outcome in counted
+    ):
+        step += NO_PRESET_FRAME
     return {
         "write_id": write["write_id"],
         "preset": preset,
@@ -363,9 +384,7 @@ def _summary(
         "remaining_attempts": remaining,
         "retry_allowed": state in ("retryable", "not_sent"),
         "attempts": attempts,
-        "next_step": NEXT_STEPS[state].format(
-            write_id=write["write_id"], max=MAX_ATTEMPTS, remaining=remaining
-        ),
+        "next_step": step,
         "readback_verified": False,
     }
 
@@ -375,8 +394,9 @@ def _effective(
 ) -> dict[str, Any] | None:
     """An acknowledgment lapses while its write may not have sent a frame.
 
-    Refusals always lapse it. Attempts cancelled or interrupted before any
-    preset frame lapse it only over a write that already stops automatic
+    Refusals always lapse it, and likewise lapse a different write started
+    over a saved one. Attempts cancelled or interrupted before any preset
+    frame lapse it only over a write that already stops automatic
     repetition, so a cancellation never reopens one.
     """
     while write is not None and write["previous"] is not None:
@@ -448,7 +468,14 @@ def fold(
                         "write_id": write_id,
                         **preset,
                         "superseded": False,
-                        "previous": None if acknowledges is None else write,
+                        # A saved write stays in force under a different
+                        # one that only ever refused, so it still blocks an
+                        # identical replay.
+                        "previous": (
+                            write
+                            if acknowledges is not None or state == "saved"
+                            else None
+                        ),
                         "attempts": [],
                     }
                 write["attempts"].append(

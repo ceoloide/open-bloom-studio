@@ -96,7 +96,8 @@ Experimental actions still need their own `--allow-untested`.
 A single-slot preset write (`write_preset`) is one attempt of three planned
 frames. If an attempt is rejected or unconfirmed, the daemon allows the
 identical slot, flags and payload again from a fresh connection, at most three
-attempts per machine and slot, recorded in the database journal. A different
+attempts per machine and slot (an attempt whose preparation failed before any
+preset frame counts too), recorded in the database journal. A different
 write to that slot, or any write after a cancellation or the last attempt,
 waits for an explicit `acknowledge_incomplete` with the reported write ID.
 A batch write (`write_presets`) is never repeated, is refused while a target

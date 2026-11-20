@@ -133,14 +133,17 @@ reads a preset back: even a success reports `readback_verified=false`.
 
 One `write_preset` call is one attempt of three planned frames. Its result's
 `attempt` field gives the `outcome` (`saved`, `saved_cleanup_failed`,
-`rejected`, `unconfirmed`, `cancelled` or `refused`; `interrupted` or
+`rejected`, `unconfirmed`, `cancelled`, `refused`, or `no_preset_frame` when
+it stopped after preparation began but before any preset frame; `interrupted` or
 `saved_interrupted` when the daemon stopped first; `saved_late` when a save
 arrived while the outcome was being recorded), `attempts_used`,
 `retry_allowed` and `next_step`. When `retry_allowed` is true for a write the
 user asked for, call `machine_disconnect`, then submit `write_preset` again
-with exactly the same slot, flags and payload. Never recompile or change the
-contents to retry. The daemon allows 3 attempts per machine and slot and
-repeats only after a current idle report from the new connection. Stop and
+with exactly the same slot, flags and payload, without a separate
+`machine_connect`: it connects itself and repeats only on an idle report
+under 5 s old from that connection. Never recompile or change the contents
+to retry. The daemon allows 3 attempts per machine and slot, `no_preset_frame`
+ones included. Stop and
 ask the user once a save was observed, an attempt was cancelled or the
 attempts are used up. Only after their direction, pass
 `acknowledge_incomplete` with the reported `write_id` to start a new write. A

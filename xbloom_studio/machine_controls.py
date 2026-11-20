@@ -55,8 +55,9 @@ def preset_outcome(result: dict[str, Any], exc: BaseException | None) -> str:
     # A cancellation ends automatic repetition even before the first frame.
     if isinstance(exc, asyncio.CancelledError):
         return "cancelled"
+    # Preparation frames may have been sent, but provably no preset frame.
     if not result["transmitted_write_count"] and not result["partial_frame"]:
-        return "refused"
+        return "no_preset_frame"
     return "rejected" if result["rejection_evidence"] else "unconfirmed"
 
 
@@ -589,8 +590,11 @@ class MachineControls:
                 """Stop before any byte of the next frame on terminal evidence.
 
                 Also the frame's command guard, so it is rechecked after the
-                frame's journal hook and immediately before its first byte.
+                frame's journal hook and immediately before its first byte:
+                the machine must still be quiescent. Other state reports,
+                such as the attempt's own 0x43, are not refused; motion is.
                 """
+                self._require_quiescent()
                 if not single or start is None:
                     return
                 if since(start, is_save) is not None:
