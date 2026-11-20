@@ -250,7 +250,7 @@ class BleakConnectorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_optional_dependency(self):
         with mock.patch.dict(sys.modules, {"bleak": None}):
-            with self.assertRaisesRegex(RuntimeError, r"open-bloom-studio\[ble\]"):
+            with self.assertRaisesRegex(RuntimeError, r"xbloom-studio\[ble\]"):
                 await discover()
             with self.assertRaisesRegex(RuntimeError, "ble"):
                 await BleakConnector(ADDRESS).connect(lambda: None)

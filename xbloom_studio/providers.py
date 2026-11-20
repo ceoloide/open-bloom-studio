@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 MAX_RESPONSE = 2 * 1024 * 1024
 MAX_URL = 2048
 TIMEOUT = 15
-USER_AGENT = "open-bloom-studio"
+USER_AGENT = "xbloom-studio"
 COLLECTIVE_API = "https://collective-api.xbloom.com/communityRecipe"
 XRECIPE_HOSTS = frozenset(
     {

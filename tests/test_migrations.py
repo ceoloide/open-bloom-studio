@@ -186,10 +186,17 @@ class MigrationTest(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM events").fetchone()[0], 6)
         self.assertEqual(self.pragmas()[0], 2)
 
+    def test_new_databases_carry_the_project_application_id(self):
+        self.assertEqual(migrations.APPLICATION_ID.to_bytes(4, "big"), b"XBST")
+        Store(self.path).close()
+        self.assertEqual(self.pragmas(), (2, migrations.APPLICATION_ID))
+
     def test_incompatible_files_are_refused_unchanged(self):
         for sql, message in (
             ("PRAGMA user_version=99", "newer"),
             ("PRAGMA application_id=12345", "another application"),
+            # The identifier written by the former "open-bloom" namespace.
+            ("PRAGMA application_id=1329744973", "another application"),
             ("PRAGMA user_version=-1", "invalid version"),
             ("CREATE TABLE unrelated(value TEXT)", "unversioned"),
         ):

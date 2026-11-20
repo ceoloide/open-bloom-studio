@@ -87,7 +87,7 @@ class Recorder:
         self.error: BaseException | None = None
         self.closed = False
         self.executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="bloom-journal"
+            max_workers=1, thread_name_prefix="xbloom-studio-journal"
         )
         self.last: Future[Any] | None = None
         self._gap: Future[Any] | None = None

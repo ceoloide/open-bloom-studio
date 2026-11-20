@@ -112,7 +112,7 @@ def create_server(  # noqa: C901 - one registration per tool
 
         from .mcp_contracts import OUTPUTS, compact_state, input_model, normalized_input
     except ImportError as exc:
-        raise RuntimeError("Install open-bloom-studio with the mcp extra") from exc
+        raise RuntimeError("Install xbloom-studio with the mcp extra") from exc
     from .command_schema import command_schema, validate_command_params
     from .errors import error_detail
 
@@ -230,7 +230,7 @@ def create_server(  # noqa: C901 - one registration per tool
                     failure["error"]["details"] = {"operation_id": value["id"]}
                 return self.result(failure, True)
 
-    server = ContractServer("Open Bloom", instructions=INSTRUCTIONS)
+    server = ContractServer("xbloom-studio", instructions=INSTRUCTIONS)
 
     async def invoke(method: str, params: dict[str, Any] | None = None) -> Any:
         if caller is not None:
@@ -780,8 +780,8 @@ def _machine_tools(  # noqa: C901
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="xbloom-mcp",
-        description="Open Bloom MCP tools backed by a separately managed daemon",
+        prog="xbloom-studio-mcp",
+        description="xbloom-studio MCP tools backed by a separately managed daemon",
     )
     parser.add_argument("--socket")
     parser.add_argument(
@@ -800,7 +800,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ssh_config=args.ssh_config,
         )
     except (RuntimeError, ValueError) as exc:
-        print(f"xbloom-mcp: {exc}", file=sys.stderr)
+        print(f"xbloom-studio-mcp: {exc}", file=sys.stderr)
         return 2
     server.run(transport="stdio")
     return 0

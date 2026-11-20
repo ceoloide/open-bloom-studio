@@ -17,7 +17,7 @@ from unittest import mock
 from scripts import check_dist
 
 VERSION = "1.2.3"
-STEM = f"open_bloom_studio-{VERSION}"
+STEM = f"xbloom_studio-{VERSION}"
 PACKAGE_FILES = {
     "xbloom_studio/__init__.py": b'"""Doc."""\n',
     "xbloom_studio/py.typed": b"",
@@ -32,7 +32,7 @@ SOURCES = {**PACKAGE_FILES, **ROOT_FILES}
 EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 METADATA = (
     "Metadata-Version: 2.4\n"
-    "Name: open-bloom-studio\n"
+    "Name: xbloom-studio\n"
     f"Version: {VERSION}\n"
     "License-Expression: MIT\n"
     "License-File: LICENSE\n"
@@ -40,8 +40,8 @@ METADATA = (
 )
 ENTRY_POINTS = (
     b"[console_scripts]\n"
-    b"xbloom = xbloom_studio.cli:main\n"
-    b"xbloom-mcp = xbloom_studio.mcp_server:main\n"
+    b"xbloom-studio = xbloom_studio.cli:main\n"
+    b"xbloom-studio-mcp = xbloom_studio.mcp_server:main\n"
 )
 
 
@@ -65,7 +65,7 @@ def wheel_files(**changes):
 
 
 def sdist_files(**changes):
-    egg = "open_bloom_studio.egg-info"
+    egg = "xbloom_studio.egg-info"
     files = {
         **SOURCES,
         "PKG-INFO": METADATA.encode(),
@@ -192,7 +192,7 @@ class ArtifactTest(unittest.TestCase):
         self.assertIn("sdist:.env.local:0: forbidden file type", problems)
 
     def test_requires_file_follows_declared_dependencies(self):
-        egg = "open_bloom_studio.egg-info"
+        egg = "xbloom_studio.egg-info"
         requires = {f"{egg}/requires.txt": b"[ble]\nexample\n"}
         self.assertIn(
             f"sdist unexpected file: {egg}/requires.txt",
@@ -230,7 +230,7 @@ class ArtifactTest(unittest.TestCase):
 
     def test_entry_points_must_match_policy(self):
         info = f"{STEM}.dist-info/entry_points.txt"
-        egg = "open_bloom_studio.egg-info/entry_points.txt"
+        egg = "xbloom_studio.egg-info/entry_points.txt"
         extra = ENTRY_POINTS + b"other = xbloom_studio.cli:main\n"
         for value in (extra, b"[gui_scripts]\nx = y:z\n", b"not ini"):
             with self.subTest(value=value):
@@ -289,6 +289,7 @@ class InstallTest(unittest.TestCase):
             "prefix": str(venv),
             "version": VERSION,
             "files": [*PACKAGE_FILES, f"{STEM}.dist-info/RECORD"],
+            "scripts": dict(check_dist.ENTRY_POINTS),
             "resources": {"xbloom_studio/py.typed": EMPTY_SHA256},
         }
         result.update(changes)
@@ -338,6 +339,19 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(
             problems, ["installed package was not imported from the new environment"]
         )
+        for scripts in (
+            {**check_dist.ENTRY_POINTS, "xbloom": "xbloom_studio.cli:main"},
+            {"xbloom-studio": "xbloom_studio.cli:main"},
+        ):
+            problems, _ = self.probe(workdir, scripts=scripts)
+            self.assertEqual(problems, ["installed entry points differ from policy"])
+        self.assertEqual(
+            check_dist.ENTRY_POINTS,
+            {
+                "xbloom-studio": "xbloom_studio.cli:main",
+                "xbloom-studio-mcp": "xbloom_studio.mcp_server:main",
+            },
+        )
 
     def test_installed_resources_must_load_and_match(self):
         workdir = Path(tempfile.gettempdir())
@@ -371,7 +385,7 @@ class InstallTest(unittest.TestCase):
         (root / f"{STEM}.dist-info").mkdir()
         (root / f"{STEM}.dist-info/METADATA").write_text(METADATA)
         probe = check_dist.PROBE.format(
-            package="xbloom_studio", project="open-bloom-studio"
+            package="xbloom_studio", project="xbloom-studio"
         )
         output = subprocess.run(
             [sys.executable, "-c", probe],
@@ -386,7 +400,7 @@ class InstallTest(unittest.TestCase):
             {"xbloom_studio/data/a.json": hashlib.sha256(b"{}").hexdigest()},
         )
 
-    def entry_points(self, scripts=("xbloom", "xbloom-mcp"), **outputs):
+    def entry_points(self, scripts=("xbloom-studio", "xbloom-studio-mcp"), **outputs):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         workdir = Path(directory.name)
@@ -403,7 +417,7 @@ class InstallTest(unittest.TestCase):
             commands.append(command)
             if command[0] == str(venv / "bin" / "python"):
                 return values["probe"]
-            if command[0].endswith("xbloom"):
+            if command[0].endswith("xbloom-studio"):
                 return values["cli"]
             return ""
 
@@ -449,23 +463,23 @@ class InstallTest(unittest.TestCase):
         self.assertNotEqual(self.entry_points()[1][-1][6], device)
 
     def test_installed_entry_point_problems(self):
-        problems, commands = self.entry_points(scripts=("xbloom",))
-        self.assertEqual(problems, ["installed entry point missing: xbloom-mcp"])
+        problems, commands = self.entry_points(scripts=("xbloom-studio",))
+        self.assertEqual(problems, ["installed entry point missing: xbloom-studio-mcp"])
         self.assertEqual(commands, [])
         failed = json.dumps({"ok": True, "data": {"status": "failed"}})
         problems, _ = self.entry_points(cli=failed)
         self.assertEqual(
-            problems, ["installed xbloom did not complete a simulated operation"]
+            problems, ["installed xbloom-studio did not complete a simulated operation"]
         )
         problems, _ = self.entry_points(cli="")
         self.assertIn(
-            "installed xbloom did not complete a simulated operation", problems
+            "installed xbloom-studio did not complete a simulated operation", problems
         )
 
     def test_daemon_probe_rejects_nonzero_cli_exit_with_completed_output(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            cli = root / "xbloom"
+            cli = root / "xbloom-studio"
             cli.write_text(
                 "#!/bin/sh\n"
                 """echo '{"ok": true, "data": {"status": "completed"}}'\n"""
@@ -501,7 +515,7 @@ class InstallTest(unittest.TestCase):
                 "installed quickstart step exit returned None",
             ],
         )
-        stdio = "installed xbloom-mcp did not complete the stdio flow"
+        stdio = "installed xbloom-studio-mcp did not complete the stdio flow"
         good = self.daemon(venv)["mcp"]
         for change in (
             {"tools": {"recipes": 2, "machine": 3}},

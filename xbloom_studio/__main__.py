@@ -1,4 +1,4 @@
-"""Run the ``xbloom`` command line with ``python -m xbloom_studio``."""
+"""Run the ``xbloom-studio`` command line with ``python -m xbloom_studio``."""
 
 from __future__ import annotations
 

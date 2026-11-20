@@ -1,11 +1,11 @@
-"""The ``xbloom`` command: local SQLite, a private daemon, or an SSH endpoint.
+"""The ``xbloom-studio`` command: local SQLite, a private daemon, or SSH.
 
 Every command routes to one :meth:`~xbloom_studio.facade.Application.call`
 method, including the same registry and binding for database-free recipe calls.
-Machine work runs in the daemon (``xbloom serve``) when its socket exists,
-through ``--ssh`` on a remote daemon, or attached in this process with
-``--direct`` when no daemon is running. ``xbloom relay`` is the restricted
-stdio endpoint that SSH forced commands run.
+Machine work runs in the daemon (``xbloom-studio serve``) when its socket
+exists, through ``--ssh`` on a remote daemon, or attached in this process with
+``--direct`` when no daemon is running. ``xbloom-studio relay`` is the
+restricted stdio endpoint that SSH forced commands run.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from .serialization import dumps
 from .storage import ConflictError, Store
 from .tea_guidance import FAMILIES
 
-DEVICE_ENVIRONMENT = "BLOOM_DEVICE"
+DEVICE_ENVIRONMENT = "XBLOOM_STUDIO_DEVICE"
 TARGETS = ("host", "coffee", "tea")
 ACTIVE = ("accepted", "running", "waiting_for_user")
 RETAINED_CONNECTION_METHODS = (
@@ -63,8 +63,10 @@ Invoke = Callable[..., Awaitable[Any]]
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="xbloom",
-        description="Open Bloom recipes, complete history and owned machine operations",
+        prog="xbloom-studio",
+        description=(
+            "xbloom-studio recipes, complete history and owned machine operations"
+        ),
     )
     p.add_argument("--db", type=Path)
     p.add_argument("--socket", type=Path, help="Local private daemon socket")
@@ -105,7 +107,7 @@ def parser() -> argparse.ArgumentParser:
         "relay", help="Restricted one-shot stdio relay for SSH forced commands"
     )
     relay.add_argument("--socket", dest="relay_socket")
-    sub.add_parser("mcp", help="Use the separate xbloom-mcp command")
+    sub.add_parser("mcp", help="Use the separate xbloom-studio-mcp command")
     c = sub.add_parser("call", help="Call one application method by name")
     c.add_argument("method")
     c.add_argument("--params", type=Path)
@@ -518,9 +520,9 @@ def output(value: Any) -> None:
 
 def _check_options(a: argparse.Namespace) -> None:
     if a.command == "relay":
-        raise ValueError("xbloom relay takes no global options")
+        raise ValueError("xbloom-studio relay takes no global options")
     if a.command == "mcp":
-        raise ValueError("Use xbloom-mcp for the optional MCP adapter")
+        raise ValueError("Use xbloom-studio-mcp for the optional MCP adapter")
     if a.ssh_config is not None and a.ssh is None:
         raise ValueError("--ssh-config requires --ssh")
 
@@ -575,7 +577,7 @@ async def run(a: argparse.Namespace) -> int:
         and a.connector is not None
         and not (a.direct or a.command == "serve")
     ):
-        raise ValueError("--connector requires xbloom serve or --direct")
+        raise ValueError("--connector requires xbloom-studio serve or --direct")
     if not remote and (
         (a.command == "recipe" and a.action in PURE_ACTIONS)
         or (a.command == "call" and a.method in PURE_METHODS)
@@ -601,11 +603,11 @@ async def run(a: argparse.Namespace) -> int:
         method, params = route(a)
         if not remote and method in RETAINED_CONNECTION_METHODS:
             raise ValueError(
-                "Retained connections require a daemon; start xbloom serve first"
+                "Retained connections require a daemon; start xbloom-studio serve first"
             )
         if not remote and method == "operation_start" and not a.direct:
             raise ValueError(
-                "Start xbloom serve or pass --direct for machine operations"
+                "Start xbloom-studio serve or pass --direct for machine operations"
             )
     store = None
     try:
@@ -671,8 +673,8 @@ async def _execute(
             preview = await app.call("machine_prepare", {"request": params["request"]})
             if preview["requires_user"]:
                 raise ValueError(
-                    "Host preparation gates require a running daemon; start xbloom "
-                    "serve first"
+                    "Host preparation gates require a running daemon; start "
+                    "xbloom-studio serve first"
                 )
             supplied_digest = params.get("expected_recipe_sha256")
             digest = preview["recipe_sha256"]

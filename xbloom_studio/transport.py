@@ -131,9 +131,7 @@ def _bleak() -> Any:
     try:
         return importlib.import_module("bleak")
     except ImportError as exc:
-        raise RuntimeError(
-            "Install open-bloom-studio[ble] for Bluetooth support"
-        ) from exc
+        raise RuntimeError("Install xbloom-studio[ble] for Bluetooth support") from exc
 
 
 async def discover(timeout: float = 10.0) -> list[dict[str, Any]]:

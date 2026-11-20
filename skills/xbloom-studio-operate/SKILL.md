@@ -1,18 +1,18 @@
 ---
-name: bloom-operate
-description: Prepare, start, watch, stop and recover xBloom Studio machine actions (water, grinding, stored or inline recipes, exact repeats, settings and scale) through the Open Bloom daemon. Use when the user asks the machine to do something or asks about a running or uncertain operation, not for recipe authoring.
+name: xbloom-studio-operate
+description: Prepare, start, watch, stop and recover xBloom Studio machine actions (water, grinding, stored or inline recipes, exact repeats, settings and scale) through the xbloom-studio daemon. Use when the user asks the machine to do something or asks about a running or uncertain operation, not for recipe authoring.
 license: MIT
-compatibility: Needs a running open-bloom-studio daemon (xbloom serve) and access to its machine. Use the xbloom-mcp machine and history groups or the xbloom command.
+compatibility: Needs a running xbloom-studio daemon (xbloom-studio serve) and access to its machine. Use the xbloom-studio-mcp machine and history groups or the xbloom-studio command.
 ---
 
 # Operate the machine
 
-Use `xbloom-mcp --group machine --group history` for the machine actions and
-recorded status. A client may prefix tool names. They reach one daemon
-(`xbloom serve`), locally or through
-`--ssh HOST`, which is the machine's only owner. If the daemon is not
-reachable, report the setup problem. Never fall back to a second Bluetooth
-connection, a direct mode or another host.
+Use `xbloom-studio-mcp --group machine --group history` for the machine actions
+and recorded status. A client may prefix tool names. They reach one daemon
+(`xbloom-studio serve`), locally or through `--ssh HOST`, which is the
+machine's only owner. If the daemon is not reachable, report the setup problem.
+Never fall back to a second Bluetooth connection, a direct mode or another
+host.
 
 ## Permission comes first
 
@@ -124,7 +124,7 @@ start may already have happened, inspect its operation ID or look it up by
 key; do not start again.
 
 From the command line, the `water`, `grind`, `brew`, `history repeat` and
-`machine` commands of `xbloom` call the same methods, with `--key`,
+`machine` commands of `xbloom-studio` call the same methods, with `--key`,
 `--allow-control`, `--allow-untested` and `--wait`. For example
-`xbloom history repeat ID --key KEY --allow-control --wait` repeats a past
-brew exactly; recover with `xbloom operation lookup KEY`.
+`xbloom-studio history repeat ID --key KEY --allow-control --wait` repeats a
+past brew exactly; recover with `xbloom-studio operation lookup KEY`.
