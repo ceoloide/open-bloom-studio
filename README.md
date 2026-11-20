@@ -17,14 +17,17 @@ validated on hardware and stay behind an explicit experimental opt-in.
 
 ## Install
 
-Python 3.10 or newer. Install the source from the default branch with the
-extras you need:
+Python 3.10 or newer. Install the source from the default branch in a fresh
+virtual environment with the extras you need:
 `ble` for local Bluetooth through [Bleak](https://github.com/hbldh/bleak) and
 `mcp` for the MCP server. The core library has no dependencies.
 
 ```sh
 git clone https://github.com/ceoloide/open-xbloom-studio-tools
-pip install "./open-xbloom-studio-tools[ble,mcp]"
+cd open-xbloom-studio-tools
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install ".[ble,mcp]"
 ```
 
 The earlier `0.0.1-alpha` tag predates these names: it installs the
