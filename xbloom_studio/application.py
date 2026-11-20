@@ -30,7 +30,12 @@ from .journal import JournalHooks, Recorder
 from .machine_api import MachineCommandAPI, encoded_step
 from .machine_controls import EncodedTeaRecipe, UntestedOperationError
 from .ownership import AddressLease
-from .recipes import HistoryService, RecipeService, compile_recipe
+from .recipes import (
+    HistoryService,
+    RecipeService,
+    compile_recipe,
+    upload_requires_untested,
+)
 from .storage import ConflictError
 from .transport import BleakConnector
 
@@ -287,6 +292,15 @@ class MachineService(MachineCommandAPI):
             return self.state()
 
     def prepare(self, request: Any) -> dict[str, Any]:
+        """Preview a request: its plan plus whether recipe_upload needs opt-in.
+
+        ``upload_requires_untested`` belongs to this preview only. Starts and
+        uploads resolve the raw plan, so history never records it.
+        """
+        plan = self._resolve(request)
+        return {**plan, "upload_requires_untested": upload_requires_untested(plan)}
+
+    def _resolve(self, request: Any) -> dict[str, Any]:
         if not isinstance(request, dict):
             raise ValueError("Request must be an object")
         kind = request.get("kind")
@@ -358,7 +372,7 @@ class MachineService(MachineCommandAPI):
                 raise BusyError(
                     "A recipe owns preparation; start, cancel or disconnect first"
                 )
-            plan = await asyncio.to_thread(self.prepare, request)
+            plan = await asyncio.to_thread(self._resolve, request)
             if (
                 expected_recipe_sha256 is not None
                 and plan["recipe_sha256"] != expected_recipe_sha256

@@ -1,42 +1,49 @@
 ---
-name: bloom-recipes
-description: Draft, validate, store, match and import coffee and tea recipes with Open Bloom for an xBloom Studio. Use when the user wants a new or adjusted coffee recipe, or wants to save, find, compare, edit or import recipes. Crafting tea belongs to bloom-tea and brewing to bloom-operate.
+name: xbloom-studio-recipes
+description: Draft, validate, store, match and import coffee and tea recipes with xbloom-studio for an xBloom Studio. Use when the user wants a new or adjusted coffee recipe, or wants to save, find, compare, edit or import recipes. Crafting tea belongs to xbloom-studio-tea and brewing to xbloom-studio-operate.
 license: MIT
-compatibility: Needs the open-bloom-studio xbloom command or the recipe tools of xbloom-mcp. Public recipe search and import need network access.
+compatibility: Needs the xbloom-studio command or the recipe tools of xbloom-studio-mcp. Public recipe search and import need network access.
 ---
 
-# Open Bloom recipes
+# xbloom-studio recipes
 
-Work with recipe definitions only. Nothing here connects to the machine,
-brews or changes machine presets. Saving or compiling a recipe is not
-permission to run it; hand brewing requests to the `bloom-operate` skill.
+Work with recipe definitions only. Nothing here connects to the machine, brews
+or changes machine presets. Saving or compiling a recipe is not permission to
+run it; hand brewing requests to the `xbloom-studio-operate` skill.
 
-Tool names are those of `xbloom-mcp --group recipes`; a client may prefix
-them. Without MCP, the `recipe` commands of `xbloom` call the same methods.
-Validation, constraints, templates, examples, tea references and previews
-also run offline with no daemon or database, so never start a daemon or
-connect just to inspect a recipe.
+Tool names are those of `xbloom-studio-mcp --group recipes`; a client may
+prefix them. Without MCP, the `recipe` commands of `xbloom-studio` call the
+same methods. Validation, constraints, templates, examples, tea references and
+previews also run offline with no daemon or database, so never start a daemon
+or connect just to inspect a recipe.
 
 ## Draft and validate
 
-1. Read `recipe_constraints` (`xbloom recipe constraints`) for every field,
-   bound, choice and default. Do not rely on remembered ranges.
+1. Read `recipe_constraints` (`xbloom-studio recipe constraints`) for every
+   field, bound, choice and default. Do not rely on remembered ranges.
 2. Start from a coherent document: `recipe_templates` gives three original
    starter coffee recipes. Copy an envelope's `document`, never the envelope.
-3. Run `recipe_validate(document)` (`xbloom recipe validate FILE`). Read every
-   error's JSON Pointer `path` and allowed values, fix the draft explicitly and
-   validate again. Never clamp, drop or reinterpret a user's requirement
-   silently: explain the conflict and agree on a supported alternative.
-4. Preview with `recipe_preview(document)` (`xbloom recipe preview FILE`).
-   A plan shows exactly what would be sent; it does not establish taste,
-   machine readiness or authorization.
+3. Run `recipe_validate(document)` (`xbloom-studio recipe validate FILE`). Read
+   every error's JSON Pointer `path` and allowed values, fix the draft
+   explicitly and validate again. Never clamp, drop or reinterpret a user's
+   requirement silently: explain the conflict and agree on a supported
+   alternative.
+4. Preview with `recipe_preview(document)`
+   (`xbloom-studio recipe preview FILE`). A plan shows exactly what would be
+   sent; it does not establish taste, machine readiness or authorization.
 
 Recipe modes:
 
 - `coffee`: one native coffee recipe in `coffee_recipe` (dose, ratio, grind,
   RPM, cup and up to nine pours). Pour volumes must add up to the dose times
-  the ratio. Hardware execution is experimental and needs `allow_untested`.
-- `tea`: one native tea recipe in `tea`; use the `bloom-tea` skill to craft it.
+  the ratio. Hardware execution is experimental and needs `allow_untested`,
+  except an upload that the machine preview marks
+  `upload_requires_untested: false` (xDripper with the grind-size upload
+  selected, no bypass or vibration, numeric pour temperatures, pours of 1 to
+  127 ml), pinned by the preview digest. A direct start keeps the opt-in; see
+  the `xbloom-studio-operate` skill.
+- `tea`: one native tea recipe in `tea`; use the `xbloom-studio-tea` skill to
+  craft it.
 - `host`: ordered `steps` of `water`, `grind`, `wait`, `user` and `tare`,
   run as separate manual operations. A host plan is not equivalent to a
   native recipe; never substitute one for the other without saying so.
@@ -49,13 +56,13 @@ Root `coffee` holds bean metadata (`name`, `roaster`, `origin`, `variety`,
 ## Craft a coffee recipe
 
 Collect what is known about the beans and keep unknown facts unknown. Call
-`recipe_examples(coffee, water_ml, limit)` (`xbloom recipe examples FILE`) to
-rank the bundled original examples by origin, variety, process and flavor
-overlap. Scores measure metadata overlap, not cup quality, and roast is
-ignored. Treat a match as a starting point: state material mismatches, keep
-the user's dose, cup and total water, and label any value you chose yourself
-as an assumption. If nothing fits well, say the support is weak and offer a
-conservative draft.
+`recipe_examples(coffee, water_ml, limit)`
+(`xbloom-studio recipe examples FILE`) to rank the bundled original examples by
+origin, variety, process and flavor overlap. Scores measure metadata overlap,
+not cup quality, and roast is ignored. Treat a match as a starting point: state
+material mismatches, keep the user's dose, cup and total water, and label any
+value you chose yourself as an assumption. If nothing fits well, say the
+support is weak and offer a conservative draft.
 
 For taste feedback, start from the actual previous recipe and change one or
 two settings (for example a slightly coarser grind or cooler water for a
@@ -85,8 +92,8 @@ example it was adapted from.
 
 A grinder-only profile (for example for espresso) is a host recipe with one
 `grind` step built from settings the user gives
-(`xbloom recipe grind-profile NAME --size N --rpm N --duration-s N`). Never
-derive a grind time from a target weight.
+(`xbloom-studio recipe grind-profile NAME --size N --rpm N --duration-s N`).
+Never derive a grind time from a target weight.
 
 ## Import
 

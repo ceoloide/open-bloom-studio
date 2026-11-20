@@ -50,7 +50,7 @@ class ServiceCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.store = Store(self.root / "bloom.sqlite3")
+        self.store = Store(self.root / "xbloom-studio.sqlite3")
         self.machine = Machine("00:00:5E:00:53:01", auto_complete=self.auto_complete)
         self.service = self.make(self.machine)
 
@@ -775,7 +775,7 @@ class CallerLossAndRecoveryTests(ServiceCase):
         first.cancel()
         await asyncio.sleep(0.05)
         machine = Machine("00:00:5E:00:53:01")
-        other = Store(self.root / "bloom.sqlite3")
+        other = Store(self.root / "xbloom-studio.sqlite3")
         successor = self.make(machine, store=other)
         try:
             started = None

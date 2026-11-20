@@ -27,9 +27,9 @@ WAL_BUSY_SECONDS = 10
 
 
 def default_db() -> Path:
-    """Default database path; unchanged so existing local libraries are found."""
+    """Default database path under ``$XDG_DATA_HOME`` or ``~/.local/share``."""
     base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
-    return Path(base) / "open-bloom/bloom.sqlite3"
+    return Path(base) / "xbloom-studio/xbloom-studio.sqlite3"
 
 
 class ConflictError(ValueError):

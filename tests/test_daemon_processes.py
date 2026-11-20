@@ -24,8 +24,8 @@ class DaemonProcessTests(unittest.IsolatedAsyncioTestCase):
         quiet_asyncio(self)
         self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
-        self.db = self.root / "bloom.sqlite3"
-        self.socket = self.root / "run" / "bloom.sock"
+        self.db = self.root / "xbloom-studio.sqlite3"
+        self.socket = self.root / "run" / "daemon.sock"
         self.processes = []
 
     async def asyncTearDown(self):

@@ -894,7 +894,8 @@ class LeaseTests(unittest.TestCase):
             ):
                 account.return_value.pw_dir = root
                 self.assertEqual(
-                    lease_directory(), Path(root) / ".local/state/open-bloom/leases"
+                    lease_directory(),
+                    Path(root) / ".local/state/xbloom-studio/leases",
                 )
 
     def test_processes_with_distinct_tmpdirs_share_ownership(self):

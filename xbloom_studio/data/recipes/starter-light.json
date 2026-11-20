@@ -12,7 +12,7 @@
     "mode": "coffee",
     "description": "Hotter water and a finer grind for dense, lightly roasted coffee.",
     "source": {
-      "provider": "open-bloom-studio",
+      "provider": "xbloom-studio",
       "template_id": "starter-light"
     },
     "coffee_recipe": {

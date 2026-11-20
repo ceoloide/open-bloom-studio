@@ -1114,45 +1114,6 @@ wheels = [
 ]
 
 [[package]]
-name = "open-bloom-studio"
-version = "0.0.1a0"
-source = { editable = "." }
-
-[package.optional-dependencies]
-ble = [
-    { name = "bleak" },
-]
-mcp = [
-    { name = "mcp" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "bleak" },
-    { name = "coverage", version = "7.16.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "coverage", version = "7.17.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "mcp" },
-    { name = "mypy" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "bleak", marker = "extra == 'ble'", specifier = ">=1.0,<3" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.3,<3" },
-]
-provides-extras = ["ble", "mcp"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "bleak", specifier = ">=1.0,<3" },
-    { name = "coverage", specifier = ">=7.10" },
-    { name = "mcp", specifier = ">=2.3,<3" },
-    { name = "mypy", specifier = ">=2.4" },
-    { name = "ruff", specifier = ">=0.17" },
-]
-
-[[package]]
 name = "opentelemetry-api"
 version = "1.45.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2562,4 +2523,43 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/9b/5a/db5b75cf82b834963d4440e23ea0d6ecbd06d788d4f2b854ef0eec48376a/winrt_windows_storage_streams-4!10.0.28000.2957.tar.gz", hash = "sha256:6284341b4b01ab872007def0b8d29bf30d84d46f6922f6e42be1d738d6bf2ff7", size = 16649, upload-time = "2026-10-31T23:45:47.22Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d5/8d/0fc70dedc79e36acab9aff05cdceb112a7512176f901ee37f6e522dfbfad/winrt_windows_storage_streams-4!10.0.28000.2957-py3-none-any.whl", hash = "sha256:e113832320f2e7f8b09cedfb400cb7eaf0ac769ad1f2038ddbe88801497916c4", size = 18829, upload-time = "2026-10-31T23:41:34.224Z" },
+]
+
+[[package]]
+name = "xbloom-studio"
+version = "0.0.2a0"
+source = { editable = "." }
+
+[package.optional-dependencies]
+ble = [
+    { name = "bleak" },
+]
+mcp = [
+    { name = "mcp" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "bleak" },
+    { name = "coverage", version = "7.16.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "coverage", version = "7.17.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "mcp" },
+    { name = "mypy" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "bleak", marker = "extra == 'ble'", specifier = ">=1.0,<3" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.3,<3" },
+]
+provides-extras = ["ble", "mcp"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "bleak", specifier = ">=1.0,<3" },
+    { name = "coverage", specifier = ">=7.10" },
+    { name = "mcp", specifier = ">=2.3,<3" },
+    { name = "mypy", specifier = ">=2.4" },
+    { name = "ruff", specifier = ">=0.17" },
 ]

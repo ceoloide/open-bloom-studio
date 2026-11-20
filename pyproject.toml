@@ -3,8 +3,8 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "open-bloom-studio"
-version = "0.0.1a0"
+name = "xbloom-studio"
+version = "0.0.2a0"
 description = "Independent open-source tools for xBloom Studio machines"
 readme = "README.md"
 license = "MIT"
@@ -22,8 +22,8 @@ ble = ["bleak>=1.0,<3"]
 mcp = ["mcp>=2.3,<3"]
 
 [project.scripts]
-xbloom = "xbloom_studio.cli:main"
-xbloom-mcp = "xbloom_studio.mcp_server:main"
+xbloom-studio = "xbloom_studio.cli:main"
+xbloom-studio-mcp = "xbloom_studio.mcp_server:main"
 
 [project.urls]
 Repository = "https://github.com/ceoloide/open-xbloom-studio-tools"

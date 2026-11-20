@@ -15,8 +15,8 @@ import sqlite3
 from collections.abc import Callable
 
 SCHEMA_VERSION = 2
-# "OBLM". Databases created before the identifier was introduced carry zero.
-APPLICATION_ID = 0x4F424C4D
+# "XBST". Databases created before the identifier was introduced carry zero.
+APPLICATION_ID = 0x58425354
 
 BASE_SCHEMA = (
     """CREATE TABLE IF NOT EXISTS recipes(id TEXT PRIMARY KEY, name TEXT NOT NULL,
@@ -117,7 +117,7 @@ def _validate(db: sqlite3.Connection) -> int:
     if version > SCHEMA_VERSION:
         raise ValueError(
             f"Database schema {version} is newer than supported {SCHEMA_VERSION}; "
-            "upgrade Open Bloom Studio"
+            "upgrade xbloom-studio"
         )
     if version < 0 or identity not in (0, APPLICATION_ID):
         raise ValueError(

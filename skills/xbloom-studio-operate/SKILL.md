@@ -1,18 +1,18 @@
 ---
-name: bloom-operate
-description: Prepare, start, watch, stop and recover xBloom Studio machine actions (water, grinding, stored or inline recipes, exact repeats, settings and scale) through the Open Bloom daemon. Use when the user asks the machine to do something or asks about a running or uncertain operation, not for recipe authoring.
+name: xbloom-studio-operate
+description: Prepare, start, watch, stop and recover xBloom Studio machine actions (water, grinding, stored or inline recipes, exact repeats, settings and scale) through the xbloom-studio daemon. Use when the user asks the machine to do something or asks about a running or uncertain operation, not for recipe authoring.
 license: MIT
-compatibility: Needs a running open-bloom-studio daemon (xbloom serve) and access to its machine. Use the xbloom-mcp machine and history groups or the xbloom command.
+compatibility: Needs a running xbloom-studio daemon (xbloom-studio serve) and access to its machine. Use the xbloom-studio-mcp machine and history groups or the xbloom-studio command.
 ---
 
 # Operate the machine
 
-Use `xbloom-mcp --group machine --group history` for the machine actions and
-recorded status. A client may prefix tool names. They reach one daemon
-(`xbloom serve`), locally or through
-`--ssh HOST`, which is the machine's only owner. If the daemon is not
-reachable, report the setup problem. Never fall back to a second Bluetooth
-connection, a direct mode or another host.
+Use `xbloom-studio-mcp --group machine --group history` for the machine actions
+and recorded status. A client may prefix tool names. They reach one daemon
+(`xbloom-studio serve`), locally or through `--ssh HOST`, which is the
+machine's only owner. If the daemon is not reachable, report the setup problem.
+Never fall back to a second Bluetooth connection, a direct mode or another
+host.
 
 ## Permission comes first
 
@@ -22,7 +22,9 @@ earlier unrelated brew is not permission. Pass `allow_control=true` only for
 an action the user asked for, and `allow_untested=true` only when the user
 accepts that the action is experimental (native coffee and tea recipes and
 some commands, as reported by the tools). Do not ask again for something the
-user already answered in this session.
+user already answered in this session. Pass `allow_untested=true` only where
+the preview reports that the chosen route needs it; see "Upload now, start
+later".
 
 ## Look before acting
 
@@ -99,6 +101,22 @@ exit commands were sent. Other writes are rejected while a recipe is prepared. A
 token without proving preparation was cancelled, and a token is not a readback
 of the stored recipe.
 
+The preview carries two separate flags. `requires_untested` governs a direct
+`operation_start` of that request. `upload_requires_untested` is only the
+opt-in check for a plan that `recipe_upload` otherwise accepts (exactly one
+native coffee or tea step); it does not mean the plan can be uploaded. For an
+experimental plan it is `false` only on the hardware-validated route: a
+structured coffee recipe (fresh or an exact repeat) for the xDripper with the
+grind-size upload selected (command 8001, which does not by itself establish
+grinding), no bypass, no vibration, numeric pour temperatures and pours of 1
+to 127 ml. For that route, upload with `allow_control=true` and the preview's
+digest as `expected_recipe_sha256`, without `allow_untested`, then use
+`recipe_start_uploaded`. Without that digest, or with a changed one, the
+upload is refused before anything is sent. Starting the same recipe directly
+with `operation_start` still needs `allow_untested=true`. If the preview has
+no `upload_requires_untested` field, the daemon is older: follow
+`requires_untested` for the upload too.
+
 ## Settings and scale
 
 Read `machine_capabilities` first: it lists each command's parameter schema
@@ -124,7 +142,7 @@ start may already have happened, inspect its operation ID or look it up by
 key; do not start again.
 
 From the command line, the `water`, `grind`, `brew`, `history repeat` and
-`machine` commands of `xbloom` call the same methods, with `--key`,
+`machine` commands of `xbloom-studio` call the same methods, with `--key`,
 `--allow-control`, `--allow-untested` and `--wait`. For example
-`xbloom history repeat ID --key KEY --allow-control --wait` repeats a past
-brew exactly; recover with `xbloom operation lookup KEY`.
+`xbloom-studio history repeat ID --key KEY --allow-control --wait` repeats a
+past brew exactly; recover with `xbloom-studio operation lookup KEY`.

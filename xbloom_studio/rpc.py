@@ -37,8 +37,8 @@ START_METHODS = ("operation_start", "recipe_start_uploaded")
 def default_socket() -> Path:
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if runtime:
-        return Path(runtime) / "open-bloom/bloom.sock"
-    return Path.home() / ".local/state/open-bloom/run/bloom.sock"
+        return Path(runtime) / "xbloom-studio/daemon.sock"
+    return Path.home() / ".local/state/xbloom-studio/run/daemon.sock"
 
 
 @contextmanager

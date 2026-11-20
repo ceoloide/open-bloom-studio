@@ -1,4 +1,4 @@
-"""One dispatch path: Python, the xbloom CLI, the daemon and MCP agree."""
+"""One dispatch path: Python, the xbloom-studio CLI, the daemon and MCP agree."""
 
 from __future__ import annotations
 
@@ -30,10 +30,30 @@ WATER = {
     "pattern": "center",
 }
 DOCUMENT = {"name": "Parity", "steps": [WATER]}
+# The hardware-validated prepared coffee profile: its preview carries a
+# separate upload flag that every adapter must pass through unchanged.
+COFFEE = {
+    "kind": "recipe",
+    "document": {
+        "name": "Prepared",
+        "mode": "coffee",
+        "coffee_recipe": {
+            "cup_type": "xdripper",
+            "dose_g": 15,
+            "grind_size": 60,
+            "ratio": 16,
+            "grinder_enabled": True,
+            "pours": [
+                {"volume_ml": 120, "temperature": 91},
+                {"volume_ml": 120, "temperature": 91},
+            ],
+        },
+    },
+}
 
 
 def run_cli(*args):
-    """Run ``xbloom`` in this process; return (exit code, parsed stdout lines)."""
+    """Run ``xbloom-studio`` in this process; return (exit code, stdout lines)."""
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = main(list(args))
@@ -46,13 +66,13 @@ class ParityTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
-        self.db = self.root / "bloom.sqlite3"
+        self.db = self.root / "xbloom-studio.sqlite3"
         self.store = Store(self.db)
         self.machine = Machine("SIM-PARITY", auto_complete=True)
         self.app = Application(
             self.store, connector=self.machine, interaction_options=FAST
         )
-        self.socket = self.root / "run" / "bloom.sock"
+        self.socket = self.root / "run" / "daemon.sock"
         self.server = await LocalServer(self.app, self.socket).start()
 
     async def asyncTearDown(self):
@@ -99,6 +119,7 @@ class ParityTests(unittest.IsolatedAsyncioTestCase):
             ),
             ("machine_capabilities", {}, "machine_capabilities", None),
             ("machine_prepare", {"request": WATER}, "machine_prepare", None),
+            ("machine_prepare", {"request": COFFEE}, "machine_prepare", None),
             ("recipe_tea_references", {"family": "green"}, None, None),
             ("recipe_examples", {"coffee": {"origin": "Kenya"}}, None, None),
         ]
@@ -114,6 +135,11 @@ class ParityTests(unittest.IsolatedAsyncioTestCase):
                         tool, params if arguments is None else arguments
                     )
                     self.assertEqual(tool_result, daemon)
+                if method == "machine_prepare":
+                    # Coffee keeps its direct-start flag; neither upload needs one.
+                    coffee = params["request"] is COFFEE
+                    self.assertIs(daemon["requires_untested"], coffee)
+                    self.assertIs(daemon["upload_requires_untested"], False)
 
     async def test_mcp_defaults_replay_the_same_attempt_across_adapters(self):
         short = {"kind": "water", "volume_ml": 50, "temperature_c": 20}
@@ -188,7 +214,7 @@ class ParityTests(unittest.IsolatedAsyncioTestCase):
 class AllowlistTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.tmp.name) / "bloom.sqlite3")
+        self.store = Store(Path(self.tmp.name) / "xbloom-studio.sqlite3")
         self.app = Application(self.store)
 
     async def asyncTearDown(self):

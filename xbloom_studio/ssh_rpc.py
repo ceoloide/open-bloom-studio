@@ -2,9 +2,9 @@
 
 The operator owns SSH configuration and keys. :func:`ssh_call` runs the
 system ``ssh`` client non-interactively with strict host-key checking and no
-forwarding, and sends one request to ``xbloom relay`` on the remote host,
-typically pinned as a forced command. :func:`relay` forwards one request to a
-fixed local socket and exposes neither a shell, the link nor the database.
+forwarding, and sends one request to ``xbloom-studio relay`` on the remote
+host, typically pinned as a forced command. :func:`relay` forwards one request
+to a fixed local socket and exposes neither a shell, the link nor the database.
 
 The remote policy is the fixed :data:`REMOTE_METHODS` allowlist, maintained
 independently of the methods an application offers locally: a new local
@@ -29,8 +29,8 @@ from .rpc import call
 from .rpc_types import RemoteError
 from .rpc_wire import MAX_REQUEST, MAX_RESPONSE, frame, request, response
 
-DEFAULT_RELAY_SOCKET = "/run/open-bloom/bloom.sock"
-REMOTE_COMMAND = ("xbloom", "relay")
+DEFAULT_RELAY_SOCKET = "/run/xbloom-studio/daemon.sock"
+REMOTE_COMMAND = ("xbloom-studio", "relay")
 REMOTE_METHODS = frozenset(
     {
         "service_info",
@@ -272,10 +272,10 @@ async def relay(socket_path: str | os.PathLike[str]) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run ``xbloom relay``: one restricted request on stdio, then exit."""
+    """Run ``xbloom-studio relay``: one restricted request on stdio, then exit."""
     parser = argparse.ArgumentParser(
-        prog="xbloom relay",
-        description="Restricted one-shot Open Bloom RPC stdio relay",
+        prog="xbloom-studio relay",
+        description="Restricted one-shot xbloom-studio RPC stdio relay",
     )
     parser.add_argument("--socket", default=DEFAULT_RELAY_SOCKET)
     args = parser.parse_args(argv)

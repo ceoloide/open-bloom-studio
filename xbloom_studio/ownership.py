@@ -24,7 +24,7 @@ def lease_directory() -> Path:
     # The account's home is shared by the CLI and service even when either
     # overrides HOME or runs in a private temporary directory.
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    return home / ".local" / "state" / "open-bloom" / "leases"
+    return home / ".local" / "state" / "xbloom-studio" / "leases"
 
 
 class AddressLease:
