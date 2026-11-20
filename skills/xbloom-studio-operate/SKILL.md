@@ -146,8 +146,8 @@ attempts are used up. Only after their direction, pass
 fresh caller finds the exact contents and counts with
 `machine_preset_writes(slot)`, which never connects. Batch preset writes,
 brew starts and other commands are never repeated automatically. A batch is
-refused while a target slot has an incomplete write, and leaves the slots'
-writes `superseded`.
+refused while a target slot has an incomplete write, and leaves the writes of
+slots it may have changed `superseded`.
 
 ## Errors
 

@@ -673,7 +673,7 @@ class PresetAttemptTests(Base):
         self.assertEqual(result["outcome"], "rejected")
         self.assertIn("not a save", result["error"])
 
-    async def evidence_during_second_journal(self, evidence):
+    async def evidence_during_second_journal(self, evidence, flood=0):
         m = Machine()
         intents = []
 
@@ -683,8 +683,11 @@ class PresetAttemptTests(Base):
                     intents.append(packet)
                     if len(intents) == 2:
                         # After the cursor the old code captured, before any
-                        # byte of the second frame.
+                        # byte of the second frame; a flood of reports then
+                        # rolls the bounded history past it.
                         m.state(evidence)
+                        for _ in range(flood):
+                            m.state(1)
                         await asyncio.sleep(0.01)
 
             def write_completed(self, packet):
@@ -792,6 +795,50 @@ class PresetAttemptTests(Base):
         self.assertEqual(
             (result["outcome"], result["transmitted_write_count"]), ("cancelled", 1)
         )
+
+    async def test_cancellation_survives_a_write_that_then_fails(self):
+        m = Machine()
+        m.block_code = 11510
+        async with interaction(m, allow_untested=True) as session:
+            task = asyncio.create_task(session.write_preset(SavedPreset("A", b"x", 0)))
+            await until(lambda: m.blocked.is_set())
+            m.fail_commands[11510] = ConnectionError("link lost while draining")
+            task.cancel()
+            m.release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            result = session._last_preset_write
+            self.assertEqual(m.codes().count(11510), 1)  # Sent, then failed.
+            # Only the attempt keeps its cancellation; later commands do not.
+            self.assertFalse(session._keep_cancellation)
+            self.assertIsNone(session._event_latch)
+        self.assertEqual(
+            (result["outcome"], result["transmitted_write_count"]), ("cancelled", 1)
+        )
+
+    async def test_terminal_evidence_outlives_bounded_event_history(self):
+        for evidence, outcome in ((0x44, "rejected"), (0x25, "saved_cleanup_failed")):
+            with self.subTest(outcome=outcome):
+                m, result = await self.evidence_during_second_journal(evidence, 300)
+                self.assertEqual(m.codes().count(11510), 1)
+                self.assertEqual(result["outcome"], outcome)
+        flood = [reply(8023, u32(1))] * 300
+        # The save after the final frame also survives the flood.
+        m = Machine()
+        sent = []
+
+        def respond(packet):
+            sent.append(packet)
+            if len(sent) < 3:
+                return [reply(11510, b"", 0xC2)]
+            return [reply(11510, b"", 0xC2), reply(8023, u32(0x25)), *flood]
+
+        m.overrides[11510] = respond
+        async with interaction(m, allow_untested=True) as session:
+            result = await asyncio.wait_for(
+                session.write_preset(SavedPreset("A", b"new", 4), save_timeout=1), 2
+            )
+        self.assertEqual(result["outcome"], "saved")
 
 
 class CalibrationTests(Base):

@@ -1332,6 +1332,127 @@ class PresetRetryTests(ServiceCase):
             self.machine.release.set()
             await task
 
+    async def test_a_raw_save_blocks_a_repeat_before_its_packet_commits(self):
+        # The save's raw chunk commits; its decoded packet never does.
+        append, entered, gate = self.store.append, threading.Event(), threading.Event()
+
+        def stall(kind, data, **context):
+            if kind == "ble.packet" and data["payload_hex"] == "25000000":
+                entered.set()
+                gate.wait(10)
+            return append(kind, data, **context)
+
+        with patch.object(self.store, "append", stall):
+            task = asyncio.create_task(self.write())
+            await until(entered.is_set, 5)
+            self.service.lease.release()  # The process is gone.
+            successor = self.make(Machine("00:00:5E:00:53:01"))
+            try:
+                write = successor.preset_writes("A")["writes"][0]
+                self.assertEqual(write["attempts"][0]["outcome"], "saved_interrupted")
+                with self.assertRaisesRegex(PresetWriteRefused, "already observed"):
+                    await successor.command(
+                        "write_preset", {"preset": A}, True, allow_untested=True
+                    )
+                self.assertEqual(successor.connector.calls, [])
+            finally:
+                await successor.close()
+                self.service.lease.acquire()
+                gate.set()
+                await task
+
+    async def test_cancellation_survives_a_failed_drain(self):
+        self.machine.block_code = 11510
+        task = asyncio.create_task(self.write())
+        await until(lambda: self.machine.blocked.is_set(), 5)
+        self.machine.fail_commands[11510] = ConnectionError("link lost")
+        task.cancel()
+        self.machine.release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        write = self.latest()
+        self.assertEqual(
+            (write["state"], write["attempts"][-1]["outcome"], write["retry_allowed"]),
+            ("cancelled", "cancelled", False),
+        )
+
+    async def exhaust(self):
+        self.machine.studio.reject_preset_attempts = 3
+        for _ in range(3):
+            exhausted = (await self.write())["attempt"]
+            await self.service.disconnect()
+        return exhausted
+
+    async def test_a_replacement_cancelled_before_preset_bytes_keeps_the_old_write(
+        self,
+    ):
+        exhausted = await self.exhaust()
+        self.machine.block_code = 11511
+        other = {**A, "flags": 5}
+        task = asyncio.create_task(
+            self.write(other, acknowledge_incomplete=exhausted["write_id"])
+        )
+        await until(lambda: self.machine.blocked.is_set(), 5)
+        task.cancel()
+        self.machine.release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.machine.block_code = None
+        await self.service.disconnect()
+        write = self.latest()
+        self.assertEqual(
+            (write["write_id"], write["state"]), (exhausted["write_id"], "exhausted")
+        )
+        for preset in (other, A):
+            with self.subTest(preset=preset), self.assertRaises(PresetWriteRefused):
+                await self.write(preset)
+        result = await self.write(other, acknowledge_incomplete=exhausted["write_id"])
+        self.assertEqual(result["attempt"]["state"], "saved")
+
+    async def test_a_replacement_interrupted_before_its_intent_keeps_the_old_write(
+        self,
+    ):
+        exhausted = await self.exhaust()
+        frames = self.frames()
+        context = {"device": self.service.device, "session_id": "s"}
+        self.store.append(
+            STARTED,
+            {
+                "write_id": "9" * 32,
+                "attempt_id": "8" * 32,
+                "acknowledges": exhausted["write_id"],
+                **A,
+                "flags": 5,
+            },
+            sequence=1,
+            **context,
+        )
+        # Its session committed only another command's intent: no preset byte.
+        self.store.append(
+            "command.intent",
+            {"command": 8022, "frame_hex": "58"},
+            sequence=2,
+            **context,
+        )
+        await self.service.close()
+        self.service = self.make(self.machine)
+        write = self.latest()
+        self.assertEqual(
+            (write["write_id"], write["state"]), (exhausted["write_id"], "exhausted")
+        )
+        with self.assertRaises(PresetWriteRefused):
+            await self.write({**A, "flags": 5})
+        # A committed preset intent may have sent bytes: the replacement stays.
+        self.store.append(
+            "command.intent",
+            {"command": 11510, "frame_hex": "58"},
+            sequence=3,
+            **context,
+        )
+        write = self.latest()
+        self.assertEqual((write["write_id"], write["state"]), ("9" * 32, "retryable"))
+        self.assertEqual(self.frames(), frames)
+
     async def test_cancelled_preparation_stops_automatic_repeats(self):
         self.machine.block_code = 11511
         task = asyncio.create_task(self.write())
@@ -1424,6 +1545,26 @@ class PresetRetryTests(ServiceCase):
         result = await self.write()
         self.assertEqual(result["attempt"]["state"], "saved")
         self.assertEqual(result["attempt"]["attempts_used"], 1)
+
+    async def test_a_batch_supersedes_only_slots_it_may_have_changed(self):
+        for slot in "ABC":
+            await self.write({**A, "slot": slot})
+            await self.service.disconnect()
+        # No preset frame: every saved summary survives.
+        self.machine.fail_commands[11511] = ConnectionError("lost while preparing")
+        result = await self.batch("A", "B", "C")
+        self.assertEqual(result["details"]["transmitted_write_count"], 0)
+        del self.machine.fail_commands[11511]
+        await self.service.disconnect()
+        states = [w["state"] for w in self.service.preset_writes()["writes"]]
+        self.assertEqual(states, ["saved"] * 3)
+        self.assertNotIn("preset_write.superseded", self.kinds())
+        # A fails on its frame: B and C were never at risk.
+        self.machine.fail_commands[11510] = ConnectionError("lost mid-batch")
+        await self.batch("A", "B", "C")
+        del self.machine.fail_commands[11510]
+        states = [w["state"] for w in self.service.preset_writes()["writes"]]
+        self.assertEqual(states, ["superseded", "saved", "saved"])
 
     async def test_a_batch_never_overwrites_an_unresolved_write(self):
         self.machine.studio.reject_preset_attempts = 1

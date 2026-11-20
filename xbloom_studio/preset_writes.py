@@ -5,9 +5,9 @@ inside the call. The daemon records each attempt in the existing event
 journal (SQLite, append-only, ``synchronous=FULL``): ``started`` is committed
 before the attempt's first frame, ``finished`` carries its outcome. A torn
 transaction never becomes a row. An attempt without a recorded outcome is
-``interrupted``, unless its own session's committed packets show a save after
-its first preset frame could reach the machine. Anything else unexpected
-fails closed.
+``interrupted``, unless its own session's committed packets or raw incoming
+chunks show a save after its first preset frame could reach the machine.
+Anything else unexpected fails closed.
 
 A write is the latest set of attempts for one machine and slot with identical
 flags and payload. At most :data:`MAX_ATTEMPTS` attempts that may have sent a
@@ -16,9 +16,11 @@ is incomplete; an observed save or cancellation ends automatic repetition,
 and only the user's explicit acknowledgment of the write ID (passed as
 ``acknowledge_incomplete``) starts a new set over an incomplete one. The
 acknowledgment is part of the new write's first ``started`` record, and it
-lapses while that write has no attempt that may have sent a frame. A batch
-write that may have changed a slot first records ``superseded`` for the slot's
-write. Outcomes are machine evidence, never a readback of stored contents.
+lapses while that write has no attempt that may have sent a frame: refused,
+or, over a write that already stops repetition, cancelled or interrupted with
+proof that no preset frame was sent. Before its first frame for a slot, a
+batch write records ``superseded`` for that slot's write. Outcomes are machine
+evidence, never a readback of stored contents.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from .machine_controls import SLOTS
+from .protocol import FrameBuffer, FrameError
 from .storage import ConflictError
 
 MAX_ATTEMPTS = 3
@@ -50,11 +53,14 @@ RETRYABLE = frozenset({"rejected", "unconfirmed", "interrupted"})
 SAVED = frozenset({"saved", "saved_cleanup_failed", "saved_interrupted"})
 # States a batch must not overwrite: they await a repeat or the user.
 UNRESOLVED = frozenset({"retryable", "exhausted", "cancelled", "in_progress"})
+# States that already stop automatic repetition; preserving one reopens nothing.
+STOPPED = frozenset({"exhausted", "cancelled"})
 # Kinds an attempt's session evidence is read from, by the session index.
 EVIDENCE_KINDS = (
     "command.intent",
     "ble.outgoing_chunk",
     "ble.outgoing_chunk_withheld",
+    "ble.incoming_chunk",
     "ble.packet",
 )
 PRESET_FRAME = 11510
@@ -65,7 +71,8 @@ SAVE_PACKET = {
     "marker": 0xC1,
     "payload_hex": "25000000",
 }
-Evidence = Callable[[str, int], bool]
+# What an unfinished attempt's session proves: "saved", "sent" or "unsent".
+Evidence = Callable[[str, int], str]
 
 
 class PresetWriteRefused(ConflictError):
@@ -76,18 +83,29 @@ class PresetWriteRefused(ConflictError):
         self.write = write
 
 
-def saved_after_transmission(rows: Iterable[Mapping[str, Any]]) -> bool:
-    """Whether committed session rows show a save after a preset frame was sent.
+def _is_save(fields: Mapping[str, Any]) -> bool:
+    return all(fields.get(key) == value for key, value in SAVE_PACKET.items())
+
+
+def attempt_evidence(rows: Iterable[Mapping[str, Any]]) -> str:
+    """What committed session rows prove about an attempt without an outcome.
 
     ``rows`` are one session's :data:`EVIDENCE_KINDS` rows after an attempt's
-    ``started`` record, in order. The correlation point matches the live
+    ``started`` record, in order. ``"saved"``: a save followed a preset frame
+    that could reach the machine. The correlation point matches the live
     attempt's: the transcript row of the chunk that completes a preset frame,
     unless the next row records that chunk as withheld. Rows are emitted in
-    that order synchronously, so nothing interleaves between the two.
+    that order synchronously, so nothing interleaves between the two. A save
+    counts from its decoded packet or, since a restart may find the raw chunk
+    committed without the packet decoded from it, from the raw incoming
+    chunks, decoded as the client does. ``"unsent"``: no preset frame's
+    intent committed, and every preset byte follows its committed intent.
+    ``"sent"``: anything else.
     """
     frame: str | None = None
     sent = ""
-    pending = transmitted = False
+    pending = transmitted = intended = False
+    frames = FrameBuffer()
     for row in rows:
         kind, data = row["kind"], json.loads(row["data"])
         if pending:
@@ -96,14 +114,32 @@ def saved_after_transmission(rows: Iterable[Mapping[str, Any]]) -> bool:
         if kind == "command.intent":
             sent = ""
             frame = data["frame_hex"] if data["command"] == PRESET_FRAME else None
+            intended = intended or frame is not None
         elif kind == "ble.outgoing_chunk" and frame is not None:
             sent += data["hex"]
             if sent == frame:
                 pending, frame = True, None
-        elif kind == "ble.packet" and transmitted:
-            if all(data.get(key) == value for key, value in SAVE_PACKET.items()):
-                return True
-    return False
+        elif kind == "ble.packet" and transmitted and _is_save(data):
+            return "saved"
+        elif kind == "ble.incoming_chunk":
+            try:
+                packets = frames.feed(bytes.fromhex(data["hex"]))
+            except FrameError as exc:
+                packets = exc.packets
+            if transmitted and any(
+                _is_save(
+                    {
+                        "device": packet.device,
+                        "function": packet.function,
+                        "command": packet.command,
+                        "marker": packet.marker,
+                        "payload_hex": packet.payload.hex(),
+                    }
+                )
+                for packet in packets
+            ):
+                return "saved"
+    return "sent" if intended else "unsent"
 
 
 def _outcome(
@@ -114,11 +150,29 @@ def _outcome(
     if attempt["attempt_id"] == active:
         return "in_progress"
     if "derived" not in attempt:
-        saved = evidence is not None and evidence(
-            attempt["session_id"], attempt["sequence"]
+        proof = (
+            "sent"
+            if evidence is None
+            else evidence(attempt["session_id"], attempt["sequence"])
         )
-        attempt["derived"] = "saved_interrupted" if saved else "interrupted"
+        attempt["derived"] = "saved_interrupted" if proof == "saved" else "interrupted"
+        attempt["unsent"] = proof == "unsent"
     return str(attempt["derived"])
+
+
+def _unsent(
+    attempt: dict[str, Any], active: str | None, evidence: Evidence | None
+) -> bool:
+    """Whether an attempt provably sent no preset frame."""
+    outcome = _outcome(attempt, active, evidence)
+    if outcome == "cancelled":
+        return (
+            attempt["transmitted_write_count"] == 0
+            and attempt["partial_frame"] is False
+        )
+    return outcome == "refused" or (
+        outcome == "interrupted" and attempt["unsent"] is True
+    )
 
 
 def _state(write: dict[str, Any], outcomes: list[str]) -> str:
@@ -191,15 +245,21 @@ def _summary(
 def _effective(
     write: dict[str, Any] | None, active: str | None, evidence: Evidence | None
 ) -> dict[str, Any] | None:
-    """An acknowledgment lapses while its write may not have sent a frame."""
-    while (
-        write is not None
-        and write["previous"] is not None
-        and all(
-            _outcome(attempt, active, evidence) == "refused"
-            for attempt in write["attempts"]
-        )
-    ):
+    """An acknowledgment lapses while its write may not have sent a frame.
+
+    Refusals always lapse it. Attempts cancelled or interrupted before any
+    preset frame lapse it only over a write that already stops automatic
+    repetition, so a cancellation never reopens one.
+    """
+    while write is not None and write["previous"] is not None:
+        attempts = write["attempts"]
+        if not all(
+            _outcome(attempt, active, evidence) == "refused" for attempt in attempts
+        ) and not (
+            _summary(write["previous"], active, evidence)["state"] in STOPPED
+            and all(_unsent(attempt, active, evidence) for attempt in attempts)
+        ):
+            break
         write = write["previous"]
     return write
 
@@ -221,7 +281,11 @@ def fold(
             slot, write_id = data["slot"], data["write_id"]
             if slot not in SLOTS or not isinstance(write_id, str):
                 raise ValueError("unknown slot or write ID")
-            write = writes[slot] = _effective(writes.get(slot), active, evidence)
+            write = writes.get(slot)
+            # An outcome belongs to the latest started write, even one whose
+            # session evidence would let it lapse once it is unfinished.
+            if row["kind"] != FINISHED:
+                write = writes[slot] = _effective(write, active, evidence)
             if row["kind"] == STARTED:
                 preset = {
                     "slot": slot,
@@ -266,6 +330,7 @@ def fold(
                         "sequence": row.get("sequence"),
                         "outcome": None,
                         "transmitted_write_count": None,
+                        "partial_frame": None,
                     }
                 )
             elif write is None or write["write_id"] != write_id:
@@ -280,6 +345,7 @@ def fold(
                     raise ValueError("duplicate or unknown outcome")
                 attempt["outcome"] = data["outcome"]
                 attempt["transmitted_write_count"] = data.get("transmitted_write_count")
+                attempt["partial_frame"] = data.get("partial_frame")
             elif row["kind"] == SUPERSEDED:
                 write["superseded"] = True
             else:

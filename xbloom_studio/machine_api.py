@@ -38,8 +38,8 @@ from .preset_writes import (
     SUPERSEDED,
     PresetWriteRefused,
     admit,
+    attempt_evidence,
     fold,
-    saved_after_transmission,
     supersede,
 )
 from .recipe_validation import HOST_STEPS, NATIVE, check_recipe
@@ -64,8 +64,8 @@ COMMANDS = {
     f"{MAX_ATTEMPTS} attempts per machine and slot. Optional backup is not "
     "readback.",
     "write_presets": "Write A/B/C once each; requires caller-supplied backups. "
-    "Refused over an incomplete write_preset; supersedes the slots' recorded "
-    "writes.",
+    "Refused over an incomplete write_preset; supersedes each slot's recorded "
+    "write before its first frame for that slot.",
     "set_water_source": "Select tank/tap source by the existing validated argument "
     "contract.",
     "read_pour_radius": "Query current raw value; also prepares/home the machine.",
@@ -373,16 +373,23 @@ class MachineCommandAPI:
                 values["backup_path"] = folder / (uuid.uuid4().hex + ".json")
             attempt: dict[str, Any] | None = None
             before = session._last_preset_write
+            pending = {record["slot"]: record for record in superseded}
+
+            async def supersede_slot(slot: str) -> None:
+                # Durable before the batch's first frame for this slot, and
+                # only for a slot that batch may change.
+                record = pending.pop(slot, None)
+                if record is not None:
+                    recorder.emit(SUPERSEDED, record)
+                    await recorder.flush()
+
             try:
                 if admitted is not None:
                     attempt = await self._begin_preset_write(
                         values["preset"], acknowledge, *admitted
                     )
-                if superseded:
-                    # Durable before any batch frame could change these slots.
-                    for record in superseded:
-                        recorder.emit(SUPERSEDED, record)
-                    await recorder.flush()
+                if pending:
+                    session._before_slot_write = supersede_slot
                 with recorder.capturing():
                     result: dict[str, Any] = await getattr(session, command)(**values)
             except PresetWriteError as exc:
@@ -405,6 +412,8 @@ class MachineCommandAPI:
                     with suppress(Exception):
                         await wait_cleanup(asyncio.ensure_future(recorder.flush()))
                 raise
+            finally:
+                session._before_slot_write = None
             if attempt is not None:
                 outcome = self._finish_preset_write(attempt, before)
                 await wait_cleanup(asyncio.ensure_future(recorder.flush()))
@@ -424,14 +433,14 @@ class MachineCommandAPI:
         if not self.device:
             raise ValueError("Configure a machine address for preset writes")
         rows = self.store.preset_write_events(self.device)
-        return fold(rows, self.preset_attempt, self._saved_evidence)
+        return fold(rows, self.preset_attempt, self._attempt_evidence)
 
-    def _saved_evidence(self, session_id: str | None, sequence: int | None) -> bool:
-        """A committed save in an unfinished attempt's own session after it began."""
+    def _attempt_evidence(self, session_id: str | None, sequence: int | None) -> str:
+        """What an unfinished attempt's own session committed after it began."""
         if session_id is None or sequence is None:
-            return False
+            return "sent"
         rows = self.store.session_events_after(session_id, sequence, EVIDENCE_KINDS)
-        return saved_after_transmission(rows)
+        return attempt_evidence(rows)
 
     def preset_writes(self, slot: str | None = None) -> dict[str, Any]:
         """The latest recorded single-slot write per slot; never connects.

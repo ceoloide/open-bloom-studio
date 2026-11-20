@@ -3,14 +3,15 @@
 import json
 import unittest
 
+from tests.frames import reply, u32
 from xbloom_studio.preset_writes import (
     FINISHED,
     STARTED,
     SUPERSEDED,
     PresetWriteRefused,
     admit,
+    attempt_evidence,
     fold,
-    saved_after_transmission,
     supersede,
 )
 
@@ -26,8 +27,10 @@ def started(attempt, write=W, **preset):
     return row(STARTED, write_id=write, attempt_id=attempt, **{**A, **preset})
 
 
-def finished(attempt, outcome, write=W):
-    return row(FINISHED, write_id=write, attempt_id=attempt, slot="A", outcome=outcome)
+def finished(attempt, outcome, write=W, **sent):
+    return row(
+        FINISHED, write_id=write, attempt_id=attempt, slot="A", outcome=outcome, **sent
+    )
 
 
 def acknowledging(attempt, write, acknowledges, **preset):
@@ -76,13 +79,59 @@ class FoldTests(unittest.TestCase):
         self.assertEqual(fold(interrupted)["A"]["state"], "retryable")
         self.assertEqual(fold(interrupted)["A"]["write_id"], X)
 
+    def test_a_replacement_that_provably_sent_nothing_keeps_a_stopped_write(self):
+        rows = [*exhausted(), {**acknowledging("d", X, W, flags=5), "session_id": "s"}]
+        rows[-1]["sequence"] = 9
+        unsent = {"transmitted_write_count": 0, "partial_frame": False}
+        # Cancelled before any preset byte, or interrupted before any durable
+        # preset intent: the exhausted write stays in force and still stops.
+        for tail, proof in (
+            ([finished("d", "cancelled", X, **unsent)], "sent"),
+            ([], "unsent"),
+        ):
+            with self.subTest(tail=tail):
+                write = fold(rows + tail, evidence=lambda *_, p=proof: p)["A"]
+                self.assertEqual((write["write_id"], write["state"]), (W, "exhausted"))
+                self.assertEqual(admit(write, A, W), (None, False))
+                with self.assertRaises(PresetWriteRefused):
+                    admit(write, A, None)
+        # A frame may have been sent, or its proof is missing: it stays.
+        for tail, proof, state in (
+            ([finished("d", "cancelled", X, transmitted_write_count=1)], "sent", 0),
+            ([finished("d", "cancelled", X, partial_frame=True)], "sent", 0),
+            ([finished("d", "cancelled", X)], "unsent", 0),
+            ([], "sent", 1),
+        ):
+            with self.subTest(tail=tail, proof=proof):
+                write = fold(rows + tail, evidence=lambda *_, p=proof: p)["A"]
+                self.assertEqual(
+                    (write["write_id"], write["state"]),
+                    (X, ("cancelled", "retryable")[state]),
+                )
+        # Over a write that may still repeat, a cancellation never reopens it,
+        # nor is a new first write's cancellation forgotten.
+        retryable = [started("a"), finished("a", "rejected")]
+        for prefix, rows_ in (
+            (
+                retryable,
+                [acknowledging("d", X, W), finished("d", "cancelled", X, **unsent)],
+            ),
+            ([], [started("d", X), finished("d", "cancelled", X, **unsent)]),
+        ):
+            with self.subTest(prefix=prefix):
+                write = fold(prefix + rows_)["A"]
+                self.assertEqual(
+                    (write["write_id"], write["state"], write["retry_allowed"]),
+                    (X, "cancelled", False),
+                )
+
     def test_journaled_save_evidence_resolves_an_interrupted_attempt(self):
         rows = [{**started("a"), "session_id": "s", "sequence": 7}]
         asked = []
 
         def evidence(session, sequence):
             asked.append((session, sequence))
-            return True
+            return "saved"
 
         write = fold(rows, evidence=evidence)["A"]
         self.assertEqual(asked, [("s", 7)])
@@ -199,13 +248,47 @@ def chunk(hex_, kind="ble.outgoing_chunk"):
     return (kind, {"hex": hex_})
 
 
+def incoming(*frames):
+    return [("ble.incoming_chunk", {"hex": data.hex()}) for data in frames]
+
+
+SAVED_FRAME = reply(8023, u32(0x25))
+
+
 class EvidenceTests(unittest.TestCase):
+    def test_a_raw_save_counts_before_its_decoded_packet_commits(self):
+        sent = [intent(), chunk("aabb"), chunk("ccdd")]
+        # A restart finds the raw chunk committed and the packet still queued.
+        for rows in (
+            [*sent, *incoming(SAVED_FRAME)],
+            [*sent, *incoming(SAVED_FRAME[:5], SAVED_FRAME[5:])],
+            # Corrupt input clears the buffer as the client does.
+            [*sent, *incoming(b"\x00", SAVED_FRAME)],
+            [*incoming(SAVED_FRAME[:5]), *sent, *incoming(SAVED_FRAME[5:])],
+        ):
+            with self.subTest(rows=rows):
+                self.assertEqual(attempt_evidence(evidence(*rows)), "saved")
+        for rows in (
+            [*incoming(SAVED_FRAME), *sent],
+            [intent(), chunk("aabb"), *incoming(SAVED_FRAME), chunk("ccdd")],
+            [*sent, *incoming(reply(8023, u32(0x44)), reply(8023, u32(0x25), 0xC2))],
+        ):
+            with self.subTest(rows=rows):
+                self.assertEqual(attempt_evidence(evidence(*rows)), "sent")
+
+    def test_no_committed_preset_intent_proves_nothing_was_sent(self):
+        for rows in ([], [packet()], [intent(8022, FRAME), chunk(FRAME)]):
+            with self.subTest(rows=rows):
+                self.assertEqual(attempt_evidence(evidence(*rows)), "unsent")
+        self.assertEqual(attempt_evidence(evidence(intent())), "sent")
+
     def test_a_save_counts_only_after_a_preset_frame_could_reach_the_machine(self):
         sent = [intent(), chunk("aabb"), chunk("ccdd")]
-        self.assertTrue(saved_after_transmission(evidence(*sent, packet())))
+        self.assertEqual(attempt_evidence(evidence(*sent, packet())), "saved")
         # The save followed the next frame's intent while its hook waited.
-        self.assertTrue(
-            saved_after_transmission(evidence(*sent, intent(), packet(), chunk("aa")))
+        self.assertEqual(
+            attempt_evidence(evidence(*sent, intent(), packet(), chunk("aa"))),
+            "saved",
         )
         for rows in (
             # Stale: before any preset frame, or during its unfinished chunks.
@@ -226,7 +309,7 @@ class EvidenceTests(unittest.TestCase):
             [*sent, packet(function=1)],
         ):
             with self.subTest(rows=rows):
-                self.assertFalse(saved_after_transmission(evidence(*rows)))
+                self.assertNotEqual(attempt_evidence(evidence(*rows)), "saved")
 
 
 if __name__ == "__main__":

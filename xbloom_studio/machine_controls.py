@@ -12,7 +12,7 @@ import json
 import math
 import os
 import struct
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -213,6 +213,10 @@ class MachineControls:
         "configure_grinder",
         "configure_brewer",
     )
+    # Awaited with each slot before a batch's first frame for that slot, so a
+    # caller can commit that the slot may change; never set by a caller's
+    # parameters.
+    _before_slot_write: Callable[[str], Awaitable[None]] | None = None
     UNTESTED_METHODS = (
         "write_preset",
         "write_presets",
@@ -238,6 +242,8 @@ class MachineControls:
         _scale_mode: bool
         _uncertain: bool
         _partial_frame: bool
+        _keep_cancellation: bool
+        _event_latch: Callable[[int, Packet], None] | None
         _event_revision: int
         _preset_write_used: bool
         _last_preset_write: dict[str, Any] | None
@@ -274,6 +280,7 @@ class MachineControls:
             after_revision: int,
             predicate: Callable[[Packet], bool],
             timeout: float,
+            events: Iterable[tuple[int, Packet]] | None = None,
         ) -> Packet: ...
 
         def _launch(
@@ -533,6 +540,8 @@ class MachineControls:
             self._preset_write_used = True
             start: int | None = None
             cursor: int | None = None
+            hook = self._before_slot_write
+            announced: set[str] = set()
 
             def is_save(packet: Packet) -> bool:
                 return packet.command == 8023 and packet.payload == PRESET_SAVED
@@ -540,11 +549,19 @@ class MachineControls:
             def is_rejection(packet: Packet) -> bool:
                 return packet.command == 8023 and packet.payload == PRESET_REJECTED
 
+            # Terminal evidence is latched for the attempt's lifetime, from
+            # before its first frame: no burst of other reports evicts it.
+            latched: list[tuple[int, Packet]] = []
+
+            def latch(revision: int, packet: Packet) -> None:
+                if is_save(packet) or is_rejection(packet):
+                    latched.append((revision, packet))
+
             def since(after: int, predicate: Callable[[Packet], bool]) -> Packet | None:
                 return next(
                     (
                         packet
-                        for revision, packet in self._received_events
+                        for revision, packet in latched
                         if revision > after and predicate(packet)
                     ),
                     None,
@@ -586,10 +603,17 @@ class MachineControls:
                         "Machine reported a rejection state; no further writes sent"
                     )
 
+            self._event_latch = latch
+            # A cancellation stays a cancellation even if the frame's write
+            # then fails; it ends automatic repetition.
+            self._keep_cancellation = True
             try:
                 await self._prepare()
                 for index, preset in enumerate(presets):
                     terminal()
+                    if hook is not None and preset.slot not in announced:
+                        announced.add(preset.slot)
+                        await hook(preset.slot)
                     packet = await self._command(
                         11510,
                         preset.body(),
@@ -620,6 +644,7 @@ class MachineControls:
                     cursor,
                     lambda packet: is_save(packet) or (single and is_rejection(packet)),
                     save_timeout,
+                    latched,
                 )
                 if not is_save(packet):
                     raise SessionError("Machine reported a rejection state, not a save")
@@ -657,6 +682,9 @@ class MachineControls:
                     "recovery in a fresh interaction",
                     result,
                 ) from exc
+            finally:
+                self._event_latch = None
+                self._keep_cancellation = False
 
     async def start_grinder_calibration(self, *, timeout: float = 180) -> Operation:
         async with self._lifecycle:
