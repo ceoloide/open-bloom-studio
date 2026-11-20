@@ -134,7 +134,8 @@ reads a preset back: even a success reports `readback_verified=false`.
 One `write_preset` call is one attempt of three planned frames. Its result's
 `attempt` field gives the `outcome` (`saved`, `saved_cleanup_failed`,
 `rejected`, `unconfirmed`, `cancelled` or `refused`; `interrupted` or
-`saved_interrupted` when the daemon stopped first), `attempts_used`,
+`saved_interrupted` when the daemon stopped first; `saved_late` when a save
+arrived while the outcome was being recorded), `attempts_used`,
 `retry_allowed` and `next_step`. When `retry_allowed` is true for a write the
 user asked for, call `machine_disconnect`, then submit `write_preset` again
 with exactly the same slot, flags and payload. Never recompile or change the

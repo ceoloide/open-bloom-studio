@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import uuid
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -383,46 +383,57 @@ class MachineCommandAPI:
                     recorder.emit(SUPERSEDED, record)
                     await recorder.flush()
 
-            try:
-                if admitted is not None:
-                    attempt = await self._begin_preset_write(
-                        values["preset"], acknowledge, *admitted
+            # An attempt's passive telemetry stays captured until its command's
+            # terminal record, so a save that arrives while its outcome
+            # commits is journaled evidence even without idle capture.
+            with recorder.capturing() if admitted is not None else nullcontext():
+                try:
+                    if admitted is not None:
+                        attempt = self._begin_preset_write(
+                            values["preset"], acknowledge, *admitted
+                        )
+                        await recorder.flush()
+                    if pending:
+                        session._before_slot_write = supersede_slot
+                    with recorder.capturing():
+                        result: dict[str, Any] = await getattr(session, command)(
+                            **values
+                        )
+                except PresetWriteError as exc:
+                    result = {
+                        "status": "failed",
+                        "error": str(exc),
+                        "type": type(exc).__name__,
+                        "details": deepcopy(exc.result),
+                        "recovery_required": session._uncertain,
+                    }
+                except BaseException as exc:
+                    if attempt is not None:
+                        # Records the terminal record too; may raise a late
+                        # cancellation instead.
+                        await self._settle_preset_write(command, attempt, before, exc)
+                        raise
+                    recorder.emit(
+                        "machine.command_failed",
+                        {
+                            "command": command,
+                            "type": type(exc).__name__,
+                            "error": str(exc),
+                        },
                     )
-                if pending:
-                    session._before_slot_write = supersede_slot
-                with recorder.capturing():
-                    result: dict[str, Any] = await getattr(session, command)(**values)
-            except PresetWriteError as exc:
-                result = {
-                    "status": "failed",
-                    "error": str(exc),
-                    "type": type(exc).__name__,
-                    "details": deepcopy(exc.result),
-                    "recovery_required": session._uncertain,
-                }
-            except BaseException as exc:
+                    if admitted is not None:
+                        # The outcome is committed before the guard admits a reader.
+                        with suppress(Exception):
+                            await wait_cleanup(asyncio.ensure_future(recorder.flush()))
+                    raise
+                finally:
+                    session._before_slot_write = None
                 if attempt is not None:
-                    self._finish_preset_write(attempt, before, exc)
-                recorder.emit(
-                    "machine.command_failed",
-                    {"command": command, "type": type(exc).__name__, "error": str(exc)},
-                )
-                if admitted is not None:
-                    # The outcome is committed before the guard admits a reader.
-                    with suppress(Exception):
-                        await wait_cleanup(asyncio.ensure_future(recorder.flush()))
-                raise
-            finally:
-                session._before_slot_write = None
-            if attempt is not None:
-                outcome = self._finish_preset_write(attempt, before)
-                await wait_cleanup(asyncio.ensure_future(recorder.flush()))
-                write = (await asyncio.to_thread(self._preset_ledger))[attempt["slot"]]
-                result["attempt"] = {
-                    "attempt_id": attempt["attempt_id"],
-                    "outcome": outcome,
-                    **write,
-                }
+                    settled = await self._settle_preset_write(
+                        command, attempt, before, result=result
+                    )
+                    assert settled is not None
+                    return settled
             recorder.emit(
                 "machine.command_finished", {"command": command, "result": result}
             )
@@ -457,7 +468,7 @@ class MachineCommandAPI:
             "writes": [write for key, write in writes.items() if slot in (None, key)],
         }
 
-    async def _begin_preset_write(
+    def _begin_preset_write(
         self,
         preset: SavedPreset,
         acknowledge: str | None,
@@ -465,7 +476,7 @@ class MachineCommandAPI:
         write_id: str | None,
         repeat: bool,
     ) -> dict[str, Any]:
-        """Check the session, then commit the attempt before any frame."""
+        """Check the session, then record the attempt; flush before any frame."""
         session, recorder = self._session, self._recorder
         if session._preset_write_used or session._uncertain:
             raise SessionError(
@@ -497,12 +508,109 @@ class MachineCommandAPI:
         )
         recorder.emit(STARTED, started)
         self.preset_attempt = attempt["attempt_id"]
-        try:
-            await recorder.flush()
-        except BaseException as exc:
-            self._finish_preset_write(attempt, session._last_preset_write, exc)
-            raise
         return attempt
+
+    async def _settle_preset_write(
+        self,
+        command: str,
+        attempt: dict[str, Any],
+        before: Any,
+        exc: BaseException | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Commit an attempt's outcome and its command's terminal record.
+
+        Runs under the guard and the caller's capture window. The outcome is
+        recorded once; a save journaled before the terminal record still
+        wins over it, in the ledger and in the summary returned here, which is
+        read after that record commits. A cancellation that arrives at any
+        point here is committed as the command's cancellation before the guard
+        is released, so it ends automatic repetition and the caller's
+        ``CancelledError`` matches the ledger. With ``exc`` the caller then
+        re-raises it, unless a late cancellation is raised here; journal
+        failures then stay suppressed.
+        """
+        recorder, late = self._recorder, False
+        cancel_recorded = isinstance(exc, asyncio.CancelledError)
+
+        async def settle(step: Any) -> Any:
+            nonlocal late
+            task = asyncio.ensure_future(step)
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    late = True
+            return task.result()
+
+        def cancel() -> None:
+            nonlocal cancel_recorded
+            cancel_recorded = True
+            recorder.emit(
+                "machine.command_failed",
+                {"command": command, "type": "CancelledError", "error": ""},
+            )
+
+        outcome = self._finish_preset_write(attempt, before, exc)
+        summary: dict[str, Any] | None = None
+        try:
+            await settle(recorder.flush())
+            if exc is not None:
+                recorder.emit(
+                    "machine.command_failed",
+                    {"command": command, "type": type(exc).__name__, "error": str(exc)},
+                )
+            elif late:
+                cancel()
+            else:
+                assert result is not None
+                # The summary is derived from the ledger after this record.
+                result["attempt"] = {
+                    "attempt_id": attempt["attempt_id"],
+                    "write_id": attempt["write_id"],
+                }
+                recorder.emit(
+                    "machine.command_finished", {"command": command, "result": result}
+                )
+            while True:
+                await settle(recorder.flush())
+                if late and not cancel_recorded:
+                    cancel()
+                    continue
+                if exc is not None or late:
+                    break
+                self.preset_attempt = None
+                summary = (await settle(asyncio.to_thread(self._preset_ledger)))[
+                    attempt["slot"]
+                ]
+                if not late:
+                    break
+        except Exception as failure:
+            if exc is None:
+                if late:
+                    raise asyncio.CancelledError() from failure
+                raise
+        finally:
+            self.preset_attempt = None
+        if late and not isinstance(exc, asyncio.CancelledError):
+            raise asyncio.CancelledError() from exc
+        if exc is not None:
+            return None
+        assert result is not None and summary is not None
+        mine = next(
+            (
+                item["outcome"]
+                for item in summary["attempts"]
+                if item["attempt_id"] == attempt["attempt_id"]
+            ),
+            outcome,  # Lapsed: it provably sent nothing.
+        )
+        result["attempt"] = {
+            "attempt_id": attempt["attempt_id"],
+            "outcome": mine,
+            **summary,
+        }
+        return result
 
     def _finish_preset_write(
         self, attempt: dict[str, Any], before: Any, exc: BaseException | None = None
@@ -532,7 +640,6 @@ class MachineCommandAPI:
                 "partial_frame": bool(mine.get("partial_frame")),
             },
         )
-        self.preset_attempt = None
         return outcome
 
     async def upload(

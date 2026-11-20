@@ -20,7 +20,7 @@ from xbloom_studio.errors import error_detail
 from xbloom_studio.journal import Recorder
 from xbloom_studio.machine_api import same_attempt, same_request
 from xbloom_studio.ownership import LeaseBusyError
-from xbloom_studio.preset_writes import STARTED, PresetWriteRefused
+from xbloom_studio.preset_writes import FINISHED, STARTED, PresetWriteRefused
 from xbloom_studio.storage import ConflictError, Store
 
 FAST = {
@@ -1598,6 +1598,303 @@ class PresetRetryTests(ServiceCase):
                 await self.write(preset)
         result = await self.write(other, acknowledge_incomplete=exhausted["write_id"])
         self.assertEqual(result["attempt"]["state"], "saved")
+
+    def unconfirmed(self):
+        # Every frame is acknowledged; no save arrives within the attempt.
+        self.machine.overrides[11510] = lambda p: [reply(11510, b"", 0xC2)]
+
+    def on_append(self, hook):
+        """Run ``hook(kind, data)`` on the journal thread before each append;
+        a hook returning False drops the row, as a crash before it would."""
+        append = self.store.append
+
+        def wrapped(kind, data, **context):
+            if hook(kind, data) is False:
+                return None
+            return append(kind, data, **context)
+
+        return patch.object(self.store, "append", wrapped)
+
+    def on_loop(self, callback):
+        """From the journal thread, run ``callback`` on the loop and wait."""
+        loop, done = asyncio.get_running_loop(), threading.Event()
+
+        def run():
+            try:
+                callback()
+            finally:
+                done.set()
+
+        def call():
+            loop.call_soon_threadsafe(run)
+            done.wait(5)
+
+        return call
+
+    def records(self, kind, attempt_id):
+        return [
+            event
+            for event in self.store.events(limit=10000)
+            if event["kind"] == kind and event["data"]["attempt_id"] == attempt_id
+        ]
+
+    async def test_a_save_while_the_outcome_commits_counts_with_default_capture(
+        self,
+    ):
+        self.unconfirmed()
+        save = self.on_loop(lambda: self.machine.state(0x25))
+
+        def hook(kind, data):
+            if kind == FINISHED:
+                save()  # Classified unconfirmed; the save arrives meanwhile.
+
+        with self.on_append(hook):
+            result = await self.write(save_timeout=0.05)
+        self.assertFalse(self.service.recorder.capture_idle_telemetry)
+        self.assertEqual(result["details"]["outcome"], "unconfirmed")
+        attempt = result["attempt"]
+        self.assertEqual(
+            [attempt[k] for k in ("outcome", "state", "retry_allowed")],
+            ["saved_late", "saved", False],
+        )
+        self.assertIn("no further write", attempt["next_step"])
+        # One recorded outcome; a restart derives the same and never replays.
+        self.assertEqual(len(self.records(FINISHED, attempt["attempt_id"])), 1)
+        await self.service.close()
+        self.service = self.make(self.machine)
+        write = self.latest()
+        self.assertEqual(
+            (write["state"], write["attempts"][-1]["outcome"]), ("saved", "saved_late")
+        )
+        with self.assertRaisesRegex(PresetWriteRefused, "already observed a save"):
+            await self.write()
+        self.assertEqual(self.frames(), 3)
+
+    async def test_a_save_after_the_command_finished_is_not_the_attempts(self):
+        await self.service.close()
+        self.service = self.make(self.machine, capture_idle_telemetry=True)
+        self.unconfirmed()
+        result = await self.write(save_timeout=0.05)
+        self.machine.state(0x25)
+        await self.service.recorder.flush()
+        saves = [
+            e
+            for e in self.store.events(limit=10000)
+            if e["kind"] == "ble.packet" and e["data"]["payload_hex"] == "25000000"
+        ]
+        self.assertEqual(len(saves), 1)  # Committed, but after the command.
+        write = self.latest()
+        self.assertEqual(
+            [write[k] for k in ("state", "retry_allowed")], ["retryable", True]
+        )
+        self.assertEqual(
+            (result["attempt"]["outcome"], write["attempts"][-1]["outcome"]),
+            ("unconfirmed", "unconfirmed"),
+        )
+
+    async def test_a_committed_raw_or_decoded_save_is_reconciled_after_restart(self):
+        save = reply(8023, u32(0x25))
+        packet = {
+            "device": 2,
+            "function": 7,
+            "command": 8023,
+            "marker": 0xC1,
+            "payload_hex": "25000000",
+        }
+        frame = "58aa"
+        cases = {
+            "raw": [("ble.incoming_chunk", {"hex": save.hex()})],
+            "decoded": [("ble.packet", packet)],
+            "after_terminal": [
+                ("machine.command_finished", {"command": "write_preset"}),
+                ("ble.packet", packet),
+            ],
+            "another_command": [
+                ("machine.command_requested", {"command": "back_home"}),
+                ("ble.packet", packet),
+            ],
+        }
+        for index, (name, tail) in enumerate(cases.items()):
+            slot = "ABC"[index % 3]
+            write_id, attempt_id = f"{index + 1}" * 32, f"{index + 5}" * 32
+            context = {"device": self.service.device, "session_id": name}
+            rows = [
+                (STARTED, {"write_id": write_id, "attempt_id": attempt_id}),
+                ("command.intent", {"command": 11510, "frame_hex": frame}),
+                ("ble.outgoing_chunk", {"hex": frame}),
+                (
+                    FINISHED,
+                    {
+                        "write_id": write_id,
+                        "attempt_id": attempt_id,
+                        "outcome": "unconfirmed",
+                        "transmitted_write_count": 3,
+                        "partial_frame": False,
+                    },
+                ),
+                *tail,
+            ]
+            for sequence, (kind, data) in enumerate(rows, 1):
+                if kind in (STARTED, FINISHED):
+                    data = {**data, **A, "slot": slot}
+                self.store.append(kind, data, sequence=sequence, **context)
+            write = self.latest(slot)
+            with self.subTest(name=name):
+                if name in ("raw", "decoded"):
+                    self.assertEqual(
+                        (write["state"], write["attempts"][-1]["outcome"]),
+                        ("saved", "saved_late"),
+                    )
+                    with self.assertRaisesRegex(PresetWriteRefused, "already"):
+                        await self.write({**A, "slot": slot})
+                else:
+                    self.assertEqual(
+                        (write["state"], write["retry_allowed"]), ("retryable", True)
+                    )
+        self.assertEqual(self.frames(), 0)
+
+    async def test_a_cancellation_while_the_outcome_commits_stops_repeats(self):
+        self.unconfirmed()
+        # Cancelled while the outcome commits, or later, while the command's
+        # terminal record commits.
+        for slot, target in (("A", FINISHED), ("B", "machine.command_finished")):
+            entered, gate = threading.Event(), threading.Event()
+
+            def hook(kind, data, target=target, entered=entered, gate=gate):
+                if kind == target:
+                    entered.set()
+                    gate.wait(5)
+
+            preset = {**A, "slot": slot}
+            with self.subTest(target=target), self.on_append(hook):
+                task = asyncio.create_task(self.write(preset, save_timeout=0.05))
+                await until(entered.is_set, 5)
+                task.cancel()
+                gate.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                # Committed before the guard admitted this reader.
+                write = self.latest(slot)
+                self.assertEqual(
+                    [write[k] for k in ("state", "retry_allowed")],
+                    ["cancelled", False],
+                )
+                attempt_id = write["attempts"][-1]["attempt_id"]
+                self.assertEqual(write["attempts"][-1]["outcome"], "cancelled")
+                finished = self.records(FINISHED, attempt_id)
+                self.assertEqual(
+                    [row["data"]["outcome"] for row in finished], ["unconfirmed"]
+                )
+                self.assertIn(
+                    {"command": "write_preset", "type": "CancelledError", "error": ""},
+                    [
+                        e["data"]
+                        for e in self.store.events(limit=10000)
+                        if e["kind"] == "machine.command_failed"
+                    ],
+                )
+            await self.service.disconnect()
+            frames = self.frames()
+            with self.assertRaisesRegex(PresetWriteRefused, "cancelled"):
+                await self.write(preset)
+            self.assertEqual(self.frames(), frames)
+
+    async def test_a_save_takes_precedence_over_a_late_cancellation(self):
+        self.unconfirmed()
+        entered, gate = threading.Event(), threading.Event()
+        save = self.on_loop(lambda: self.machine.state(0x25))
+
+        def hook(kind, data):
+            if kind == FINISHED:
+                save()
+                entered.set()
+                gate.wait(5)
+
+        with self.on_append(hook):
+            task = asyncio.create_task(self.write(save_timeout=0.05))
+            await until(entered.is_set, 5)
+            task.cancel()
+            gate.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        write = self.latest()
+        self.assertEqual(
+            (write["state"], write["attempts"][-1]["outcome"]), ("saved", "saved_late")
+        )
+
+    async def test_an_interrupted_replacement_that_withheld_its_first_chunk(self):
+        exhausted = await self.exhaust()
+        frames = self.frames()
+        other = {**A, "flags": 5}
+        crashed = []
+
+        def withheld(kind, data):
+            if crashed or kind == FINISHED:
+                crashed.append(kind)  # The daemon stops before the outcome.
+                return False
+            if kind == "command.intent" and data["command"] == 11510:
+                # The link drops after the intent commits, before any byte.
+                self.machine._connected = False
+            return None
+
+        with self.on_append(withheld):
+            await self.write(other, acknowledge_incomplete=exhausted["write_id"])
+        session = [
+            e["kind"]
+            for e in self.store.events(limit=10000)
+            if e["session_id"] == self.service.recorder.session_id
+            and e["kind"] != "ble.incoming_chunk"
+            and e["kind"] != "ble.packet"
+        ]
+        # Preparation frames, then the preset frame's withheld first chunk.
+        self.assertEqual(
+            session[-4:],
+            [
+                "command.intent",
+                "ble.outgoing_chunk",
+                "ble.outgoing_chunk_withheld",
+                "command.write_failed",
+            ],
+        )
+        intents = [
+            e["data"]["command"]
+            for e in self.store.events(limit=10000)
+            if e["kind"] == "command.intent"
+            and e["session_id"] == self.service.recorder.session_id
+        ]
+        self.assertEqual(intents[-1], 11510)
+        self.assertEqual(intents.count(11510), 1)
+        self.assertEqual(self.frames(), frames)
+        await self.service.close()
+        self.service = self.make(self.machine)
+        write = self.latest()
+        self.assertEqual(
+            (write["write_id"], write["state"]), (exhausted["write_id"], "exhausted")
+        )
+        for preset in (other, A):
+            with self.subTest(preset=preset), self.assertRaises(PresetWriteRefused):
+                await self.write(preset)
+
+    async def test_an_interrupted_replacement_after_a_bare_intent_stays(self):
+        exhausted = await self.exhaust()
+        other = {**A, "flags": 5}
+        crashed = []
+
+        def bare(kind, data):
+            if crashed:
+                return False
+            if kind == "command.intent" and data["command"] == 11510:
+                crashed.append(kind)  # Nothing after the intent commits.
+            return None
+
+        with self.on_append(bare):
+            await self.write(other, acknowledge_incomplete=exhausted["write_id"])
+        await self.service.close()
+        self.service = self.make(self.machine)
+        write = self.latest()
+        self.assertNotEqual(write["write_id"], exhausted["write_id"])
+        self.assertEqual([write[k] for k in ("state", "preset")], ["retryable", other])
+        self.assertEqual(write["attempts"][-1]["outcome"], "interrupted")
 
 
 if __name__ == "__main__":

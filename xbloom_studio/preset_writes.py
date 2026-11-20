@@ -7,7 +7,11 @@ before the attempt's first frame, ``finished`` carries its outcome. A torn
 transaction never becomes a row. An attempt without a recorded outcome is
 ``interrupted``, unless its own session's committed packets or raw incoming
 chunks show a save after its first preset frame could reach the machine.
-Anything else unexpected fails closed.
+The same session evidence, up to its command's terminal record, also
+reconciles a recorded outcome: a save that arrived while the outcome was
+committing wins (``saved_late``), and a cancellation committed before the
+command released its guard makes it ``cancelled``. Anything else unexpected
+fails closed.
 
 A write is the latest set of attempts for one machine and slot with identical
 flags and payload. At most :data:`MAX_ATTEMPTS` attempts that may have sent a
@@ -49,8 +53,9 @@ OUTCOMES = frozenset(
     }
 )
 RETRYABLE = frozenset({"rejected", "unconfirmed", "interrupted"})
-# "saved_interrupted" is derived: a journaled save, then no outcome.
-SAVED = frozenset({"saved", "saved_cleanup_failed", "saved_interrupted"})
+# Derived: "saved_interrupted" is a journaled save, then no outcome;
+# "saved_late" a journaled save in the attempt's window despite its outcome.
+SAVED = frozenset({"saved", "saved_cleanup_failed", "saved_interrupted", "saved_late"})
 # States a batch must not overwrite: they await a repeat or the user.
 UNRESOLVED = frozenset({"retryable", "exhausted", "cancelled", "in_progress"})
 # States that already stop automatic repetition; preserving one reopens nothing.
@@ -58,11 +63,20 @@ STOPPED = frozenset({"exhausted", "cancelled"})
 # Kinds an attempt's session evidence is read from, by the session index.
 EVIDENCE_KINDS = (
     "command.intent",
+    "command.write_failed",
     "ble.outgoing_chunk",
     "ble.outgoing_chunk_withheld",
     "ble.incoming_chunk",
     "ble.packet",
+    "capture.gap",
+    "machine.command_requested",
+    "machine.command_finished",
+    "machine.command_failed",
+    STARTED,
 )
+# The command's terminal records: they end an attempt's evidence window.
+TERMINAL = frozenset({"machine.command_finished", "machine.command_failed"})
+PASSIVE = frozenset({"ble.incoming_chunk", "ble.packet"})
 PRESET_FRAME = 11510
 SAVE_PACKET = {
     "device": 2,
@@ -71,7 +85,7 @@ SAVE_PACKET = {
     "marker": 0xC1,
     "payload_hex": "25000000",
 }
-# What an unfinished attempt's session proves: "saved", "sent" or "unsent".
+# What an attempt's session proves: "saved", "cancelled", "sent" or "unsent".
 Evidence = Callable[[str, int], str]
 
 
@@ -87,76 +101,139 @@ def _is_save(fields: Mapping[str, Any]) -> bool:
     return all(fields.get(key) == value for key, value in SAVE_PACKET.items())
 
 
+def _saves(frames: FrameBuffer, chunk: str) -> bool:
+    try:
+        packets = frames.feed(bytes.fromhex(chunk))
+    except FrameError as exc:
+        packets = exc.packets
+    return any(
+        _is_save(
+            {
+                "device": packet.device,
+                "function": packet.function,
+                "command": packet.command,
+                "marker": packet.marker,
+                "payload_hex": packet.payload.hex(),
+            }
+        )
+        for packet in packets
+    )
+
+
 def attempt_evidence(rows: Iterable[Mapping[str, Any]]) -> str:
-    """What committed session rows prove about an attempt without an outcome.
+    """What committed session rows prove about one attempt.
 
     ``rows`` are one session's :data:`EVIDENCE_KINDS` rows after an attempt's
-    ``started`` record, in order. ``"saved"``: a save followed a preset frame
-    that could reach the machine. The correlation point matches the live
-    attempt's: the transcript row of the chunk that completes a preset frame,
-    unless the next row records that chunk as withheld. Rows are emitted in
-    that order synchronously, so nothing interleaves between the two. A save
-    counts from its decoded packet or, since a restart may find the raw chunk
-    committed without the packet decoded from it, from the raw incoming
-    chunks, decoded as the client does. ``"unsent"``: no preset frame's
-    intent committed, and every preset byte follows its committed intent.
-    ``"sent"``: anything else.
+    ``started`` record, in order. Its window ends at its command's first
+    terminal record; nothing after another command's request or another
+    ``started`` record is the attempt's.
+
+    ``"saved"``: in the window, a save followed a preset frame that could
+    reach the machine. The correlation point matches the live attempt's: the
+    transcript row of the chunk that completes a preset frame, unless the next
+    row records that chunk as withheld. Rows are emitted in that order
+    synchronously, so nothing interleaves between the two. A save counts from
+    its decoded packet or, since a restart may find the raw chunk committed
+    without the packet decoded from it, from the raw incoming chunks, decoded
+    as the client does. Otherwise ``"cancelled"``: the command's terminal
+    records include its cancellation. Otherwise ``"unsent"``: every preset
+    frame's committed intent is followed by explicit proof that none of its
+    bytes was written (its first chunk observed, withheld at once and the
+    write failed, all emitted synchronously) and no row was lost. A bare
+    intent stays ambiguous: ``"sent"``.
     """
     frame: str | None = None
     sent = ""
-    pending = transmitted = intended = False
+    pending = transmitted = intended = closed = cancelled = gap = False
+    ambiguous = False
+    # How far the current preset intent's proof of no bytes has come.
+    proof: str | None = None
+    proof_chunk = ""
     frames = FrameBuffer()
     for row in rows:
         kind, data = row["kind"], json.loads(row["data"])
+        if kind in (STARTED, "machine.command_requested"):
+            break
+        if kind in TERMINAL:
+            closed = True
+            if kind == "machine.command_failed" and data.get("type") == (
+                "CancelledError"
+            ):
+                cancelled = True
+            continue
+        if closed:
+            continue
+        if proof is not None and not (proof == "intent" and kind in PASSIVE):
+            if (
+                proof == "intent"
+                and kind == "ble.outgoing_chunk"
+                and (data["hex"] and (frame or "").startswith(data["hex"]))
+            ):
+                proof, proof_chunk = "chunk", data["hex"]
+            elif (
+                proof == "chunk"
+                and kind == "ble.outgoing_chunk_withheld"
+                and data["hex"] == proof_chunk
+            ):
+                proof = "withheld"
+            elif (
+                proof == "withheld"
+                and kind == "command.write_failed"
+                and data["command"] == PRESET_FRAME
+            ):
+                proof = None
+            else:
+                proof, ambiguous = None, True
         if pending:
             pending = False
             transmitted = transmitted or kind != "ble.outgoing_chunk_withheld"
         if kind == "command.intent":
+            if proof is not None:
+                proof, ambiguous = None, True
             sent = ""
             frame = data["frame_hex"] if data["command"] == PRESET_FRAME else None
-            intended = intended or frame is not None
+            if frame is not None:
+                proof, intended = "intent", True
         elif kind == "ble.outgoing_chunk" and frame is not None:
             sent += data["hex"]
             if sent == frame:
                 pending, frame = True, None
+        elif kind == "capture.gap":
+            gap = True
         elif kind == "ble.packet" and transmitted and _is_save(data):
             return "saved"
-        elif kind == "ble.incoming_chunk":
-            try:
-                packets = frames.feed(bytes.fromhex(data["hex"]))
-            except FrameError as exc:
-                packets = exc.packets
-            if transmitted and any(
-                _is_save(
-                    {
-                        "device": packet.device,
-                        "function": packet.function,
-                        "command": packet.command,
-                        "marker": packet.marker,
-                        "payload_hex": packet.payload.hex(),
-                    }
-                )
-                for packet in packets
-            ):
+        elif kind == "ble.incoming_chunk" and _saves(frames, data["hex"]):
+            if transmitted:
                 return "saved"
-    return "sent" if intended else "unsent"
+    if cancelled:
+        return "cancelled"
+    if proof is not None:
+        ambiguous = True
+    return "sent" if ambiguous or (gap and intended) else "unsent"
 
 
 def _outcome(
     attempt: dict[str, Any], active: str | None, evidence: Evidence | None
 ) -> str:
-    if attempt["outcome"] is not None:
-        return str(attempt["outcome"])
+    # Running, or still settling its outcome and command: not final yet.
     if attempt["attempt_id"] == active:
         return "in_progress"
     if "derived" not in attempt:
-        proof = (
-            "sent"
-            if evidence is None
-            else evidence(attempt["session_id"], attempt["sequence"])
-        )
-        attempt["derived"] = "saved_interrupted" if proof == "saved" else "interrupted"
-        attempt["unsent"] = proof == "unsent"
+        recorded = attempt["outcome"]
+        proof = "sent"
+        if recorded not in SAVED and evidence is not None:
+            proof = evidence(attempt["session_id"], attempt["sequence"])
+        if recorded is None:
+            derived = "saved_interrupted" if proof == "saved" else "interrupted"
+        elif proof == "saved":
+            # A save takes precedence over any other recorded outcome.
+            derived = "saved_late"
+        elif proof == "cancelled":
+            derived = "cancelled"
+        else:
+            derived = recorded
+        attempt["derived"] = derived
+        attempt["unsent"] = recorded is None and proof == "unsent"
     return str(attempt["derived"])
 
 
@@ -271,8 +348,9 @@ def fold(
 ) -> dict[str, Any]:
     """The latest write per slot from journal rows in order; fail closed.
 
-    ``evidence(session_id, sequence)`` reports a journaled save for an
-    attempt without an outcome; it is asked only for such attempts.
+    ``evidence(session_id, sequence)`` reports what an attempt's session
+    journaled (see :func:`attempt_evidence`); it is asked once per attempt
+    without an observed save.
     """
     writes: dict[str, dict[str, Any] | None] = {}
     try:
@@ -344,6 +422,8 @@ def fold(
                 if attempt["outcome"] is not None or data["outcome"] not in OUTCOMES:
                     raise ValueError("duplicate or unknown outcome")
                 attempt["outcome"] = data["outcome"]
+                # Derived while it was unfinished; derive it again.
+                attempt.pop("derived", None)
                 attempt["transmitted_write_count"] = data.get("transmitted_write_count")
                 attempt["partial_frame"] = data.get("partial_frame")
             elif row["kind"] == SUPERSEDED:

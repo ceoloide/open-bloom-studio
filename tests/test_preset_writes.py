@@ -138,11 +138,53 @@ class FoldTests(unittest.TestCase):
         self.assertEqual(write["attempts"][0]["outcome"], "saved_interrupted")
         self.assertEqual((write["state"], write["retry_allowed"]), ("saved", False))
         self.assertEqual(fold(rows, "a", evidence)["A"]["state"], "in_progress")
-        finished_rows = [*rows, finished("a", "rejected")]
-        self.assertEqual(
-            fold(finished_rows, evidence=evidence)["A"]["state"], "retryable"
-        )
         self.assertEqual(len(asked), 1)
+
+    def test_window_evidence_reconciles_a_recorded_outcome(self):
+        rows = [{**started("a"), "session_id": "s", "sequence": 7}]
+        sent = {"transmitted_write_count": 3, "partial_frame": False}
+        for recorded in ("unconfirmed", "rejected", "cancelled"):
+            tail = [*rows, finished("a", recorded, **sent)]
+            with self.subTest(recorded=recorded):
+                # A save in the attempt's window wins over its recorded outcome.
+                write = fold(tail, evidence=lambda *_: "saved")["A"]
+                self.assertEqual(write["attempts"][0]["outcome"], "saved_late")
+                self.assertEqual(
+                    (write["state"], write["retry_allowed"]), ("saved", False)
+                )
+                self.assertIn("no further write", write["next_step"])
+                with self.assertRaises(PresetWriteRefused):
+                    admit(write, A, None)
+                # A committed cancellation of its command stops repetition.
+                write = fold(tail, evidence=lambda *_: "cancelled")["A"]
+                self.assertEqual(
+                    (write["attempts"][0]["outcome"], write["state"]),
+                    ("cancelled", "cancelled"),
+                )
+                self.assertFalse(write["retry_allowed"])
+                self.assertIn("Cancelled", write["next_step"])
+                # Nothing else changes it.
+                for proof in ("sent", "unsent"):
+                    write = fold(tail, evidence=lambda *_, p=proof: p)["A"]
+                    self.assertEqual(write["attempts"][0]["outcome"], recorded)
+        # A recorded save is final: its evidence is never read.
+        asked = []
+        write = fold(
+            [*rows, finished("a", "saved", **sent)],
+            evidence=lambda *args: asked.append(args) or "cancelled",
+        )["A"]
+        self.assertEqual((write["state"], asked), ("saved", []))
+        # An outcome derived while unfinished is derived again once recorded.
+        write = fold(
+            [*rows, started("b", "3" * 32, slot="B"), finished("a", "unconfirmed")],
+            evidence=lambda *_: "sent",
+        )["A"]
+        self.assertEqual(write["attempts"][0]["outcome"], "unconfirmed")
+        # Still settling its command: in progress, not yet final.
+        self.assertEqual(
+            fold([*rows, finished("a", "unconfirmed")], "a")["A"]["state"],
+            "in_progress",
+        )
 
     def test_a_superseded_write_reopens_the_slot(self):
         rows = [
@@ -255,6 +297,28 @@ def incoming(*frames):
 SAVED_FRAME = reply(8023, u32(0x25))
 
 
+def failed(command=11510):
+    return ("command.write_failed", {"command": command, "error": "x"})
+
+
+def terminal(kind="machine.command_finished", type_=None):
+    data = {"command": "write_preset"}
+    if type_ is not None:
+        data.update(type=type_, error="")
+    return (kind, data)
+
+
+CANCELLED = terminal("machine.command_failed", "CancelledError")
+# A preset intent whose first chunk was observed, then withheld before any
+# byte was written, and whose write failed: explicit proof of no bytes.
+EXCLUDED = [
+    intent(),
+    chunk("aabb"),
+    chunk("aabb", "ble.outgoing_chunk_withheld"),
+    failed(),
+]
+
+
 class EvidenceTests(unittest.TestCase):
     def test_a_raw_save_counts_before_its_decoded_packet_commits(self):
         sent = [intent(), chunk("aabb"), chunk("ccdd")]
@@ -275,6 +339,89 @@ class EvidenceTests(unittest.TestCase):
         ):
             with self.subTest(rows=rows):
                 self.assertEqual(attempt_evidence(evidence(*rows)), "sent")
+
+    def test_a_withheld_first_chunk_proves_no_preset_byte_was_sent(self):
+        for rows in (
+            EXCLUDED,
+            # Reports may commit while the intent's hook waits.
+            [intent(), packet(), *EXCLUDED[1:]],
+            [*EXCLUDED, *incoming(SAVED_FRAME), terminal()],
+            # A single-chunk frame withheld whole.
+            [
+                intent(frame="aabb"),
+                chunk("aabb"),
+                chunk("aabb", "ble.outgoing_chunk_withheld"),
+                failed(),
+                packet(),
+            ],
+            [*EXCLUDED, intent(8022, "58"), chunk("58")],
+        ):
+            with self.subTest(rows=rows):
+                self.assertEqual(attempt_evidence(evidence(*rows)), "unsent")
+        # Anything short of that explicit proof stays ambiguous.
+        for rows in (
+            [intent()],
+            EXCLUDED[:2],
+            EXCLUDED[:3],
+            [*EXCLUDED[:3], failed(8022)],
+            [intent(), failed()],
+            [intent(), chunk("bbcc"), chunk("bbcc", "ble.outgoing_chunk_withheld")],
+            [intent(), chunk("aabb"), chunk("aa", "ble.outgoing_chunk_withheld")],
+            [intent(), chunk("aabb"), packet(), *EXCLUDED[2:]],
+            [intent(), chunk("aabb"), chunk("ccdd"), *EXCLUDED[1:]],
+            [intent(), chunk("aabb"), chunk("cc", "ble.outgoing_chunk_withheld")],
+            [*EXCLUDED, *EXCLUDED[:1]],
+            [*EXCLUDED, ("capture.gap", {"lost_events": 1})],
+            [intent(), *EXCLUDED],
+        ):
+            with self.subTest(rows=rows):
+                self.assertEqual(attempt_evidence(evidence(*rows)), "sent")
+
+    def test_the_window_ends_at_the_commands_terminal_record(self):
+        sent = [intent(), chunk("aabb"), chunk("ccdd")]
+        # Saves before the terminal record count, even after the outcome.
+        for end in (terminal(), CANCELLED, terminal("machine.command_failed", "X")):
+            with self.subTest(end=end):
+                self.assertEqual(
+                    attempt_evidence(evidence(*sent, packet(), end)), "saved"
+                )
+                self.assertEqual(
+                    attempt_evidence(evidence(*sent, *incoming(SAVED_FRAME), end)),
+                    "saved",
+                )
+                # A later save is not this attempt's.
+                self.assertNotEqual(
+                    attempt_evidence(evidence(*sent, end, packet())), "saved"
+                )
+        # A save takes precedence over the command's cancellation.
+        self.assertEqual(
+            attempt_evidence(evidence(*sent, packet(), CANCELLED)), "saved"
+        )
+        # The command's cancellation, even after its terminal record.
+        for rows in (
+            [*sent, CANCELLED],
+            [*sent, terminal(), CANCELLED],
+            [*EXCLUDED, CANCELLED],
+        ):
+            with self.subTest(rows=rows):
+                self.assertEqual(attempt_evidence(evidence(*rows)), "cancelled")
+        # Nothing after another command's request or another attempt counts.
+        for boundary in (
+            ("machine.command_requested", {"command": "set_mode"}),
+            (STARTED, {}),
+        ):
+            with self.subTest(boundary=boundary):
+                self.assertEqual(
+                    attempt_evidence(evidence(*sent, terminal(), boundary, CANCELLED)),
+                    "sent",
+                )
+                self.assertEqual(
+                    attempt_evidence(evidence(*sent, boundary, packet())), "sent"
+                )
+                self.assertEqual(
+                    attempt_evidence(evidence(*EXCLUDED, boundary, intent())),
+                    "unsent",
+                )
 
     def test_no_committed_preset_intent_proves_nothing_was_sent(self):
         for rows in ([], [packet()], [intent(8022, FRAME), chunk(FRAME)]):
