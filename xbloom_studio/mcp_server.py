@@ -40,6 +40,7 @@ READ_ONLY = frozenset(
         "history_events",
         "operation_lookup",
         "machine_state",
+        "machine_preset_writes",
         "machine_prepare",
         "machine_capabilities",
     }
@@ -265,6 +266,7 @@ Invoke = Callable[..., Awaitable[Any]]
 Target = Literal["host", "coffee", "tea"]
 Family = Literal["green", "black", "oolong", "white", "pu-erh", "herbal", "cascara"]
 Detail = Literal["compact", "full"]
+Slot = Literal["A", "B", "C"]
 Status = Literal[
     "accepted",
     "running",
@@ -606,8 +608,11 @@ def _machine_tools(  # noqa: C901
         Pass allow_control=True and check machine_capabilities for which
         commands also require allow_untested. Excludes calibration and operation
         starters. Rejects active/prepared recipes, does not queue. Presets use
-        {slot,payload_hex,flags} objects and caller-supplied backup objects; the
-        service chooses private backup paths. A backup is not readback.
+        {slot,payload_hex,flags} objects and optional caller-supplied backup
+        objects; the service chooses private backup paths. A backup is not
+        readback. write_preset is one attempt: its result's attempt field says
+        whether the identical write may be resubmitted after a disconnect
+        (submit directly; it connects itself).
         Radius and vibration queries prepare the machine and return it home.
         Scale enter/tare/exit retains the connection.
         ACK confirms receipt, not physical effect or persistence.
@@ -689,6 +694,15 @@ def _machine_tools(  # noqa: C901
         """
         value = await invoke("machine_state")
         return compact_state(value) if detail == "compact" else value
+
+    @tool
+    async def machine_preset_writes(slot: Slot | None = None) -> dict[str, Any]:
+        """Read the latest recorded single-slot preset write per slot without
+        connecting: write ID, exact preset to resubmit, attempt outcomes,
+        remaining attempts, retry_allowed and next_step. Outcomes are machine
+        evidence, never a readback of stored contents.
+        """
+        return await invoke("machine_preset_writes", {"slot": slot})
 
     @tool
     async def machine_prepare(request: dict[str, Any]) -> dict[str, Any]:

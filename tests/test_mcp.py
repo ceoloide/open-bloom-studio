@@ -51,7 +51,7 @@ class ToolCase(unittest.IsolatedAsyncioTestCase):
 class ContractTests(ToolCase):
     async def test_tools_advertise_closed_strict_schemas(self):
         tools = {tool.name: tool for tool in await self.server.list_tools()}
-        self.assertEqual(len(tools), 41)
+        self.assertEqual(len(tools), 42)
         for name, tool in tools.items():
             with self.subTest(tool=name):
                 self.assertFalse(tool.input_schema.get("additionalProperties", False))
@@ -129,6 +129,29 @@ class ContractTests(ToolCase):
         )
         self.assertTrue(result.is_error)
         self.assertEqual(result.structured_content, outcome)
+
+    async def test_preset_write_attempts_are_reported_and_discoverable(self):
+        preset = {"slot": "A", "payload_hex": "6e6577", "flags": 4}
+        arguments = {
+            "command": "write_preset",
+            "params": {"preset": preset},
+            "allow_control": True,
+            "allow_untested": True,
+        }
+        error, value = await self.tool("machine_command", arguments)
+        self.assertFalse(error, value)
+        self.assertIsNone(value["backup"])
+        self.assertEqual(value["attempt"]["state"], "saved")
+        error, listing = await self.tool("machine_preset_writes", {"slot": "A"})
+        self.assertFalse(error, listing)
+        write = listing["writes"][0]
+        self.assertEqual((write["preset"], write["attempts_used"]), (preset, 1))
+        error, value = await self.tool("machine_command", arguments)
+        self.assertTrue(error)
+        self.assertEqual(value["error"]["code"], "conflict")
+        self.assertEqual(
+            value["error"]["details"]["preset_write"]["write_id"], write["write_id"]
+        )
 
     async def test_unknown_tools_and_domain_errors_are_structured(self):
         error, value = await self.tool("history_backup", {"destination": "/tmp/x"})
@@ -287,6 +310,7 @@ class ContractTests(ToolCase):
             "history_list": {},
             "history_events": {},
             "machine_prepare": {"request": WATER},
+            "machine_preset_writes": {"slot": "A"},
         }
         for name, params in arguments.items():
             with self.subTest(tool=name):

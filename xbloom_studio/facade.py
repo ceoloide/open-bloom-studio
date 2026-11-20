@@ -127,6 +127,7 @@ class Application:
             "recipe_start_uploaded": (machine_api.start_uploaded, False),
             "recipe_cancel_uploaded": (machine_api.cancel_uploaded, False),
             "machine_state": (machine_api.state, False),
+            "machine_preset_writes": (machine_api.preset_writes, True),
             "machine_prepare": (machine_api.prepare, True),
             "machine_connect": (machine_api.connect, False),
             "machine_disconnect": (machine_api.disconnect, False),

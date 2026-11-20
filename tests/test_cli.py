@@ -224,6 +224,12 @@ class RouteTests(CliCase):
                 {"token": "t", "allow_control": False},
             ),
             (
+                ("machine", "preset-writes", "--slot", "B"),
+                "machine_preset_writes",
+                {"slot": "B"},
+            ),
+            (("machine", "preset-writes"), "machine_preset_writes", {"slot": None}),
+            (
                 ("operation", "lookup", "k"),
                 "operation_lookup",
                 {"idempotency_key": "k"},

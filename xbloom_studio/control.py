@@ -12,7 +12,7 @@ import struct
 import time
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import TracebackType
@@ -416,6 +416,11 @@ class Interaction(MachineControls, ReadOnlyClient):
         # A frame was begun but not finished: later bytes would be appended
         # to it, so nothing more is written on this link.
         self._partial_frame = False
+        # While set, a caller cancelled during a frame's write sees that
+        # cancellation even if the write then fails or its deadline passes.
+        self._keep_cancellation = False
+        # Sees every decoded event, so bounded history cannot evict it.
+        self._event_latch: Callable[[int, Packet], None] | None = None
         self._prepared: dict[str, Any] | None = None
         self._last_preparation: dict[str, Any] | None = None
 
@@ -537,6 +542,8 @@ class Interaction(MachineControls, ReadOnlyClient):
             self._seen[CALIBRATED] = self._event_revision
         if packet.command not in MEASUREMENTS:
             self._received_events.append((self._event_revision, packet))
+        if self._event_latch is not None:
+            self._event_latch(self._event_revision, packet)
         op = self.operation
         if op is None or op._task is None or op._task.done() or not op._armed:
             return
@@ -775,10 +782,11 @@ class Interaction(MachineControls, ReadOnlyClient):
         after_revision: int,
         predicate: Callable[[Packet], bool],
         timeout: float,
+        events: Iterable[tuple[int, Packet]] | None = None,
     ) -> Packet:
         deadline = time.monotonic() + timeout
         while True:
-            for revision, packet in self._received_events:
+            for revision, packet in self._received_events if events is None else events:
                 if revision > after_revision and predicate(packet):
                     return packet
             if not self.state.connected:
@@ -900,6 +908,10 @@ class Interaction(MachineControls, ReadOnlyClient):
             try:
                 interrupted = await _drain(write)
                 cancelled = write.cancelled()
+                if interrupted and self._keep_cancellation:
+                    raise asyncio.CancelledError() from (
+                        None if cancelled else write.exception()
+                    )
                 if not cancelled:
                     write.result()
                 if expired == ["write"] or finished_at >= write_deadline:
