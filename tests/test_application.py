@@ -138,9 +138,11 @@ class LifecycleTests(ServiceCase):
         )
         await self.service.start(request, "gate", True)
         await until(lambda: self.service.gate is not None)
-        first = dict(self.service.gate)
-        ident = self.service.operation_id
-        self.assertEqual(self.store.operation(ident)["status"], "waiting_for_user")
+        # Gate creation and its database transition share the service guard.
+        async with self.service.guard:
+            first = dict(self.service.gate)
+            ident = self.service.operation_id
+            self.assertEqual(self.store.operation(ident)["status"], "waiting_for_user")
         with self.assertRaises(ConflictError):
             await self.service.acknowledge(ident, "wrong")
         self.assertEqual(
