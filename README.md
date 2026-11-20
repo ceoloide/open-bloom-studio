@@ -90,6 +90,9 @@ xbloom operation lookup first
 
 `xbloom serve` keeps one owner of the machine and the database behind a
 private Unix socket; other `xbloom` commands then use it automatically.
+Run the daemon and CLI under the same account with access to its home
+directory. They share ownership locks there even with different temporary
+directories.
 Pass `--device <address>` (or set `BLOOM_DEVICE`) for local Bluetooth, or
 `--connector package.module:factory` for any other connector.
 

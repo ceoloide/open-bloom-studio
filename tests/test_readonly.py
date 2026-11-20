@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import uuid
 from contextlib import aclosing
+from pathlib import Path
 from unittest import mock
 
 from tests import fake_bleak
@@ -22,7 +23,7 @@ from xbloom_studio import (
     plan,
 )
 from xbloom_studio.client import bounded, wait_set
-from xbloom_studio.ownership import AddressLease
+from xbloom_studio.ownership import AddressLease, lease_directory
 from xbloom_studio.transport import BleakTransport
 
 SCALE = reply(20501, struct.pack("<f", 0))
@@ -878,6 +879,24 @@ class PlanTests(unittest.TestCase):
 
 
 class LeaseTests(unittest.TestCase):
+    def test_lease_directory_uses_the_account_home(self):
+        with tempfile.TemporaryDirectory() as root:
+            with (
+                mock.patch("pwd.getpwuid") as account,
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "HOME": root + "/other-home",
+                        "XDG_STATE_HOME": root + "/other-state",
+                        "TMPDIR": root + "/private-tmp",
+                    },
+                ),
+            ):
+                account.return_value.pw_dir = root
+                self.assertEqual(
+                    lease_directory(), Path(root) / ".local/state/open-bloom/leases"
+                )
+
     def test_processes_with_distinct_tmpdirs_share_ownership(self):
         code = (
             "import sys; from xbloom_studio.ownership import AddressLease; "

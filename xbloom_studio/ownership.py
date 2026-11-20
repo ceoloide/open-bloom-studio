@@ -13,9 +13,17 @@ class LeaseBusyError(ConnectionError):
     """A cooperative lease is already held by another owner."""
 
 
+class LeaseDirectoryError(PermissionError):
+    """The shared per-user lease directory cannot be used safely."""
+
+
 def lease_directory() -> Path:
-    # Launchers can give the same user different TMPDIRs.
-    return Path("/tmp") / f"xbloom-{os.getuid()}"
+    import pwd
+
+    # The account's home is shared by the CLI and service even when either
+    # overrides HOME or runs in a private temporary directory.
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    return home / ".local" / "state" / "open-bloom" / "leases"
 
 
 class AddressLease:
@@ -38,20 +46,34 @@ class AddressLease:
         import fcntl
 
         directory = lease_directory()
-        directory.mkdir(mode=0o700, exist_ok=True)
-        info = directory.lstat()
+        try:
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            info = directory.lstat()
+        except PermissionError as exc:
+            raise LeaseDirectoryError(
+                "Cannot access the per-user lease directory"
+            ) from exc
+        except FileExistsError as exc:
+            raise LeaseDirectoryError("Lease directory path is occupied") from exc
         if (
             not stat.S_ISDIR(info.st_mode)
             or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) & 0o077
         ):
-            raise PermissionError(
+            raise LeaseDirectoryError(
                 "Lease directory must be private and owned by this user"
             )
         digest = hashlib.sha256(self.address.encode()).hexdigest()
-        fd = os.open(
-            directory / f"{digest}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
-        )
+        try:
+            fd = os.open(
+                directory / f"{digest}.lock",
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+            )
+        except PermissionError as exc:
+            raise LeaseDirectoryError(
+                "Cannot open a file in the per-user lease directory"
+            ) from exc
         handle = os.fdopen(fd, "r+")
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)

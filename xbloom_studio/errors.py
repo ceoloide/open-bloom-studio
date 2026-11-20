@@ -18,7 +18,7 @@ from .client import ProtocolCommandError, SessionError
 from .command_schema import CommandValidationError
 from .control import BusyError
 from .machine_controls import PresetWriteError, UntestedOperationError
-from .ownership import LeaseBusyError
+from .ownership import LeaseBusyError, LeaseDirectoryError
 from .providers import ProviderError
 from .recipe_validation import RecipeValidationError
 from .rpc_types import RemoteError, SocketDirectoryError
@@ -147,6 +147,14 @@ def error_detail(exc: BaseException, *, log_unexpected: bool = True) -> dict[str
             "busy",
             str(exc),
             "Use the existing owner or stop it cleanly before starting a new service.",
+        )
+    if isinstance(exc, LeaseDirectoryError):
+        return _detail(
+            name,
+            "permission_required",
+            str(exc),
+            "Check ownership and mode 0700 for the lease directory under "
+            "the account's home. Ensure the daemon user can write there.",
         )
     if isinstance(exc, SocketDirectoryError):
         return _detail(

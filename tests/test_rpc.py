@@ -21,6 +21,7 @@ from xbloom_studio.control import BusyError
 from xbloom_studio.errors import error_detail
 from xbloom_studio.facade import Application
 from xbloom_studio.machine_controls import PresetWriteError, UntestedOperationError
+from xbloom_studio.ownership import AddressLease, LeaseDirectoryError
 from xbloom_studio.providers import ProviderError
 from xbloom_studio.recipe_validation import RecipeValidationError
 from xbloom_studio.rpc import LocalServer, RemoteError, call, default_socket
@@ -107,6 +108,20 @@ class ErrorContractTests(unittest.TestCase):
                 self.assertEqual(detail["code"], code)
                 self.assertFalse(detail["retryable"])
                 self.assertNotIn("retry the start", detail["next_step"].lower())
+
+    def test_unsafe_lease_directory_has_actionable_permission_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / "leases"
+            directory.mkdir()
+            directory.chmod(0o755)
+            with patch(
+                "xbloom_studio.ownership.lease_directory", return_value=directory
+            ):
+                with self.assertRaises(LeaseDirectoryError) as raised:
+                    AddressLease("synthetic").acquire()
+        detail = error_detail(raised.exception)
+        self.assertEqual(detail["code"], "permission_required")
+        self.assertIn("0700", detail["next_step"])
 
     def test_unexpected_errors_hide_internals_with_a_correlation_id(self):
         with self.assertLogs("xbloom_studio.errors", "ERROR"):
