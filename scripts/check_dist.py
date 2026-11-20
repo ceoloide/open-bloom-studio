@@ -6,10 +6,12 @@ DIST_DIR must hold exactly one sdist and one wheel of this project. The
 distributed package files must match the tracked files under PACKAGE exactly,
 so additions to the package extend the check without editing this script.
 After an isolated install, every package data file is read back through
-importlib.resources and compared with its source, every console script must
-be installed and run offline against the bundled simulator, and the
-installed MCP adapter must complete a simulated operation with this
-environment's locked MCP SDK.
+importlib.resources and compared with its source, and every console script
+must be installed and run offline against the bundled simulator. The locked
+``mcp`` extra is then installed from the uv cache, without network access,
+and the documented quickstart runs through the installed scripts: direct
+mode, a simulator daemon, the CLI as its client and ``xbloom-mcp`` over stdio
+with the README's tool groups.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import tempfile
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from scripts import publication_policy
 
@@ -88,7 +91,7 @@ def egg_info_files(expected: Mapping[str, list[str]]) -> tuple[str, ...]:
 
 
 PROBE = """
-import hashlib, importlib.metadata, importlib.resources, json, sys, sysconfig
+import hashlib, importlib.metadata, importlib.resources, json, sys
 import {package}
 dist = importlib.metadata.distribution({project!r})
 
@@ -104,7 +107,6 @@ def resources(node, prefix):
 print(json.dumps({{
     "module": {package}.__file__,
     "prefix": sys.prefix,
-    "purelib": sysconfig.get_paths()["purelib"],
     "version": dist.version,
     "files": sorted(str(f) for f in dist.files or ()),
     "resources": dict(resources(
@@ -114,40 +116,118 @@ print(json.dumps({{
 """
 
 
-# Runs with this environment's interpreter and MCP SDK, but imports the
-# package from the installed wheel's site-packages given as the first argument.
-MCP_PROBE = """
-import asyncio, json, sys
-sys.path.insert(0, sys.argv[1])
+# Runs with the installed environment's interpreter after the locked mcp extra
+# is added. Arguments: the installed scripts directory and an empty work
+# directory. Default paths are redirected there, so the commands match the
+# README verbatim.
+DAEMON_PROBE = """
+import asyncio, json, os, select, signal, subprocess, sys
+from pathlib import Path
 import xbloom_studio
-from xbloom_studio.facade import Application
-from xbloom_studio.mcp_server import create_server
-from xbloom_studio.simulator import ScriptedConnector
-from xbloom_studio.storage import Store
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
-FAST = {"settle": 0, "subscription_settle": 0, "transition_delay": 0}
-REQUEST = {"kind": "water", "volume_ml": 50, "temperature_c": 20}
+scripts, root = Path(sys.argv[1]), Path(sys.argv[2])
+(root / "home").mkdir(parents=True)
+ENV = {**os.environ, "HOME": str(root / "home"), "XDG_DATA_HOME": str(root / "data"),
+       "XDG_RUNTIME_DIR": str(root / "run")}
+ENV.pop("BLOOM_DEVICE", None)
+WATER = {"kind": "water", "volume_ml": 50, "temperature_c": 20}
+ACTIVE = ("accepted", "running", "waiting_for_user")
 
 
-async def main():
-    store = Store(sys.argv[2])
-    app = Application(store, connector=ScriptedConnector(), interaction_options=FAST)
+def xbloom(*args):
+    done = subprocess.run([str(scripts / "xbloom"), *args], env=ENV, cwd=root,
+                          capture_output=True, text=True, timeout=120)
+    lines = [json.loads(line) for line in done.stdout.splitlines() if line.strip()]
+    return lines[-1] if lines else {}
+
+
+def status(reply):
+    data = reply.get("data") or {}
+    return data.get("status") or (data.get("operation") or {}).get("status")
+
+
+async def tools(group, calls):
+    server = StdioServerParameters(command=str(scripts / "xbloom-mcp"),
+                                   args=["--group", group], env=ENV, cwd=str(root))
+    async with stdio_client(server) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            listed = (await session.list_tools()).tools
+            return len(listed), await calls(session)
+
+
+async def call(session, name, arguments):
+    result = await session.call_tool(name, arguments)
+    return result.structured_content
+
+
+async def recipes(session):
+    return len((await call(session, "recipe_templates", {}))["result"])
+
+
+async def machine(session):
+    start = {"request": WATER, "idempotency_key": "mcp", "allow_control": True}
+    first = await call(session, "operation_start", start)
+    state = first["status"]
+    for _ in range(600):
+        found = await call(session, "operation_lookup", {"idempotency_key": "mcp"})
+        state = found["operation"]["status"]
+        if state not in ACTIVE:
+            break
+        await asyncio.sleep(0.1)
+    again = await call(session, "operation_start", start)
+    return {"id": first["id"], "status": state, "replayed": again["id"] == first["id"]}
+
+
+async def mcp():
+    result = {"tools": {}}
+    result["tools"]["recipes"], result["templates"] = await tools("recipes", recipes)
+    result["tools"]["machine"], result["operation"] = await tools("machine", machine)
+
+    async def history(session):
+        ident = result["operation"]["id"]
+        return (await call(session, "history_get", {"ident": ident}))["status"]
+
+    result["tools"]["history"], result["history"] = await tools("history", history)
+    return result
+
+
+result = {"module": xbloom_studio.__file__}
+result["direct"] = status(xbloom("--connector", "simulator", "--direct", "water",
+                                 "--volume-ml", "100", "--key", "first",
+                                 "--allow-control"))
+result["lookup"] = status(xbloom("operation", "lookup", "first"))
+serve = [str(scripts / "xbloom"), "--connector", "simulator", "serve"]
+daemon = subprocess.Popen(serve, env=ENV, cwd=root, stdout=subprocess.PIPE, text=True)
+try:
+    ready = select.select([daemon.stdout], [], [], 60)[0]
+    line = daemon.stdout.readline() if ready else ""
+    result["serving"] = "serving" in (json.loads(line or "{}").get("data") or {})
+    if result["serving"]:
+        result["connect"] = xbloom("machine", "connect").get("ok")
+        result["daemon"] = status(xbloom("water", "--volume-ml", "100", "--key",
+                                         "second", "--allow-control", "--wait"))
+        result["mcp"] = asyncio.run(asyncio.wait_for(mcp(), 300))
+finally:
+    daemon.send_signal(signal.SIGTERM)
     try:
-        server = create_server(caller=app.call)
-        tools = await server.list_tools()
-        start = {"request": REQUEST, "idempotency_key": "mcp", "allow_control": True}
-        await server.call_tool("operation_start", start)
-        await app.machine.task
-        found = await server.call_tool("operation_lookup", {"idempotency_key": "mcp"})
-        return len(tools), found.structured_content["operation"]["status"]
-    finally:
-        await app.close()
-        store.close()
-
-
-tools, status = asyncio.run(main())
-print(json.dumps({"module": xbloom_studio.__file__, "tools": tools, "status": status}))
+        result["exit"] = daemon.wait(60)
+    except subprocess.TimeoutExpired:
+        daemon.kill()
+        result["exit"] = daemon.wait()
+print(json.dumps(result))
 """
+EXPECTED_PROBE = {
+    "direct": "completed",
+    "lookup": "completed",
+    "serving": True,
+    "connect": True,
+    "daemon": "completed",
+    "exit": 0,
+}
+GROUPS = ("recipes", "machine", "history")
 
 
 class DistError(Exception):
@@ -365,14 +445,18 @@ def check_install(
     problems += compare_names("installed", installed, set(package_files))
     problems += check_resources(result["resources"], package_files)
     if not problems:
-        problems += check_entry_points(venv, workdir, result["purelib"], run)
+        problems += check_entry_points(venv, workdir, run)
     return problems
 
 
 def check_entry_points(
-    venv: Path, workdir: Path, purelib: str, run: Runner = run_command
+    venv: Path, workdir: Path, run: Runner = run_command, project: Path | None = None
 ) -> list[str]:
-    """Run the installed console scripts and MCP adapter against the simulator."""
+    """Run the installed console scripts against the simulator.
+
+    The MCP SDK comes from the locked ``mcp`` extra of ``project`` (default:
+    the working directory), synced offline from the uv cache.
+    """
     scripts = venv / ("Scripts" if sys.platform == "win32" else "bin")
     missing = [name for name in ENTRY_POINTS if not (scripts / name).is_file()]
     if missing:
@@ -400,12 +484,52 @@ def check_entry_points(
     lines = [json.loads(line) for line in output.splitlines() if line.strip()]
     if not lines or lines[-1].get("data", {}).get("status") != "completed":
         problems.append("installed xbloom did not complete a simulated operation")
-    probe = [sys.executable, "-I", "-c", MCP_PROBE, purelib, str(workdir / "mcp.db3")]
-    result = json.loads(run(probe))
+    # Lockfile URLs resolve from the cache the presubmit sync just filled;
+    # --inexact keeps the installed wheel.
+    run(
+        [
+            "env",
+            f"UV_PROJECT_ENVIRONMENT={venv}",
+            "uv",
+            "sync",
+            "--quiet",
+            "--frozen",
+            "--offline",
+            "--inexact",
+            "--no-install-project",
+            "--no-dev",
+            "--extra",
+            "mcp",
+            "--project",
+            str(project or Path.cwd()),
+        ]
+    )
+    python = scripts / ("python.exe" if sys.platform == "win32" else "python")
+    probe = [str(python), "-I", "-c", DAEMON_PROBE, str(scripts), str(workdir / "q")]
+    return problems + check_probe(json.loads(run(probe)), venv)
+
+
+def check_probe(result: Mapping[str, Any], venv: Path) -> list[str]:
+    """Problems in the installed daemon, CLI client and MCP stdio flow."""
+    problems = []
     if not Path(result["module"]).resolve().is_relative_to(venv.resolve()):
-        problems.append("MCP probe did not import the installed package")
-    if result["tools"] < 1 or result["status"] != "completed":
-        problems.append("installed MCP adapter did not complete a simulated operation")
+        problems.append("daemon probe did not import the installed package")
+    problems += [
+        f"installed quickstart step {step} returned {result.get(step)!r}"
+        for step, value in EXPECTED_PROBE.items()
+        if result.get(step) != value
+    ]
+    mcp = result.get("mcp") or {}
+    operation = mcp.get("operation") or {}
+    if (
+        sorted(mcp.get("tools") or {}) != sorted(GROUPS)
+        or not all(mcp["tools"].values())
+        or not mcp.get("templates")
+        or operation.get("status") != "completed"
+        or operation.get("replayed") is not True
+        or mcp.get("history") != "completed"
+    ):
+        problems.append("installed xbloom-mcp did not complete the stdio flow")
     return problems
 
 

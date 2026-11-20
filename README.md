@@ -1,7 +1,8 @@
 # Open Bloom Studio
 
 Open Bloom Studio is an independent open-source project building local tools
-for xBloom Studio coffee and tea machines.
+for xBloom Studio coffee and tea machines: a Python library, the `xbloom`
+command line with a local daemon, the `xbloom-mcp` server and agent skills.
 
 This project is not affiliated with, endorsed by, or sponsored by xBloom.
 Product names are used only to describe compatibility and remain the property
@@ -9,20 +10,74 @@ of their respective owners.
 
 ## Status
 
-Early development. Nothing is released yet.
+Alpha (0.0.1a0). Interfaces may change. Brewing coffee or tea from encoded
+recipes, preset writes and some settings commands are not validated on
+hardware and stay behind an explicit experimental opt-in.
 
-## Usage
+## Install
 
-The core package has no runtime dependencies. Local Bluetooth support uses
-[Bleak](https://github.com/hbldh/bleak) through the optional `ble` extra:
+Python 3.10 or newer. Install the tagged source with the extras you need:
+`ble` for local Bluetooth through [Bleak](https://github.com/hbldh/bleak) and
+`mcp` for the MCP server. The core library has no dependencies.
 
 ```sh
-pip install "open-bloom-studio[ble]"
+git clone --branch 0.0.1-alpha https://github.com/ceoloide/open-xbloom-studio-tools
+pip install "./open-xbloom-studio-tools[ble,mcp]"
 ```
 
-Read-only sessions register a telemetry session and never change settings.
-Controls require an explicit `allow_control=True`; commands that are not
-hardware-tested additionally require `allow_untested=True`.
+## Try it offline
+
+The bundled simulator is a deterministic, in-memory machine for tests and
+examples; it does not model physical timing.
+
+```sh
+xbloom recipe templates
+xbloom --connector simulator --direct water --volume-ml 100 --key first --allow-control
+xbloom operation lookup first
+```
+
+Every start needs an idempotency key. Reusing a key returns the recorded
+attempt and never starts the machine again. After any uncertainty, inspect
+`xbloom operation lookup KEY` instead of starting with a new key. A start
+whose delivery stays unconfirmed is recorded `unknown`, not `failed`, and is
+never replayed.
+
+## Use a machine
+
+Controls require `--allow-control` (`allow_control=True` in Python); commands
+that are not hardware-tested additionally require `--allow-untested`.
+Read-only sessions never change settings.
+
+`xbloom serve` keeps one owner of the machine and the database behind a
+private Unix socket; other `xbloom` commands and `xbloom-mcp` then use it.
+Pass `--device <address>` (or set `BLOOM_DEVICE`) for local Bluetooth:
+
+```sh
+xbloom --device <address> serve &
+xbloom machine connect
+xbloom water --volume-ml 100 --key second --allow-control --wait
+```
+
+Replace `--device <address>` with `--connector simulator` to try the same
+flow offline. Run the daemon and the CLI under the same account; they share
+ownership locks in `~/.local/state/open-bloom/leases` under that account's
+home. A daemon that restarts marks interrupted work `unknown` and does not
+replay it.
+
+For a daemon on another host, add `--ssh <host-alias>` to any `xbloom`
+command. It runs `xbloom relay` there over your SSH configuration with strict
+host-key checking. Pin the relay as a forced command for that key, for example
+`restrict,command="xbloom relay --socket /run/open-bloom/bloom.sock"`; it
+forwards only a fixed method list.
+
+### Other links
+
+Any byte link implementing `xbloom_studio.Connector` (lifecycle, write size,
+notifications and a stable machine identity; see `xbloom_studio/connector.py`)
+runs behind the same handshake, control gates, acknowledgments, serialization
+and uncertainty tracking. Pass `--connector package.module:factory` to `serve`
+or `--direct`; the factory is called with the configured device (or `None`)
+and returns the connector. In Python:
 
 ```python
 import asyncio
@@ -31,9 +86,7 @@ from xbloom_studio import Interaction, ScriptedConnector, Studio
 
 
 async def main():
-    # Any byte link implementing xbloom_studio.Connector can replace the
-    # simulator, for example BleakConnector("<machine address>").
-    connector = ScriptedConnector()
+    connector = ScriptedConnector()  # or BleakConnector("<address>"), or yours
     print(await Studio(connector=connector).read_device_info())
     async with Interaction(connector=connector, allow_control=True) as machine:
         print(await machine.dispense_water(volume_ml=100))
@@ -42,104 +95,59 @@ async def main():
 asyncio.run(main())
 ```
 
-`ScriptedConnector` with `SimulatedStudio` is a deterministic, in-memory
-simulator for tests and examples; it does not model physical timing. The
-library validates the session handshake, gates every control frame, waits for
-acknowledgments, serializes and segments writes, and reports uncertain
-outcomes above the connector, so every link runs behind the same checks.
+`xbloom_studio.facade.Application(store, connector=...)` exposes the same
+`call(method, params)` dispatch as the CLI, daemon and MCP server.
 
 ## Recipes and history
 
-Recipes are JSON documents validated offline with `check_recipe`, which
-reports every problem with its path and allowed values. `compile_recipe`
-turns a coffee or tea recipe into a plan holding the exact bytes to upload;
-hardware execution of encoded recipes remains untested and requires
-`allow_untested=True`.
-
-```python
-from xbloom_studio import check_recipe, recipe_templates
-from xbloom_studio.recipes import compile_recipe
-
-document = recipe_templates()[0]["document"]
-assert check_recipe(document)["valid"]
-plan = compile_recipe(document)
-```
-
-`xbloom_studio.storage.Store` keeps a local SQLite library of recipe
-revisions, aliases and brew history, by default under
-`$XDG_DATA_HOME/open-bloom/`. A repeated brew reuses its stored plan byte for
-byte. `xbloom_studio.journal.JournalHooks` commits the intent before a normal
-command writes its first byte. Stop commands proceed after a bounded journal
-wait so a stalled disk cannot block a stop.
+Recipes are JSON documents validated offline (`xbloom recipe validate FILE`,
+or `check_recipe` in Python), which reports every problem with its path and
+allowed values. `xbloom recipe constraints` lists every field and bound. A
+local SQLite library, by default under `$XDG_DATA_HOME/open-bloom/`, keeps
+recipe revisions, aliases and every attempt with its exact plan, so a repeat
+reuses the stored plan byte for byte.
 
 The bundled starter recipes, coffee examples and tea profiles are original to
-this project. The example and tea lookups also accept your own collection
-through a `path` argument. Recipe imports are user-directed: one public recipe
-page at a time, or an owner-supplied xRecipe export read offline.
+this project. Recipe imports are user-directed: one public recipe page at a
+time, or an export you supply, read offline.
 
-## Command line, daemon and MCP
+## MCP server and agent skills
 
-Every interface calls the same allowlisted application methods, so Python,
-`xbloom`, the daemon and `xbloom-mcp` behave alike. Try them offline with the
-simulator:
+`xbloom-mcp` serves the same methods as MCP tools over stdio and needs a
+running daemon (`xbloom-mcp --ssh <host-alias>` for a remote one). Tools come
+in three groups, so a client can be given only the roles it needs:
 
-```sh
-xbloom --connector simulator --direct water --volume-ml 100 --key first --allow-control
-xbloom operation lookup first
+```json
+{
+  "mcpServers": {
+    "bloom-recipes": {"command": "xbloom-mcp", "args": ["--group", "recipes"]},
+    "bloom-history": {"command": "xbloom-mcp", "args": ["--group", "history"]},
+    "bloom-machine": {"command": "xbloom-mcp", "args": ["--group", "machine"]}
+  }
+}
 ```
 
-`xbloom serve` keeps one owner of the machine and the database behind a
-private Unix socket; other `xbloom` commands then use it automatically.
-Run the daemon and CLI under the same account with access to its home
-directory. They share ownership locks in `~/.local/state/open-bloom/leases`,
-where `~` is the service account's home. When upgrading from a build that
-used temporary-directory locks, stop existing daemons and finish any
-direct-mode operations before starting the new version.
-Pass `--device <address>` (or set `BLOOM_DEVICE`) for local Bluetooth, or
-`--connector package.module:factory` for any other connector.
-
-```sh
-xbloom --connector simulator serve &
-xbloom machine connect
-xbloom water --volume-ml 100 --key second --allow-control --wait
-```
-
-Every start needs an idempotency key. Reusing a key returns the recorded
-attempt and never starts the machine again, whichever adapter sends it and
-whether declared defaults are omitted or spelled out; after any uncertainty,
-inspect `xbloom operation lookup <key>` instead of starting with a new key. A
-start whose command delivery stays unconfirmed is recorded `unknown`, not
-`failed`. A daemon that restarts marks interrupted work `unknown` and does not
-replay it.
-
-For a daemon on another host, `xbloom --ssh <host-alias> ...` runs
-`xbloom relay` there over your existing SSH configuration with strict host-key
-checking. Pin the relay as a forced command for that key, for example
-`restrict,command="xbloom relay --socket /run/open-bloom/bloom.sock"`; it forwards only
-a fixed method list, never backups. The MCP server needs the `mcp` extra and a
-running daemon:
-
-```sh
-pip install "open-bloom-studio[mcp]"
-xbloom-mcp            # or: xbloom-mcp --ssh <host-alias>
-```
-
-In Python, `xbloom_studio.facade.Application(store, connector=...)` exposes
-the same `call(method, params)` dispatch.
+The `skills/` folder holds four Agent Skills (`SKILL.md` folders) that
+teach an agent to use these tools safely: `bloom-recipes` (author, store and
+import recipes), `bloom-tea` (craft tea drafts), `bloom-history` (find past
+brews and add feedback) and `bloom-operate` (run, watch, stop and recover
+machine work). Copy the folders into your agent's skills directory, for
+example `~/.claude/skills/` for Claude Code. The skills ask for explicit user
+permission before any physical action and never retry an uncertain start.
 
 ## Development
 
-The repository uses [uv](https://docs.astral.sh/uv/) with a committed lockfile.
-One command runs every check that CI runs: formatting, lint, strict typing,
-the publication policy, the offline test suite with line and branch coverage
-gates, and the build, content and installation checks for the sdist and wheel.
+The repository uses [uv](https://docs.astral.sh/uv/) with a committed
+lockfile. One command runs every check that CI runs: formatting, lint, strict
+typing, the publication policy, the offline tests with coverage gates, and the
+build and installed-artifact checks for the sdist and wheel, including the
+CLI, daemon and MCP stdio server against the simulator.
 
 ```sh
 uv run --locked python -m scripts.presubmit
 ```
 
-Tests use no real machine. An in-process Python socket guard permits loopback
-and local Unix sockets, with the system bus excluded.
+Tests use no real machine.
 
 ## License
 

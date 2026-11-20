@@ -284,11 +284,9 @@ class ArtifactTest(unittest.TestCase):
 class InstallTest(unittest.TestCase):
     def probe(self, workdir, **changes):
         venv = (workdir / "venv").resolve()
-        purelib = str(venv / "lib/site-packages")
         result = {
             "module": str(venv / "lib/site-packages/xbloom_studio/__init__.py"),
             "prefix": str(venv),
-            "purelib": purelib,
             "version": VERSION,
             "files": [*PACKAGE_FILES, f"{STEM}.dist-info/RECORD"],
             "resources": {"xbloom_studio/py.typed": EMPTY_SHA256},
@@ -307,9 +305,7 @@ class InstallTest(unittest.TestCase):
                 Path("x.whl"), workdir, PACKAGE_FILES, VERSION, run
             )
         if not problems:
-            entry_points.assert_called_once_with(
-                venv.parent / "venv", workdir, purelib, run
-            )
+            entry_points.assert_called_once_with(venv.parent / "venv", workdir, run)
         return problems, commands
 
     def test_install_is_isolated_and_complete(self):
@@ -399,21 +395,38 @@ class InstallTest(unittest.TestCase):
         for name in scripts:
             (venv / "bin" / name).write_text("")
         completed = json.dumps({"ok": True, "data": {"status": "completed"}})
-        probe = {"module": str(venv / "x.py"), "tools": 41, "status": "completed"}
-        values = {"cli": completed + "\n", "mcp": json.dumps(probe)}
+        values = {"cli": completed + "\n", "probe": json.dumps(self.daemon(venv))}
         values.update(outputs)
         commands = []
 
         def run(command):
             commands.append(command)
-            if command[0] == sys.executable:
-                return values["mcp"]
+            if command[0] == str(venv / "bin" / "python"):
+                return values["probe"]
             if command[0].endswith("xbloom"):
                 return values["cli"]
             return ""
 
-        problems = check_dist.check_entry_points(venv, workdir, "/site", run)
+        problems = check_dist.check_entry_points(
+            venv, workdir, run, project=Path("/project")
+        )
         return problems, commands
+
+    @staticmethod
+    def daemon(venv, **changes):
+        operation = {"id": "op", "status": "completed", "replayed": True}
+        result = {
+            **check_dist.EXPECTED_PROBE,
+            "module": str(venv / "lib/xbloom_studio/__init__.py"),
+            "mcp": {
+                "tools": {"recipes": 2, "machine": 3, "history": 1},
+                "templates": 3,
+                "operation": operation,
+                "history": "completed",
+            },
+        }
+        result.update(changes)
+        return result
 
     def test_installed_entry_points_run_the_simulator(self):
         problems, commands = self.entry_points()
@@ -421,28 +434,56 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(commands[0][1:], ["--help"])
         self.assertIn("simulator", commands[1])
         self.assertIn("--direct", commands[1])
-        self.assertEqual(commands[2][1:3], ["-I", "-c"])
-        self.assertEqual(commands[2][4], "/site")
+        sync, probe = commands[2:]
+        self.assertEqual([sync[0], *sync[2:4]], ["env", "uv", "sync"])
+        self.assertEqual(sync[1], f"UV_PROJECT_ENVIRONMENT={Path(probe[4]).parent}")
+        for flag in ("--frozen", "--offline", "--inexact", "--no-install-project"):
+            self.assertIn(flag, sync)
+        self.assertEqual(sync[sync.index("--extra") + 1], "mcp")
+        self.assertEqual(sync[sync.index("--project") + 1], "/project")
+        self.assertEqual(probe[1:4], ["-I", "-c", check_dist.DAEMON_PROBE])
+        self.assertTrue(probe[4].endswith("bin"))
 
     def test_installed_entry_point_problems(self):
         problems, commands = self.entry_points(scripts=("xbloom",))
         self.assertEqual(problems, ["installed entry point missing: xbloom-mcp"])
         self.assertEqual(commands, [])
         failed = json.dumps({"ok": True, "data": {"status": "failed"}})
-        elsewhere = {"module": "/elsewhere/x.py", "tools": 0, "status": "failed"}
-        problems, _ = self.entry_points(cli=failed, mcp=json.dumps(elsewhere))
+        problems, _ = self.entry_points(cli=failed)
         self.assertEqual(
-            problems,
-            [
-                "installed xbloom did not complete a simulated operation",
-                "MCP probe did not import the installed package",
-                "installed MCP adapter did not complete a simulated operation",
-            ],
+            problems, ["installed xbloom did not complete a simulated operation"]
         )
         problems, _ = self.entry_points(cli="")
         self.assertIn(
             "installed xbloom did not complete a simulated operation", problems
         )
+
+    def test_daemon_probe_problems(self):
+        venv = Path("/venv")
+        self.assertEqual(check_dist.check_probe(self.daemon(venv), venv), [])
+        elsewhere = self.daemon(venv, module="/elsewhere/x.py", daemon="unknown")
+        del elsewhere["exit"]
+        self.assertEqual(
+            check_dist.check_probe(elsewhere, venv),
+            [
+                "daemon probe did not import the installed package",
+                "installed quickstart step daemon returned 'unknown'",
+                "installed quickstart step exit returned None",
+            ],
+        )
+        stdio = "installed xbloom-mcp did not complete the stdio flow"
+        good = self.daemon(venv)["mcp"]
+        for change in (
+            {"tools": {"recipes": 2, "machine": 3}},
+            {"tools": {"recipes": 2, "machine": 0, "history": 1}},
+            {"templates": 0},
+            {"operation": {**good["operation"], "status": "unknown"}},
+            {"operation": {**good["operation"], "replayed": False}},
+            {"history": "failed"},
+        ):
+            bad = self.daemon(venv, mcp={**good, **change})
+            self.assertEqual(check_dist.check_probe(bad, venv), [stdio], change)
+        self.assertIn(stdio, check_dist.check_probe(self.daemon(venv, mcp=None), venv))
 
     def test_run_command_returns_output(self):
         code = "print('ok')"
