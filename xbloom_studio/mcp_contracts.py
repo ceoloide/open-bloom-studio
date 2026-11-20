@@ -390,7 +390,15 @@ Plan = model(
     requires_untested=(
         bool,
         ...,
-        "Whether physical execution requires experimental opt-in.",
+        "Whether physical execution requires experimental opt-in; governs a direct "
+        "operation_start.",
+    ),
+    upload_requires_untested=(
+        optional(bool),
+        None,
+        "machine_prepare only: whether recipe_upload of this plan requires "
+        "experimental opt-in. Absent from older daemons and recipe_preview; then "
+        "follow requires_untested.",
     ),
     requires_user=(list[str], ..., "Known host preparation instructions."),
     limitations=(list[str], ..., "Evidence and physical workflow limits."),

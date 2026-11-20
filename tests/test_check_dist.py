@@ -579,8 +579,9 @@ class MainTest(unittest.TestCase):
                 mock.patch.object(check_dist, "source_metadata", return_value=source),
                 mock.patch.object(check_dist, "source_files", return_value=SOURCES),
                 mock.patch.object(check_dist, "check_install", return_value=[]),
+                mock.patch.object(check_dist, "version_problems", return_value=[]),
             )
-            with patches[0], patches[1], patches[2] as install:
+            with patches[0], patches[1], patches[2] as install, patches[3] as ver:
                 status, out, _ = self.run_main([directory])
                 self.assertEqual(status, 0)
                 self.assertIn("distribution checks passed", out)
@@ -594,6 +595,14 @@ class MainTest(unittest.TestCase):
                 install.assert_not_called()
                 write_sdist(directory, sdist_files())
 
+                ver.assert_called_with(VERSION, Path.cwd())
+                ver.return_value = ["uv.lock version differs from the built version"]
+                status, _, err = self.run_main([directory])
+                self.assertEqual(status, 1)
+                self.assertIn("uv.lock version differs", err)
+                install.assert_not_called()
+                ver.return_value = []
+
                 install.return_value = ["installed version is 0"]
                 self.assertEqual(self.run_main([directory])[0], 1)
 
@@ -606,6 +615,68 @@ class MainTest(unittest.TestCase):
             status, _, err = self.run_main([str(Path(directory) / "missing")])
             self.assertEqual(status, 1)
             self.assertIn("expected one sdist", err)
+
+
+class VersionTests(unittest.TestCase):
+    LOCK = (
+        '[[package]]\nname = "other"\nversion = "9"\nsource = {{ registry = "x" }}\n\n'
+        '[[package]]\nname = "xbloom-studio"\nversion = "{lock}"\n'
+        'source = {{ editable = "." }}\n'
+    )
+
+    def checkout(self, directory, pyproject="1.2.3", lock="1.2.3", readme="1.2.3"):
+        root = Path(directory)
+        (root / "pyproject.toml").write_text(
+            '[build-system]\nversion = "0"\n\n[project]\nname = "xbloom-studio"\n'
+            f'version = "{pyproject}"\n\n[tool.x]\nversion = "0"\n'
+        )
+        (root / "uv.lock").write_text(self.LOCK.format(lock=lock))
+        (root / "README.md").write_text(f"## Status\n\nAlpha ({readme}, notes).\n")
+        return root
+
+    def test_the_checkout_declares_the_synced_version(self):
+        root = Path(__file__).resolve().parents[1]
+        version = check_dist.source_metadata()["Version"]
+        self.assertEqual(version, "0.0.2a0")
+        self.assertEqual(
+            check_dist.declared_versions(root),
+            dict.fromkeys(("pyproject.toml", "uv.lock", "README.md"), version),
+        )
+        self.assertEqual(check_dist.version_problems(version, root), [])
+
+    def test_every_declaration_must_match_the_built_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.checkout(directory)
+            self.assertEqual(check_dist.version_problems(VERSION, root), [])
+            for name in ("pyproject", "lock", "readme"):
+                with self.subTest(name):
+                    root = self.checkout(directory, **{name: "1.2.4"})
+                    self.assertEqual(len(check_dist.version_problems(VERSION, root)), 1)
+            for name in ("pyproject.toml", "uv.lock", "README.md"):
+                with self.subTest(missing=name):
+                    root = self.checkout(directory)
+                    (root / name).unlink()
+                    self.assertEqual(
+                        check_dist.version_problems(VERSION, root),
+                        [f"{name} version differs from the built version"],
+                    )
+            (Path(directory) / "pyproject.toml").write_text("[project]\n")
+            (Path(directory) / "uv.lock").write_text("[[package]]\nname = 'x'\n")
+            self.assertEqual(len(check_dist.version_problems(VERSION, root)), 3)
+
+    def test_versions_must_be_canonical(self):
+        for version in ("0.0.2a0", "1.0", "1.0rc1.post2.dev3", "0.0.1a1.dev0"):
+            self.assertTrue(check_dist.PUBLIC_VERSION.fullmatch(version), version)
+        with tempfile.TemporaryDirectory() as directory:
+            for version in ("0.0.2-alpha", "v1.0", "1.0+local", "0.0.2alpha"):
+                with self.subTest(version):
+                    root = self.checkout(
+                        directory, pyproject=version, lock=version, readme=version
+                    )
+                    self.assertEqual(
+                        check_dist.version_problems(version, root),
+                        ["built version is not a canonical PEP 440 public version"],
+                    )
 
 
 if __name__ == "__main__":

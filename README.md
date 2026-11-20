@@ -11,9 +11,13 @@ of their respective owners.
 
 ## Status
 
-Alpha (0.0.1a1.dev0, unreleased). Interfaces may change. Brewing coffee or tea
-from encoded recipes, preset writes and some settings commands are not
-validated on hardware and stay behind an explicit experimental opt-in.
+Alpha (0.0.2a0, the `0.0.2-alpha` prerelease). Interfaces may change. One
+route is validated on hardware: uploading, then starting, a structured
+xDripper coffee recipe within the limits under
+[Recipes and history](#recipes-and-history). Brewing other coffee or tea from
+encoded recipes, starting a recipe directly, preset writes and some settings
+commands are not validated on hardware and stay behind an explicit
+experimental opt-in.
 
 ## Install
 
@@ -33,7 +37,8 @@ python -m pip install ".[ble,mcp]"
 Activate `.venv` from the checkout in each terminal before running the
 commands below.
 
-The earlier `0.0.1-alpha` tag predates these names: it installs the
+To install exactly this prerelease, run `git checkout 0.0.2-alpha` after
+cloning. The earlier `0.0.1-alpha` tag predates these names: it installs the
 `open-bloom-studio` distribution with the `xbloom` and `xbloom-mcp` commands.
 
 ## Try it offline
@@ -137,6 +142,24 @@ reports every problem with its path and allowed values.
 library, by default `$XDG_DATA_HOME/xbloom-studio/xbloom-studio.sqlite3`, keeps
 recipe revisions, aliases and every attempt with its exact plan, so a repeat
 reuses the stored plan byte for byte.
+
+Structured coffee and tea recipes are experimental on hardware. One upload
+route is validated: a structured coffee recipe for the xDripper with grinding
+enabled, no bypass, no vibration, numeric pour temperatures and pours of at
+most 127 ml each, uploaded with
+`xbloom-studio machine upload ID --allow-control --expected-recipe-sha256 DIGEST`
+and then started with
+`xbloom-studio machine start-uploaded TOKEN --key KEY --allow-control --wait`.
+Its evidence is one observed brew (15 g, 240 ml at 91 C
+and 3 ml/s): the pinned upload succeeded, one start command ran it, and the
+machine returned to idle. A preview (`machine_prepare`) reports this as
+`upload_requires_untested: false`; such an upload needs `--allow-control` but
+not `--allow-untested`, and a repeat of that brew uploads the same way. The
+plan's own `requires_untested` is unchanged and still governs a direct start
+(`brew`, `history repeat`, `operation_start`), which keeps needing
+`--allow-untested`. Every other recipe, including opaque `native` bytes with
+the same settings, keeps its opt-in. A daemon that predates this omits
+`upload_requires_untested`; then follow `requires_untested`.
 
 The bundled starter recipes, coffee examples and tea profiles are original to
 this project. Recipe imports are user-directed: one public recipe page at a

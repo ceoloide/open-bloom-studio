@@ -19,10 +19,11 @@ from typing import TYPE_CHECKING, Any
 from .coffee import (
     COFFEE_ENCODER_VERSION,
     LEGACY_COFFEE_ENCODER_VERSION,
+    MAX_POUR_FRAGMENT_ML,
     _encode_coffee_recipe_v1,
     encode_coffee_recipe,
 )
-from .control import EncodedRecipe
+from .control import VALIDATED_UPLOAD_CUP_LIMITS, EncodedRecipe
 from .machine_controls import EncodedTeaRecipe
 from .pagination import integer
 from .recipe_validation import (
@@ -53,6 +54,7 @@ __all__ = [
     "check_recipe",
     "compile_recipe",
     "recipe_constraints",
+    "upload_requires_untested",
     "validate_recipe",
     "validate_retained_plan",
     "validate_step",
@@ -186,6 +188,57 @@ def validate_retained_plan(plan: dict[str, Any]) -> None:
             "Historical plan is incompatible or has been modified; "
             "inspect before recompiling"
         )
+
+
+def upload_requires_untested(plan: object) -> bool:
+    """Whether uploading a resolved plan still needs experimental opt-in.
+
+    Pure and never persisted; a plan's own ``requires_untested`` keeps
+    governing a direct start. One upload profile was observed on hardware: a
+    structured coffee plan from the current encoder, still reproduced by it,
+    for the xDripper reference cup limits, with the grind-size upload, no
+    bypass, no vibration, numeric pour temperatures and pours of at most one
+    payload record. Every other plan keeps its recorded requirement, and a
+    malformed plan requires opt-in.
+    """
+    if not isinstance(plan, dict):
+        return True
+    if plan.get("requires_untested") is False:
+        return False
+    return not _validated_prepared_coffee(plan)
+
+
+def _validated_prepared_coffee(plan: dict[str, Any]) -> bool:
+    if plan.get("encoder_version") != COFFEE_ENCODER_VERSION:
+        return False
+    try:
+        # A freshly compiled plan passes trivially; a retained one must still
+        # be what the current encoder produces, byte for byte.
+        validate_retained_plan(plan)
+    except ValueError:
+        return False
+    document = plan["recipe_snapshot"]
+    execution = plan.get("execution")
+    if document.get("mode") != "coffee" or not (
+        isinstance(execution, list) and len(execution) == 1
+    ):
+        return False
+    content, step = document["coffee_recipe"], execution[0]
+    return (
+        content["cup_type"] == "xdripper"
+        and content["bypass"] is None
+        and step["kind"] == "native"
+        and step["grinder_enabled"] is True
+        and tuple(step["cup_limits"]) == VALIDATED_UPLOAD_CUP_LIMITS
+        and step["bypass_ml"] == 0
+        and all(
+            not isinstance(pour["temperature"], str)
+            and pour["volume_ml"] <= MAX_POUR_FRAGMENT_ML
+            and pour["vibration_before"] is False
+            and pour["vibration_after"] is False
+            for pour in content["pours"]
+        )
+    )
 
 
 def _recognized_limitations(

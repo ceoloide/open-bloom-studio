@@ -24,6 +24,7 @@ from .connector import Connector
 from .events import decode_event, protocol_error
 from .machine_controls import (
     MachineControls,
+    UntestedOperationError,
     _number,
     cup_limits_payload,
     validate_cup_limits,
@@ -109,6 +110,8 @@ PAUSE_RESUME_CODES = {
 }
 PATTERNS = {"center": 0, "ring": 1, "spiral": 2}
 CALIBRATED_POSITION = struct.pack("<I", 85)
+# The xDripper reference cup limits of the one hardware-observed upload profile.
+VALIDATED_UPLOAD_CUP_LIMITS = (90, 110)
 
 
 class BusyError(RuntimeError):
@@ -1170,7 +1173,30 @@ class Interaction(MachineControls, ReadOnlyClient):
         if not isinstance(recipe, EncodedRecipe):
             raise TypeError("Provide EncodedRecipe machine content")
         self._require_recipe_options(recipe)
+        return await self._upload("recipe", self._recipe_upload(recipe))
 
+    async def _upload_validated_coffee(self, recipe: EncodedRecipe) -> dict[str, Any]:
+        """Upload the hardware-observed coffee options without experimental opt-in.
+
+        Internal to the application, which admits only a validated structured
+        coffee plan here. This path itself accepts nothing but the grind-size
+        upload (8001) with the xDripper reference cup limits and no bypass;
+        any other option keeps the upload_recipe opt-in.
+        """
+        if not isinstance(recipe, EncodedRecipe):
+            raise TypeError("Provide EncodedRecipe machine content")
+        if (
+            recipe.set_grinder_size is not True
+            or recipe.cup_limits != VALIDATED_UPLOAD_CUP_LIMITS
+            or recipe.bypass_ml != 0
+        ):
+            raise UntestedOperationError(
+                "Only the validated xDripper grind-size upload without bypass "
+                "skips allow_untested"
+            )
+        return await self._upload("recipe", self._recipe_upload(recipe))
+
+    def _recipe_upload(self, recipe: EncodedRecipe) -> Callable[[], Awaitable[None]]:
         async def configure() -> None:
             await self._upload_command(8102, recipe.settings_payload())
             if recipe.cup_limits is not None:
@@ -1179,7 +1205,7 @@ class Interaction(MachineControls, ReadOnlyClient):
                 8001 if recipe.set_grinder_size else 8004, recipe.payload
             )
 
-        return await self._upload("recipe", configure)
+        return configure
 
     async def upload_tea(self, recipe: Any) -> dict[str, Any]:
         """Upload dedicated tea content; never sends the tea execute command."""
