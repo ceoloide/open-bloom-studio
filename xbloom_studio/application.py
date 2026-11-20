@@ -302,6 +302,10 @@ class MachineService(MachineCommandAPI):
                     "Provide exactly one recipe reference or inline document"
                 )
             if "document" in request:
+                if request.get("revision") is not None:
+                    raise ValueError(
+                        "An inline document cannot select a saved revision"
+                    )
                 return compile_recipe(request["document"])
             plan = self.recipe_service.compile(
                 request["reference"], request.get("revision")

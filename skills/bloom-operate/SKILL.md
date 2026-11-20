@@ -87,7 +87,9 @@ If a start times out, the connection drops, a response is lost or a status is
 expected_recipe_sha256)` uploads one native coffee or tea recipe without
 starting it and returns a single-use token. `recipe_start_uploaded(token,
 idempotency_key, allow_control)` starts it once;
-`recipe_cancel_uploaded(token, allow_control)` leaves preparation. Other
+`recipe_cancel_uploaded(token, allow_control)` releases the reservation. If it
+returns `cancelled: false`, the preparation was already invalidated and no
+exit commands were sent. Other
 writes are rejected while a recipe is prepared. A disconnect invalidates the
 token without proving preparation was cancelled, and a token is not a readback
 of the stored recipe.

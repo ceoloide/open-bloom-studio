@@ -32,8 +32,10 @@ START_METHODS = ("operation_start", "recipe_start_uploaded")
 
 
 def default_socket() -> Path:
-    base = Path(os.environ.get("XDG_RUNTIME_DIR", Path.home() / ".local/state"))
-    return base / "open-bloom/bloom.sock"
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return Path(runtime) / "open-bloom/bloom.sock"
+    return Path.home() / ".local/state/open-bloom/run/bloom.sock"
 
 
 async def call(
@@ -99,8 +101,12 @@ class LocalServer:
 
     async def start(self) -> LocalServer:
         self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        mode = self.path.parent.stat()
-        if mode.st_uid != os.getuid() or stat.S_IMODE(mode.st_mode) & 0o077:
+        mode = self.path.parent.lstat()
+        if (
+            not stat.S_ISDIR(mode.st_mode)
+            or mode.st_uid != os.getuid()
+            or stat.S_IMODE(mode.st_mode) & 0o077
+        ):
             raise SocketDirectoryError(
                 "Socket directory must be owned by this user and mode 0700"
             )

@@ -61,8 +61,10 @@ xbloom water --volume-ml 100 --key second --allow-control --wait
 Replace `--device <address>` with `--connector simulator` to try the same
 flow offline. Run the daemon and the CLI under the same account; they share
 ownership locks in `~/.local/state/open-bloom/leases` under that account's
-home. A daemon that restarts marks interrupted work `unknown` and does not
-replay it.
+home. Stop any older daemon and finish direct-mode work before upgrading.
+The default socket is `$XDG_RUNTIME_DIR/open-bloom/bloom.sock` when configured,
+or `~/.local/state/open-bloom/run/bloom.sock` otherwise. A daemon that restarts
+marks interrupted work `unknown` and does not replay it.
 
 For a daemon on another host, add `--ssh <host-alias>` to any `xbloom`
 command. It runs `xbloom relay` there over your SSH configuration with strict

@@ -36,7 +36,11 @@ TARGETS = ("host", "coffee", "tea")
 ACTIVE = ("accepted", "running", "waiting_for_user")
 RETAINED_CONNECTION_METHODS = (
     "machine_connect",
+    "machine_disconnect",
     "machine_command",
+    "operation_stop",
+    "operation_pause_resume",
+    "operation_acknowledge",
     "recipe_upload",
     "recipe_start_uploaded",
     "recipe_cancel_uploaded",
@@ -326,6 +330,8 @@ def _recipe_source(a: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Provide exactly one recipe reference or --file")
     if a.reference:
         return {"kind": "recipe", "reference": a.reference, "revision": a.revision}
+    if a.revision is not None:
+        raise ValueError("--revision requires a saved recipe reference")
     return {"kind": "recipe", "document": load(a.file)}
 
 
@@ -564,6 +570,12 @@ async def run(a: argparse.Namespace) -> int:
             assert app is not None
             return await app.call(method, params)
 
+    if (
+        not remote
+        and a.connector is not None
+        and not (a.direct or a.command == "serve")
+    ):
+        raise ValueError("--connector requires xbloom serve or --direct")
     if not remote and (
         (a.command == "recipe" and a.action in PURE_ACTIONS)
         or (a.command == "call" and a.method in PURE_METHODS)
@@ -585,6 +597,16 @@ async def run(a: argparse.Namespace) -> int:
             raise ValueError("Configured daemon targets a different device")
         if a.db and a.db.expanduser().resolve() != Path(identity["database"]):
             raise ValueError("Configured daemon uses a different database")
+    if a.command != "serve":
+        method, params = route(a)
+        if not remote and method in RETAINED_CONNECTION_METHODS:
+            raise ValueError(
+                "Retained connections require a daemon; start xbloom serve first"
+            )
+        if not remote and method == "operation_start" and not a.direct:
+            raise ValueError(
+                "Start xbloom serve or pass --direct for machine operations"
+            )
     store = None
     try:
         if not remote or a.command == "serve":
@@ -606,7 +628,7 @@ async def run(a: argparse.Namespace) -> int:
             return await serve(
                 app, a.socket or default_socket(), a.recover_stale_socket
             )
-        return await _execute(a, invoke, remote, store, app)
+        return await _execute(a, method, params, invoke, remote, store, app)
     finally:
         try:
             if app is not None:
@@ -633,16 +655,13 @@ async def serve(app: Application, socket_path: Path, recover_stale: bool) -> int
 
 async def _execute(
     a: argparse.Namespace,
+    method: str,
+    params: dict[str, Any],
     invoke: Invoke,
     remote: bool,
     store: Store | None,
     app: Application | None,
 ) -> int:
-    method, params = route(a)
-    if not remote and method in RETAINED_CONNECTION_METHODS:
-        raise ValueError(
-            "Retained connections require a running daemon; start xbloom serve first"
-        )
     if not remote and method == "operation_start":
         assert store is not None and app is not None
         existing = await asyncio.to_thread(
@@ -673,6 +692,8 @@ async def _execute(
     output(result)
     if method in ("recipe_validate", "recipe_tea_validate"):
         return 0 if result["valid"] else 2
+    if method == "machine_command" and result.get("status") == "failed":
+        return 2
     started = method in ("operation_start", "recipe_start_uploaded")
     watch = (started and (not remote or getattr(a, "wait", False))) or (
         a.command == "operation" and a.action == "watch"

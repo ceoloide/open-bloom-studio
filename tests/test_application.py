@@ -480,6 +480,10 @@ class AdmissionTests(ServiceCase):
         self.assertEqual(same.device, "00:00:5E:00:53:01")
         self.assertIsNone(MachineService(self.store).device)
 
+    def test_inline_recipe_rejects_saved_revision_selection(self):
+        with self.assertRaisesRegex(ValueError, "inline document"):
+            self.service.prepare({**recipe(WATER), "revision": 2})
+
     async def test_machine_operations_need_a_configured_machine(self):
         service = MachineService(self.store)
         try:
@@ -878,6 +882,12 @@ class UploadTests(ServiceCase):
         with self.assertRaisesRegex(ConflictError, "no longer valid"):
             await self.service.start_uploaded(prepared["token"], "stale", True)
         self.assertIsNone(self.store.operation_by_key("stale"))
+        before = list(self.machine.codes())
+        result = await self.service.cancel_uploaded(prepared["token"], True)
+        self.assertEqual(result, {"token": prepared["token"], "cancelled": False})
+        self.assertIsNone(self.service.state()["prepared"])
+        self.assertIsNone(self.service._prepared_plan)
+        self.assertEqual(self.machine.codes(), before)
 
     async def test_upload_admission_and_failure(self):
         for kwargs in ({"allow_control": False}, {"allow_untested": "yes"}):

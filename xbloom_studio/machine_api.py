@@ -402,6 +402,8 @@ class MachineCommandAPI:
                 await recorder.flush()
                 return deepcopy(self.prepared)
             except BaseException as exc:
+                self.prepared = self._prepared_plan = None
+                session._invalidate_preparation("upload_failed")
                 session._uncertain = True
                 recorder.emit(
                     "recipe.upload_failed",
@@ -452,17 +454,29 @@ class MachineCommandAPI:
     ) -> dict[str, Any]:
         if allow_control is not True:
             raise ValueError("Canceling requires allow_control")
+        self._reject_queued_write()
         async with self.guard:
+            self._require_open()
             if self.prepared is None or self.prepared["token"] != token:
                 raise ConflictError("No matching prepared recipe")
-            recorder = self._recorder
-            with recorder.capturing():
-                result = await self._session.cancel_prepared(token)
-            self.prepared = None
-            self._prepared_plan = None
-            recorder.emit("recipe.upload_cancelled", result)
-            await recorder.flush()
-            return result
+            recorder, session = self._recorder, self._session
+            try:
+                live = session.get_state().get("prepared") or {}
+                if live.get("token") == token:
+                    with recorder.capturing():
+                        result = await session.cancel_prepared(token)
+                else:
+                    # Release logical ownership without writing into changed context.
+                    result = {"token": token, "cancelled": False}
+                recorder.emit("recipe.upload_cancelled", result)
+                await recorder.flush()
+                return result
+            except BaseException:
+                session._invalidate_preparation("cancel_failed")
+                session._uncertain = True
+                raise
+            finally:
+                self.prepared = self._prepared_plan = None
 
     def _same_attempt(self, row: dict[str, Any], request: Any) -> None:
         """A replayed key must name the same request on this machine.

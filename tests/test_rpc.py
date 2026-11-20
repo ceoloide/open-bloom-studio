@@ -341,6 +341,24 @@ class LocalServerTests(ServerCase):
         writer.close()
         self.assertEqual(server.handlers, set())
 
+    async def test_default_socket_has_private_fallback_beside_existing_leases(self):
+        with (
+            patch.object(Path, "home", return_value=self.path.parent),
+            patch("pwd.getpwuid") as account,
+            patch.dict(os.environ, {"XDG_RUNTIME_DIR": ""}),
+        ):
+            account.return_value.pw_dir = self.path.parent
+            await self.app.machine._own()
+            self.assertEqual(
+                default_socket(),
+                self.path.parent / ".local/state/open-bloom/run/bloom.sock",
+            )
+            server = await LocalServer(self.app).start()
+            try:
+                self.assertEqual(stat.S_IMODE(server.path.parent.stat().st_mode), 0o700)
+            finally:
+                await server.close()
+
     def test_default_socket_uses_the_runtime_directory(self):
         with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1000"}):
             self.assertEqual(

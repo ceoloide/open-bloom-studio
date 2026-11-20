@@ -201,9 +201,9 @@ def create_server(  # noqa: C901 - one registration per tool
             try:
                 normalized = {"result": value} if isinstance(value, list) else value
                 validated = outputs.model_validate(normalized)
-                return self.result(
-                    validated.model_dump(mode="json", exclude_unset=True)
-                )
+                data = validated.model_dump(mode="json", exclude_unset=True)
+                failed = name == "machine_command" and data.get("status") == "failed"
+                return self.result(data, failed)
             except Exception:
                 correlation_id = uuid.uuid4().hex
                 logging.getLogger(__name__).exception(
