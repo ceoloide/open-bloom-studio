@@ -175,6 +175,9 @@ class ContractTests(ToolCase):
             ({"kind": "water", "volume_ml": 50}, "/request/water/temperature_c"),
             ({**WATER, "volume_ml": 1000, "flow_ml_s": 0.1}, "/request/water"),
             ({**WATER, "timeout": 0}, "/request/water/timeout"),
+            ({**WATER, "timeout": None}, "/request/water/timeout"),
+            ({**WATER, "name": "   "}, "/request/water"),
+            ({**WATER, "name": None}, "/request/water/name"),
             (
                 {"kind": "grind", "size": 20.5, "rpm": 80, "duration_s": 2},
                 "/request/grind/size",

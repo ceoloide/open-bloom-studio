@@ -30,7 +30,7 @@ from .recipe_validation import check_recipe, recipe_constraints
 from .recipes import compile_recipe
 from .rpc import LocalServer, call, default_socket
 from .serialization import dumps
-from .storage import Store
+from .storage import ConflictError, Store
 from .tea_guidance import FAMILIES
 from .tea_validation import validate_tea_recipe
 from .templates import recipe_templates
@@ -667,7 +667,13 @@ async def _execute(
                     "Host preparation gates require a running daemon; start xbloom "
                     "serve first"
                 )
-            params.setdefault("expected_recipe_sha256", preview["recipe_sha256"])
+            supplied_digest = params.get("expected_recipe_sha256")
+            digest = preview["recipe_sha256"]
+            if supplied_digest is not None and supplied_digest != digest:
+                raise ConflictError(
+                    "Prepared recipe changed; preview it again before starting"
+                )
+            params["expected_recipe_sha256"] = digest
     result = await invoke(method, params)
     if a.command == "history" and a.action == "export":
         while result:

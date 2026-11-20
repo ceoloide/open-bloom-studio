@@ -118,9 +118,9 @@ class HostStepRequest(Input):
 
     @model_validator(mode="after")
     def shared_rules(self) -> HostStepRequest:
-        step = self.model_dump(exclude_none=True)
-        step.pop("name", None)
-        report = check_recipe({"name": "request", "steps": [step]})
+        step = self.model_dump(exclude_unset=True)
+        name = step.pop("name", "request")
+        report = check_recipe({"name": name, "steps": [step]})
         if not report["valid"]:
             raise ValueError(
                 "; ".join(
@@ -148,7 +148,9 @@ def _step_field(rule: dict[str, Any], description: str) -> tuple[Any, Any]:
     elif "default" in rule:
         default = rule["default"]
     else:
-        typ, default = optional(typ), None
+        return typ, Field(
+            default_factory=lambda: None, description=description, **options
+        )
     return typ, Field(default, description=description, **options)
 
 
@@ -161,9 +163,9 @@ def _step_request(kind: str) -> Any:
             for name, rule in HOST_STEPS[kind].items()
         },
         "name": (
-            optional(str),
+            str,
             Field(
-                None,
+                default_factory=lambda: None,
                 min_length=1,
                 description="Optional name for this temporary operation.",
             ),

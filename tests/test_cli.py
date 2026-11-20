@@ -419,6 +419,44 @@ class DirectTests(CliCase):
         finally:
             store.close()
 
+    def test_direct_null_digest_still_pins_the_previewed_recipe(self):
+        store = Store(self.db)
+        try:
+            saved = store.create_recipe({"name": "Recipe", "steps": [WATER]})
+        finally:
+            store.close()
+        ident = saved["id"]
+        params = self.file(
+            "start.json",
+            {
+                "request": {"kind": "recipe", "reference": ident},
+                "idempotency_key": "digest-pin",
+                "allow_control": True,
+                "expected_recipe_sha256": None,
+            },
+        )
+        call = Application.call
+
+        async def update_after_preview(app, method, params=None):
+            result = await call(app, method, params)
+            if method == "machine_prepare":
+                app.store.update_recipe(
+                    ident, {"name": "Recipe", "steps": [{**WATER, "volume_ml": 70}]}, 1
+                )
+            return result
+
+        with patch.object(Application, "call", update_after_preview):
+            code, _, errors = self.xbloom(
+                "--direct", "call", "operation_start", "--params", params
+            )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(errors[0]["error"]["code"], "conflict")
+        store = Store(self.db)
+        try:
+            self.assertEqual(store.history(), [])
+        finally:
+            store.close()
+
     def test_direct_mode_refuses_daemon_only_work(self):
         gate = self.file(
             "gate.json",

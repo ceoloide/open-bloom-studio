@@ -942,7 +942,8 @@ class Interaction(MachineControls, ReadOnlyClient):
                     else progress.transmitted_at is not None and not _confirmed(future)
                 ):
                     self._uncertain = True
-                    self._unconfirmed_deliveries += 1
+                    if progress.transmitted_at is not None and not progress.withheld:
+                        self._unconfirmed_deliveries += 1
                 # A begun frame whose final chunk was never attempted would
                 # absorb the next bytes; a final attempt stays merely unknown.
                 if progress.unfinished() and self._withholds_final_chunk():

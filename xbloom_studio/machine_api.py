@@ -26,7 +26,7 @@ from .machine_controls import (
     PresetWriteError,
     SavedPreset,
 )
-from .recipe_validation import HOST_STEPS, check_recipe
+from .recipe_validation import HOST_STEPS, NATIVE, check_recipe
 from .storage import ConflictError
 
 if TYPE_CHECKING:
@@ -196,7 +196,12 @@ def comparable_request(request: Any) -> Any:
     if kind == "recipe" and isinstance(request.get("document"), dict):
         report = check_recipe(request["document"])
         if report["valid"]:
-            return {**request, "document": report["normalized"]}
+            document = report["normalized"]
+            if document["mode"] == "native":
+                for key, rule in NATIVE.items():
+                    if "default" in rule:
+                        document["native"].setdefault(key, rule["default"])
+            return {**request, "document": document}
     return request
 
 

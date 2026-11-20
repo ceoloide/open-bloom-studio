@@ -383,6 +383,27 @@ class AdmissionTests(ServiceCase):
                 await self.service.start(other, "reference", True)
         self.assertEqual(self.machine.codes().count(POUR), 2)
 
+    async def test_inline_native_defaults_replay_without_resending(self):
+        first = await self.service.start(NATIVE, "native-defaults", True)
+        self.assertEqual((await self.finish())["status"], "completed")
+        document = NATIVE["document"]
+        explicit = {
+            **NATIVE,
+            "document": {
+                **document,
+                "native": {
+                    **document["native"],
+                    "grinder_enabled": False,
+                    "bypass_ml": 0,
+                    "bypass_temperature_c": 20,
+                },
+            },
+        }
+        again = await self.service.start(explicit, "native-defaults", True)
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(again["request"], NATIVE)
+        self.assertEqual(self.machine.codes().count(8002), 1)
+
     async def test_legacy_persisted_requests_are_still_replayed(self):
         plan = self.service.prepare(WATER)
         mcp_style = {**WATER, "flow_ml_s": 3, "pattern": "center"}
@@ -476,6 +497,27 @@ class UncertaintyTests(ServiceCase):
         self.assertIn("Water sufficiency", step["error"])
         self.assertEqual(step["cleanup_status"], "completed")
         self.assertFalse(done["result"]["state"]["recovery_required"])
+        self.assertNotIn(POUR, self.machine.codes())
+
+    async def test_withheld_final_start_chunk_is_failed_with_recovery_required(self):
+        self.service.options["write_timeout"] = 3
+        self.machine.block_code = POUR
+        await self.service.start(WATER, "partial-start", True)
+        try:
+            await asyncio.wait_for(self.machine.blocked.wait(), 2)
+            self.machine.emit(40522, u32(0))
+            await until(
+                lambda: (
+                    self.service._session.state.observations["water_sufficient"].value
+                    is False
+                )
+            )
+        finally:
+            self.machine.release.set()
+        done = await self.finish()
+        self.assertEqual(done["status"], "failed")
+        self.assertTrue(done["result"]["state"]["recovery_required"])
+        self.assertTrue(self.service._session._partial_frame)
         self.assertNotIn(POUR, self.machine.codes())
 
     async def test_missing_acknowledgment_is_not_completion(self):
