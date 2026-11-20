@@ -2561,6 +2561,49 @@ class PresetRetryTests(ServiceCase):
                     await self.write()
         self.assertEqual(self.frames(), 0)
 
+    async def test_late_cancellation_during_an_unverified_starts_failure_flush(self):
+        append = self.store.append
+        entered, release = threading.Event(), threading.Event()
+
+        def fail_start_and_hold_failure(kind, data, **context):
+            if kind == STARTED:
+                append(kind, data, **context)
+                raise sqlite3.OperationalError("reported after commit")
+            if kind == "machine.command_failed" and data["type"] == "RuntimeError":
+                entered.set()
+                release.wait(10)
+            return append(kind, data, **context)
+
+        with (
+            patch.object(self.store, "append", fail_start_and_hold_failure),
+            patch.object(
+                self.service,
+                "_started_committed",
+                side_effect=sqlite3.OperationalError("transient read failure"),
+            ),
+        ):
+            task = asyncio.create_task(self.write())
+            try:
+                await until(entered.is_set, 5)
+                task.cancel()
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        [attempt_id] = self.started_ids()
+        self.assertEqual(self.records(FINISHED, attempt_id), [])
+        with contextlib.suppress(RuntimeError):
+            await self.service.close()
+        self.service = self.make(self.machine)
+        self.assertEqual(
+            (self.latest()["state"], self.latest()["retry_allowed"]),
+            ("cancelled", False),
+        )
+        with self.assertRaises(PresetWriteRefused):
+            await self.write()
+        self.assertEqual(self.frames(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

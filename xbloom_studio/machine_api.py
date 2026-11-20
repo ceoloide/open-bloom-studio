@@ -587,6 +587,7 @@ class MachineCommandAPI:
         if not committed:
             self.preset_attempt = None
             end_capture()
+            cancel_recorded = cancel_recorded or late
             recorder.emit(
                 "machine.command_failed",
                 {
@@ -597,6 +598,10 @@ class MachineCommandAPI:
             )
             with suppress(Exception):
                 await settle(recorder.flush())
+            if late and not cancel_recorded:
+                cancel()
+                with suppress(Exception):
+                    await settle(recorder.flush())
             if late and not isinstance(exc, asyncio.CancelledError):
                 raise asyncio.CancelledError() from exc
             if exc is None:
