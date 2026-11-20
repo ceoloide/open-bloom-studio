@@ -2527,7 +2527,7 @@ wheels = [
 
 [[package]]
 name = "xbloom-studio"
-version = "0.0.1a1.dev0"
+version = "0.0.2a0"
 source = { editable = "." }
 
 [package.optional-dependencies]

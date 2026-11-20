@@ -308,8 +308,9 @@ def _recipe_tools(tool: Tool, invoke: Invoke) -> None:  # noqa: C901
     async def recipe_validate(document: Any) -> dict[str, Any]:
         """Check all fields without saving or machine access. Return valid, errors
         with JSON Pointer paths and allowed values, warnings, normalized data and
-        execution_supported. Structured coffee/tea compile locally but require
-        allow_untested for hardware execution; opaque native bytes get
+        execution_supported. Structured coffee/tea compile locally and require
+        allow_untested for direct hardware execution; machine_prepare reports
+        whether recipe_upload still needs it. Opaque native bytes get
         envelope/settings validation only. Fix errors before create/update.
         """
         return await invoke("recipe_validate", {"document": document})
@@ -628,11 +629,15 @@ def _machine_tools(  # noqa: C901
         expected_recipe_sha256: str | None = None,
     ) -> dict[str, Any]:
         """Upload exactly one native coffee/tea step without starting. Pins the
-        compiled plan/hash. Request uses the machine_prepare format. A
-        session-local single-use token reserves the owner until
-        start/cancel/disconnect; no automatic expiry. Physical controls may
-        invalidate it. Does not prove recipe readback or advance physical prompts.
-        Preview first.
+        compiled plan/hash. Request uses the machine_prepare format. Pass
+        allow_untested when the preview's upload_requires_untested is true.
+        If upload_requires_untested is false and requires_untested is true, pass
+        the preview's recipe_sha256 as expected_recipe_sha256 when uploading
+        without allow_untested. The digest is checked before connecting. If a daemon
+        omits the field, follow requires_untested. A session-local
+        single-use token reserves the owner until start/cancel/disconnect; no
+        automatic expiry. Physical controls may invalidate it. Does not prove
+        recipe readback or advance physical prompts. Preview first.
         """
         return await invoke(
             "recipe_upload",
@@ -650,8 +655,8 @@ def _machine_tools(  # noqa: C901
     ) -> dict[str, Any]:
         """Start the pinned uploaded recipe once without reupload/home. Returns a
         recorded operation ID. Reusing the same key retrieves that attempt, never
-        retries physical execution. Experimental permission was established at
-        upload. Cannot advance native physical prompts.
+        retries physical execution. Experimental admission was decided at upload.
+        Cannot advance native physical prompts.
         """
         return await invoke(
             "recipe_start_uploaded",
@@ -687,7 +692,9 @@ def _machine_tools(  # noqa: C901
     @tool
     async def machine_prepare(request: dict[str, Any]) -> dict[str, Any]:
         """Preview offline. Start the returned resolved_request when present to pin
-        ID/revision.
+        ID/revision. requires_untested governs operation_start;
+        upload_requires_untested is the recipe_upload opt-in check for a plan it
+        otherwise accepts (absent from older daemons: follow requires_untested).
 
         Request examples: {"kind":"recipe","reference":"B","revision":1};
         {"kind":"recipe","document":{"name":"Pour","steps":[{"kind":"water",
@@ -738,8 +745,9 @@ def _machine_tools(  # noqa: C901
         "pattern":"center"}, {"kind":"grind","size":20,"rpm":80,"duration_s":2}.
         Inline recipes use {"kind":"recipe","document":{...}}; see
         machine_prepare. Optionally pass expected_recipe_sha256 from the preview to
-        reject changed content. Reuse a key only to retrieve the identical attempt.
-        Returns the operation ID.
+        reject changed content. Needs allow_untested when the preview's
+        requires_untested is true, even if upload would not. Reuse a key only to
+        retrieve the identical attempt. Returns the operation ID.
         """
         return await invoke(
             "operation_start",

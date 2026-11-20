@@ -27,6 +27,7 @@ from .machine_controls import (
     SavedPreset,
 )
 from .recipe_validation import HOST_STEPS, NATIVE, check_recipe
+from .recipes import upload_requires_untested
 from .storage import ConflictError
 
 if TYPE_CHECKING:
@@ -105,7 +106,11 @@ def command_capabilities() -> dict[str, Any]:
         "preset_backup": "Service-generated private file; caller supplies previous "
         "contents, never machine readback.",
         "prepared_recipe": "Single native coffee/tea step; session-local single-use "
-        "token, no automatic expiry or retry.",
+        "token, no automatic expiry or retry. For a plan that can be uploaded, "
+        "follow the machine_prepare preview's upload_requires_untested. "
+        "If it is false and requires_untested is true, pass the preview's "
+        "recipe_sha256 as expected_recipe_sha256 when uploading without "
+        "allow_untested. A direct operation_start keeps requires_untested.",
         "native_stage_advance": False,
         "calibration_exposed": False,
         "grinder_upload": {
@@ -259,7 +264,7 @@ class MachineCommandAPI:
 
         async def _connect(self, allow_untested: bool) -> None: ...
 
-        def prepare(self, request: Any) -> dict[str, Any]: ...
+        def _resolve(self, request: Any) -> dict[str, Any]: ...
 
         async def _execute(
             self,
@@ -362,7 +367,7 @@ class MachineCommandAPI:
         self._reject_queued_write()
         async with self.guard:
             self._require_unoccupied()
-            plan = await asyncio.to_thread(self.prepare, request)
+            plan = await asyncio.to_thread(self._resolve, request)
             if len(plan["execution"]) != 1 or plan["execution"][0]["kind"] not in (
                 "native",
                 "tea",
@@ -375,8 +380,20 @@ class MachineCommandAPI:
                 and plan["recipe_sha256"] != expected_recipe_sha256
             ):
                 raise ConflictError("Prepared recipe changed; preview it again")
-            if plan["requires_untested"] and not allow_untested:
+            # Only the hardware-observed coffee profile drops the opt-in here;
+            # the plan's own requires_untested still governs a direct start.
+            untested = upload_requires_untested(plan)
+            if untested and not allow_untested:
                 raise ValueError("Recipe requires allow_untested")
+            validated = plan["requires_untested"] and not untested
+            # Without the opt-in, that exemption holds only for the reviewed
+            # preview: its digest pins the exact content before any connection.
+            if validated and not allow_untested and expected_recipe_sha256 is None:
+                raise ValueError(
+                    "A validated prepared coffee upload without experimental "
+                    "opt-in needs expected_recipe_sha256 from its machine_prepare "
+                    "preview; nothing was sent"
+                )
             plan.pop("resolved_request", None)
             step = plan["execution"][0]
             encoded = encoded_step(step)
@@ -387,7 +404,9 @@ class MachineCommandAPI:
             # The service guard covers upload and reservation; no caller slips in.
             try:
                 with recorder.capturing():
-                    if isinstance(encoded, EncodedRecipe):
+                    if validated and isinstance(encoded, EncodedRecipe):
+                        result = await session._upload_validated_coffee(encoded)
+                    elif isinstance(encoded, EncodedRecipe):
                         result = await session.upload_recipe(encoded)
                     else:
                         result = await session.upload_tea(encoded)

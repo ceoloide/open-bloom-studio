@@ -36,7 +36,12 @@ Recipe modes:
 
 - `coffee`: one native coffee recipe in `coffee_recipe` (dose, ratio, grind,
   RPM, cup and up to nine pours). Pour volumes must add up to the dose times
-  the ratio. Hardware execution is experimental and needs `allow_untested`.
+  the ratio. Hardware execution is experimental and needs `allow_untested`,
+  except an upload that the machine preview marks
+  `upload_requires_untested: false` (xDripper with the grind-size upload
+  selected, no bypass or vibration, numeric pour temperatures, pours of 1 to
+  127 ml), pinned by the preview digest. A direct start keeps the opt-in; see
+  the `xbloom-studio-operate` skill.
 - `tea`: one native tea recipe in `tea`; use the `xbloom-studio-tea` skill to
   craft it.
 - `host`: ordered `steps` of `water`, `grind`, `wait`, `user` and `tare`,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xbloom-studio"
-version = "0.0.1a1.dev0"
+version = "0.0.2a0"
 description = "Independent open-source tools for xBloom Studio machines"
 readme = "README.md"
 license = "MIT"
