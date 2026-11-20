@@ -414,6 +414,7 @@ class MachineService(MachineCommandAPI):
         try:
             await self._transition(ident, "running")
             for index, step in enumerate(plan["execution"]):
+                previous_operation = session.operation
                 await recorder.flush()
                 recorder.emit("step.started", {"index": index, "step": step})
                 kind = step["kind"]

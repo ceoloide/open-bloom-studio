@@ -193,6 +193,23 @@ class LifecycleTests(ServiceCase):
         self.assertNotIn("stop_result", stopped["result"])
         self.assertEqual(self.machine.codes().count(POUR), 1)
 
+    async def test_gate_stop_keeps_completed_step_evidence_separate(self):
+        started = await self.service.start(
+            recipe(WATER, {"kind": "user", "instruction": "Place cup"}),
+            "step-gate",
+            True,
+        )
+        await until(lambda: self.service.gate is not None, 4)
+        async with self.service.guard:
+            row = self.store.operation(started["id"])
+            self.assertEqual(row["status"], "waiting_for_user")
+            self.assertEqual(row["result"]["steps"][0]["status"], "completed")
+        stopped = await self.service.stop(started["id"])
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(stopped["result"]["steps"], row["result"]["steps"])
+        self.assertNotIn("stop_result", stopped["result"])
+        self.assertEqual(self.machine.codes().count(POUR), 1)
+
     async def test_busy_machine_never_queues_another_start(self):
         await self.service.start(recipe({"kind": "wait", "duration_s": 60}), "w", True)
         with self.assertRaises(BusyError):
