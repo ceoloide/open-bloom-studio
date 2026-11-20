@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -20,7 +21,12 @@ from xbloom_studio.errors import error_detail
 from xbloom_studio.journal import Recorder
 from xbloom_studio.machine_api import same_attempt, same_request
 from xbloom_studio.ownership import LeaseBusyError
-from xbloom_studio.preset_writes import FINISHED, STARTED, PresetWriteRefused
+from xbloom_studio.preset_writes import (
+    CLOSED,
+    FINISHED,
+    STARTED,
+    PresetWriteRefused,
+)
 from xbloom_studio.storage import ConflictError, Store
 
 FAST = {
@@ -1713,13 +1719,42 @@ class PresetRetryTests(ServiceCase):
                 ("machine.command_requested", {"command": "back_home"}),
                 ("ble.packet", packet),
             ],
+            # Queued behind the terminal record, before the window closed.
+            "before_closed": [
+                ("machine.command_finished", {"command": "write_preset"}),
+                ("ble.packet", packet),
+                (CLOSED, {"command": "write_preset"}),
+            ],
+            "after_closed": [
+                ("machine.command_finished", {"command": "write_preset"}),
+                (CLOSED, {"command": "write_preset"}),
+                ("ble.packet", packet),
+            ],
+            # A boundary never reaches past another command's request.
+            "closed_after_another_command": [
+                ("machine.command_finished", {"command": "write_preset"}),
+                ("machine.command_requested", {"command": "back_home"}),
+                ("ble.packet", packet),
+                (CLOSED, {"command": "write_preset"}),
+            ],
+            "closed_before_terminal": [
+                (CLOSED, {"command": "write_preset"}),
+                ("machine.command_finished", {"command": "write_preset"}),
+                ("ble.packet", packet),
+            ],
         }
+        latest: dict[str, str] = {}
         for index, (name, tail) in enumerate(cases.items()):
             slot = "ABC"[index % 3]
-            write_id, attempt_id = f"{index + 1}" * 32, f"{index + 5}" * 32
+            write_id, attempt_id = f"{index + 1:032x}", f"{index + 101:032x}"
             context = {"device": self.service.device, "session_id": name}
+            started = {"write_id": write_id, "attempt_id": attempt_id}
+            if slot in latest:
+                # Acknowledged, so a retryable write may precede it.
+                started["acknowledges"] = latest[slot]
+            latest[slot] = write_id
             rows = [
-                (STARTED, {"write_id": write_id, "attempt_id": attempt_id}),
+                (STARTED, started),
                 ("command.intent", {"command": 11510, "frame_hex": frame}),
                 ("ble.outgoing_chunk", {"hex": frame}),
                 (
@@ -1740,7 +1775,7 @@ class PresetRetryTests(ServiceCase):
                 self.store.append(kind, data, sequence=sequence, **context)
             write = self.latest(slot)
             with self.subTest(name=name):
-                if name in ("raw", "decoded"):
+                if name in ("raw", "decoded", "before_closed"):
                     self.assertEqual(
                         (write["state"], write["attempts"][-1]["outcome"]),
                         ("saved", "saved_late"),
@@ -1821,6 +1856,183 @@ class PresetRetryTests(ServiceCase):
         self.assertEqual(
             (write["state"], write["attempts"][-1]["outcome"]), ("saved", "saved_late")
         )
+
+    def session_kinds(self):
+        return [
+            (e["kind"], e["data"])
+            for e in self.store.events(limit=10000)
+            if e["session_id"] == self.service.recorder.session_id
+        ]
+
+    def is_save(self, kind, data):
+        return kind == "ble.packet" and data["payload_hex"] == "25000000"
+
+    async def test_a_save_while_the_terminal_record_commits_is_the_attempts(self):
+        # The terminal record is queued first; while its append is paused, a
+        # save arrives after all three frames. It is sequenced after that
+        # record, yet arrived before the record was durable.
+        self.unconfirmed()
+        save = self.on_loop(lambda: self.machine.state(0x25))
+
+        def hook(kind, data):
+            if kind == "machine.command_finished":
+                save()
+
+        with self.on_append(hook):
+            result = await self.write(save_timeout=0.05)
+        self.assertEqual(result["details"]["outcome"], "unconfirmed")
+        self.assertEqual(result["details"]["transmitted_write_count"], 3)
+        attempt = result["attempt"]
+        self.assertEqual(
+            [attempt[k] for k in ("outcome", "state", "retry_allowed")],
+            ["saved_late", "saved", False],
+        )
+        kinds = [
+            "save" if self.is_save(kind, data) else kind
+            for kind, data in self.session_kinds()
+        ]
+        terminal = kinds.index("machine.command_finished")
+        self.assertLess(terminal, kinds.index("save"))
+        self.assertLess(kinds.index("save"), kinds.index(CLOSED))
+        self.assertEqual(len(self.records(FINISHED, attempt["attempt_id"])), 1)
+        await self.service.close()
+        self.service = self.make(self.machine)
+        write = self.latest()
+        self.assertEqual(
+            (write["state"], write["attempts"][-1]["outcome"]), ("saved", "saved_late")
+        )
+        with self.assertRaisesRegex(PresetWriteRefused, "already observed a save"):
+            await self.write()
+        self.assertEqual(self.frames(), 3)
+
+    async def test_a_save_and_cancellation_while_the_terminal_record_commits(self):
+        self.unconfirmed()
+        entered, gate = threading.Event(), threading.Event()
+        save = self.on_loop(lambda: self.machine.state(0x25))
+
+        def hook(kind, data):
+            if kind == "machine.command_finished":
+                save()
+                entered.set()
+                gate.wait(5)
+
+        with self.on_append(hook):
+            task = asyncio.create_task(self.write(save_timeout=0.05))
+            await until(entered.is_set, 5)
+            task.cancel()
+            gate.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        # Committed before the guard admitted this reader; the save wins.
+        write = self.latest()
+        self.assertEqual(
+            (write["state"], write["attempts"][-1]["outcome"]), ("saved", "saved_late")
+        )
+        attempt_id = write["attempts"][-1]["attempt_id"]
+        self.assertEqual(len(self.records(FINISHED, attempt_id)), 1)
+        self.assertIn(
+            (
+                "machine.command_failed",
+                {"command": "write_preset", "type": "CancelledError", "error": ""},
+            ),
+            self.session_kinds(),
+        )
+        await self.service.close()
+        self.service = self.make(self.machine)
+        write = self.latest()
+        self.assertEqual(
+            (write["state"], write["attempts"][-1]["outcome"]), ("saved", "saved_late")
+        )
+        with self.assertRaisesRegex(PresetWriteRefused, "already observed a save"):
+            await self.write()
+        self.assertEqual(self.frames(), 3)
+
+    async def test_a_save_after_the_evidence_window_closed_is_not_the_attempts(self):
+        # Arrives while the boundary itself commits, with idle capture on so
+        # it is journaled: later than the window, never credited.
+        await self.service.close()
+        self.service = self.make(self.machine, capture_idle_telemetry=True)
+        self.unconfirmed()
+        save = self.on_loop(lambda: self.machine.state(0x25))
+
+        def hook(kind, data):
+            if kind == CLOSED:
+                save()
+
+        with self.on_append(hook):
+            result = await self.write(save_timeout=0.05)
+        kinds = [
+            "save" if self.is_save(kind, data) else kind
+            for kind, data in self.session_kinds()
+        ]
+        self.assertLess(kinds.index(CLOSED), kinds.index("save"))
+        self.assertEqual(
+            (result["attempt"]["outcome"], result["attempt"]["state"]),
+            ("unconfirmed", "retryable"),
+        )
+        await self.service.close()
+        self.service = self.make(self.machine)
+        write = self.latest()
+        self.assertEqual(
+            [write[k] for k in ("state", "retry_allowed")], ["retryable", True]
+        )
+
+    async def test_a_cancellation_while_the_final_read_fails_is_committed(self):
+        # Cancelled while the summary is read after the window closed; that
+        # read then fails once. The cancellation is still durable before the
+        # guard is released, and an observed save keeps its precedence.
+        self.unconfirmed()
+        for slot, with_save in (("A", False), ("B", True)):
+            entered, gate, armed = threading.Event(), threading.Event(), []
+            save = self.on_loop(lambda: self.machine.state(0x25))
+            events = self.store.preset_write_events
+
+            def hook(kind, data, with_save=with_save, save=save, armed=armed):
+                if kind == "machine.command_finished":
+                    if with_save:
+                        save()
+                    armed.append(True)  # The next ledger read is the final one.
+
+            def read(device, armed=armed, entered=entered, gate=gate, events=events):
+                if armed and not entered.is_set():
+                    entered.set()
+                    gate.wait(5)
+                    raise sqlite3.OperationalError("database is locked")
+                return events(device)
+
+            preset = {**A, "slot": slot}
+            expected = ("saved", "saved_late") if with_save else ("cancelled",) * 2
+            with (
+                self.subTest(with_save=with_save),
+                self.on_append(hook),
+                patch.object(self.store, "preset_write_events", read),
+            ):
+                task = asyncio.create_task(self.write(preset, save_timeout=0.05))
+                await until(entered.is_set, 5)
+                task.cancel()
+                gate.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                write = self.latest(slot)
+                self.assertEqual(
+                    (write["state"], write["attempts"][-1]["outcome"]), expected
+                )
+                self.assertFalse(write["retry_allowed"])
+                attempt_id = write["attempts"][-1]["attempt_id"]
+                self.assertEqual(
+                    [r["data"]["outcome"] for r in self.records(FINISHED, attempt_id)],
+                    ["unconfirmed"],
+                )
+            await self.service.close()
+            self.service = self.make(self.machine)
+            frames = self.frames()
+            self.assertEqual(
+                (self.latest(slot)["state"], self.latest(slot)["retry_allowed"]),
+                (expected[0], False),
+            )
+            with self.assertRaises(PresetWriteRefused):
+                await self.write(preset)
+            self.assertEqual(self.frames(), frames)
 
     async def test_an_interrupted_replacement_that_withheld_its_first_chunk(self):
         exhausted = await self.exhaust()

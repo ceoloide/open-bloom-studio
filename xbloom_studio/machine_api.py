@@ -10,7 +10,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import uuid
-from contextlib import nullcontext, suppress
+from collections.abc import Callable
+from contextlib import ExitStack, suppress
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -31,6 +32,7 @@ from .machine_controls import (
     SavedPreset,
 )
 from .preset_writes import (
+    CLOSED,
     EVIDENCE_KINDS,
     FINISHED,
     MAX_ATTEMPTS,
@@ -383,10 +385,13 @@ class MachineCommandAPI:
                     recorder.emit(SUPERSEDED, record)
                     await recorder.flush()
 
-            # An attempt's passive telemetry stays captured until its command's
-            # terminal record, so a save that arrives while its outcome
-            # commits is journaled evidence even without idle capture.
-            with recorder.capturing() if admitted is not None else nullcontext():
+            # An attempt's passive telemetry stays captured until its evidence
+            # window closes, after its command's terminal record commits, so a
+            # save that arrives meanwhile is journaled evidence even without
+            # idle capture.
+            with ExitStack() as capture:
+                if admitted is not None:
+                    capture.enter_context(recorder.capturing())
                 try:
                     if admitted is not None:
                         attempt = self._begin_preset_write(
@@ -411,7 +416,9 @@ class MachineCommandAPI:
                     if attempt is not None:
                         # Records the terminal record too; may raise a late
                         # cancellation instead.
-                        await self._settle_preset_write(command, attempt, before, exc)
+                        await self._settle_preset_write(
+                            command, attempt, before, capture.close, exc
+                        )
                         raise
                     recorder.emit(
                         "machine.command_failed",
@@ -430,7 +437,7 @@ class MachineCommandAPI:
                     session._before_slot_write = None
                 if attempt is not None:
                     settled = await self._settle_preset_write(
-                        command, attempt, before, result=result
+                        command, attempt, before, capture.close, result=result
                     )
                     assert settled is not None
                     return settled
@@ -515,20 +522,26 @@ class MachineCommandAPI:
         command: str,
         attempt: dict[str, Any],
         before: Any,
+        end_capture: Callable[[], None],
         exc: BaseException | None = None,
         result: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Commit an attempt's outcome and its command's terminal record.
 
-        Runs under the guard and the caller's capture window. The outcome is
-        recorded once; a save journaled before the terminal record still
-        wins over it, in the ledger and in the summary returned here, which is
-        read after that record commits. A cancellation that arrives at any
-        point here is committed as the command's cancellation before the guard
-        is released, so it ends automatic repetition and the caller's
-        ``CancelledError`` matches the ledger. With ``exc`` the caller then
-        re-raises it, unless a late cancellation is raised here; journal
-        failures then stay suppressed.
+        Runs under the guard and the caller's capture window, which
+        ``end_capture`` closes. The outcome is recorded once. Once the first
+        terminal record has committed, the capture ends and :data:`CLOSED`
+        is recorded in the same step, so every passive row that arrived until
+        then, even one queued behind the terminal record, is sequenced inside
+        the attempt's evidence window and nothing later is. A save in that
+        window wins over the outcome, in the ledger and in the summary
+        returned here, which is read after :data:`CLOSED` and every row before
+        it commit. A cancellation that arrives at any point here is committed
+        as the command's cancellation before the guard is released, even when
+        the summary cannot be read, so it ends automatic repetition (unless a
+        save was observed) and the caller's ``CancelledError`` matches the
+        ledger. With ``exc`` the caller then re-raises it, unless a late
+        cancellation is raised here; journal failures then stay suppressed.
         """
         recorder, late = self._recorder, False
         cancel_recorded = isinstance(exc, asyncio.CancelledError)
@@ -572,10 +585,20 @@ class MachineCommandAPI:
                 recorder.emit(
                     "machine.command_finished", {"command": command, "result": result}
                 )
+            window_open = True
             while True:
                 await settle(recorder.flush())
                 if late and not cancel_recorded:
                     cancel()
+                    continue
+                if window_open:
+                    # Synchronous: no passive row can fall between the two.
+                    window_open = False
+                    end_capture()
+                    recorder.emit(
+                        CLOSED,
+                        {"command": command, "attempt_id": attempt["attempt_id"]},
+                    )
                     continue
                 if exc is not None or late:
                     break
@@ -586,6 +609,11 @@ class MachineCommandAPI:
                 if not late:
                     break
         except Exception as failure:
+            if late and not cancel_recorded:
+                # Durable before the guard is released, whatever failed.
+                cancel()
+                with suppress(Exception):
+                    await settle(recorder.flush())
             if exc is None:
                 if late:
                     raise asyncio.CancelledError() from failure

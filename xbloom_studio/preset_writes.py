@@ -7,11 +7,12 @@ before the attempt's first frame, ``finished`` carries its outcome. A torn
 transaction never becomes a row. An attempt without a recorded outcome is
 ``interrupted``, unless its own session's committed packets or raw incoming
 chunks show a save after its first preset frame could reach the machine.
-The same session evidence, up to its command's terminal record, also
-reconciles a recorded outcome: a save that arrived while the outcome was
-committing wins (``saved_late``), and a cancellation committed before the
-command released its guard makes it ``cancelled``. Anything else unexpected
-fails closed.
+The same session evidence also reconciles a recorded outcome: a save that
+arrived before the attempt's evidence window closed wins (``saved_late``),
+and a cancellation committed before the command released its guard makes it
+``cancelled``. The window closes with :data:`CLOSED`, recorded once the
+command's first terminal record has committed; without it, at that terminal
+record. Anything else unexpected fails closed.
 
 A write is the latest set of attempts for one machine and slot with identical
 flags and payload. At most :data:`MAX_ATTEMPTS` attempts that may have sent a
@@ -72,10 +73,15 @@ EVIDENCE_KINDS = (
     "machine.command_requested",
     "machine.command_finished",
     "machine.command_failed",
+    "machine.evidence_closed",
     STARTED,
 )
 # The command's terminal records: they end an attempt's evidence window.
 TERMINAL = frozenset({"machine.command_finished", "machine.command_failed"})
+# Recorded once the command's first terminal record has committed, at the
+# moment the attempt's capture ends: rows sequenced before it arrived before
+# that moment, whatever order they were queued and committed in.
+CLOSED = "machine.evidence_closed"
 PASSIVE = frozenset({"ble.incoming_chunk", "ble.packet"})
 PRESET_FRAME = 11510
 SAVE_PACKET = {
@@ -124,8 +130,12 @@ def attempt_evidence(rows: Iterable[Mapping[str, Any]]) -> str:
     """What committed session rows prove about one attempt.
 
     ``rows`` are one session's :data:`EVIDENCE_KINDS` rows after an attempt's
-    ``started`` record, in order. Its window ends at its command's first
-    terminal record; nothing after another command's request or another
+    ``started`` record, in order. Its window ends at the :data:`CLOSED` row
+    that follows its command's first terminal record, or without one, at that
+    terminal record; between the two only passive telemetry counts. A
+    terminal record is queued before it commits, so a save can be sequenced
+    after it yet arrive before it is durable; :data:`CLOSED` is recorded only
+    after that commit. Nothing after another command's request or another
     ``started`` record is the attempt's.
 
     ``"saved"``: in the window, a save followed a preset frame that could
@@ -150,18 +160,31 @@ def attempt_evidence(rows: Iterable[Mapping[str, Any]]) -> str:
     proof: str | None = None
     proof_chunk = ""
     frames = FrameBuffer()
+    window: list[Mapping[str, Any]] = []
+    terminal = end = None
     for row in rows:
-        kind, data = row["kind"], json.loads(row["data"])
+        kind = row["kind"]
         if kind in (STARTED, "machine.command_requested"):
             break
         if kind in TERMINAL:
-            closed = True
-            if kind == "machine.command_failed" and data.get("type") == (
-                "CancelledError"
+            terminal = len(window) if terminal is None else terminal
+            if kind == "machine.command_failed" and (
+                json.loads(row["data"]).get("type") == "CancelledError"
             ):
                 cancelled = True
-            continue
-        if closed:
+        elif kind == CLOSED and terminal is not None and end is None:
+            end = len(window)
+        window.append(row)
+    if end is None:
+        end = len(window) if terminal is None else terminal
+    for row in window[:end]:
+        kind, data = row["kind"], json.loads(row["data"])
+        if pending:
+            pending = False
+            transmitted = transmitted or kind != "ble.outgoing_chunk_withheld"
+        if kind in TERMINAL:
+            closed = True
+        if closed and kind not in PASSIVE:
             continue
         if proof is not None and not (proof == "intent" and kind in PASSIVE):
             if (
@@ -184,9 +207,6 @@ def attempt_evidence(rows: Iterable[Mapping[str, Any]]) -> str:
                 proof = None
             else:
                 proof, ambiguous = None, True
-        if pending:
-            pending = False
-            transmitted = transmitted or kind != "ble.outgoing_chunk_withheld"
         if kind == "command.intent":
             if proof is not None:
                 proof, ambiguous = None, True
