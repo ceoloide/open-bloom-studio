@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -23,7 +25,7 @@ WATER = {"kind": "water", "volume_ml": 50, "temperature_c": 20}
 class ToolCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.tmp.name) / "bloom.sqlite3")
+        self.store = Store(Path(self.tmp.name) / "xbloom-studio.sqlite3")
         self.machine = Machine("SIM-MCP", auto_complete=True)
         self.app = Application(
             self.store, connector=self.machine, interaction_options=FAST
@@ -322,7 +324,7 @@ class ServerSetupTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_default_transport_is_the_local_daemon_socket(self):
-        server = create_server(socket_path="/nonexistent/bloom.sock")
+        server = create_server(socket_path="/nonexistent/daemon.sock")
         result = await server.call_tool("machine_capabilities", {})
         self.assertEqual(
             result.structured_content["error"]["code"], "connection_unavailable"
@@ -335,6 +337,13 @@ class ServerSetupTests(unittest.IsolatedAsyncioTestCase):
             with patch("sys.stderr") as stderr:
                 self.assertEqual(mcp_server.main([]), 2)
         self.assertIn("mcp extra", "".join(c.args[0] for c in stderr.write.mock_calls))
+
+    def test_canonical_server_and_command_names(self):
+        self.assertEqual(create_server(caller=lambda m, p: None).name, "xbloom-studio")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            mcp_server.main(["--help"])
+        self.assertTrue(out.getvalue().startswith("usage: xbloom-studio-mcp "))
 
     def test_command_line_runs_stdio(self):
         with patch.object(mcp_server, "create_server") as create:

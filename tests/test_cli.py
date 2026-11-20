@@ -1,4 +1,4 @@
-"""The xbloom command line: routing, pure commands, direct and daemon modes."""
+"""The xbloom-studio command line: routing, pure commands, direct and daemon modes."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import runpy
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,8 +36,8 @@ class CliCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.db = self.root / "bloom.sqlite3"
-        self.socket = self.root / "run" / "bloom.sock"
+        self.db = self.root / "xbloom-studio.sqlite3"
+        self.socket = self.root / "run" / "daemon.sock"
         environment = {"XDG_RUNTIME_DIR": str(self.root / "runtime")}
         self.env = patch.dict(os.environ, environment)
         self.env.start()
@@ -364,6 +365,41 @@ class PureCommandTests(CliCase):
                 self.assertEqual(code, 2)
                 self.assertFalse(errors[0]["ok"])
 
+    def test_canonical_command_and_device_environment(self):
+        self.assertEqual(cli.parser().prog, "xbloom-studio")
+        self.assertEqual(cli.DEVICE_ENVIRONMENT, "XBLOOM_STUDIO_DEVICE")
+        with patch.dict(os.environ, {"XBLOOM_STUDIO_DEVICE": "00:00:5E:00:53:01"}):
+            args = cli.parser().parse_args(["machine", "state"])
+        self.assertEqual(args.device, "00:00:5E:00:53:01")
+        with patch.dict(os.environ, {"BLOOM_DEVICE": "00:00:5E:00:53:02"}):
+            self.assertIsNone(cli.parser().parse_args(["machine", "state"]).device)
+
+    def test_default_socket_ignores_a_daemon_at_the_former_path(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            former = root / "runtime/open-bloom/bloom.sock"
+            former.parent.mkdir(parents=True)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(listener.close)
+            listener.bind(str(former))
+            listener.listen()
+            listener.setblocking(False)
+            environment = {
+                "HOME": str(root / "home"),
+                "XDG_DATA_HOME": str(root / "data"),
+                "XDG_RUNTIME_DIR": str(root / "runtime"),
+            }
+            with patch.dict(os.environ, environment):
+                code, _, errors = run_cli("machine", "connect")
+            self.assertEqual(code, 2)
+            self.assertIn("require a daemon", errors[0]["error"]["message"])
+            with self.assertRaises(BlockingIOError):
+                listener.accept()
+            self.assertEqual(
+                sorted(p.name for p in former.parent.iterdir()), [former.name]
+            )
+            self.assertFalse((root / "data").exists())
+
     def test_relay_runs_without_global_options(self):
         with patch("xbloom_studio.ssh_rpc.main", return_value=0) as relay:
             self.assertEqual(cli.main(["relay", "--socket", "/x"]), 0)
@@ -570,7 +606,7 @@ class DaemonClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
-        self.db = self.root / "bloom.sqlite3"
+        self.db = self.root / "xbloom-studio.sqlite3"
         self.store = Store(self.db)
         self.machine = Machine("00:00:5E:00:53:07", auto_complete=False)
         self.app = Application(
@@ -582,7 +618,7 @@ class DaemonClientTests(unittest.IsolatedAsyncioTestCase):
                 "transition_delay": 0,
             },
         )
-        self.socket = self.root / "run" / "bloom.sock"
+        self.socket = self.root / "run" / "daemon.sock"
         self.server = await LocalServer(self.app, self.socket).start()
 
     async def asyncTearDown(self):
@@ -595,7 +631,7 @@ class DaemonClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tilde_socket_path_routes_to_daemon(self):
         def tilde(*args):
-            return run_cli("--socket", "~/run/bloom.sock", *args)
+            return run_cli("--socket", "~/run/daemon.sock", *args)
 
         with patch.dict("os.environ", {"HOME": str(self.root)}):
             code, lines, errors = await asyncio.to_thread(tilde, "machine", "state")

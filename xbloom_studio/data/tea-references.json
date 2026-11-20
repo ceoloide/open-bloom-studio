@@ -28,7 +28,7 @@
         "name": "Green – starter",
         "mode": "tea",
         "source": {
-          "provider": "open-bloom-studio",
+          "provider": "xbloom-studio",
           "profile_id": "green-starter"
         },
         "tea": {
@@ -63,7 +63,7 @@
         "name": "Black – starter",
         "mode": "tea",
         "source": {
-          "provider": "open-bloom-studio",
+          "provider": "xbloom-studio",
           "profile_id": "black-starter"
         },
         "tea": {
@@ -98,7 +98,7 @@
         "name": "Oolong – starter",
         "mode": "tea",
         "source": {
-          "provider": "open-bloom-studio",
+          "provider": "xbloom-studio",
           "profile_id": "oolong-starter"
         },
         "tea": {
@@ -133,7 +133,7 @@
         "name": "White – starter",
         "mode": "tea",
         "source": {
-          "provider": "open-bloom-studio",
+          "provider": "xbloom-studio",
           "profile_id": "white-starter"
         },
         "tea": {
@@ -168,7 +168,7 @@
         "name": "Pu-erh – starter",
         "mode": "tea",
         "source": {
-          "provider": "open-bloom-studio",
+          "provider": "xbloom-studio",
           "profile_id": "pu-erh-starter"
         },
         "tea": {
@@ -203,7 +203,7 @@
         "name": "Herbal – starter",
         "mode": "tea",
         "source": {
-          "provider": "open-bloom-studio",
+          "provider": "xbloom-studio",
           "profile_id": "herbal-starter"
         },
         "tea": {
@@ -238,7 +238,7 @@
         "name": "Cascara – starter",
         "mode": "tea",
         "source": {
-          "provider": "open-bloom-studio",
+          "provider": "xbloom-studio",
           "profile_id": "cascara-starter"
         },
         "tea": {

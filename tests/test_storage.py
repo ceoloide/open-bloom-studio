@@ -27,7 +27,7 @@ class StoreTestCase(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.dir = Path(directory.name)
-        self.store = Store(self.dir / "library" / "bloom.db")
+        self.store = Store(self.dir / "library" / "xbloom-studio.sqlite3")
         self.addCleanup(self.store.close)
 
 
@@ -325,15 +325,35 @@ class OperationStoreTest(StoreTestCase):
 
     def test_default_path_follows_xdg(self):
         with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(self.dir)}):
-            self.assertEqual(default_db(), self.dir / "open-bloom/bloom.sqlite3")
-        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": ""}):
             self.assertEqual(
-                default_db(), Path.home() / ".local/share/open-bloom/bloom.sqlite3"
+                default_db(), self.dir / "xbloom-studio/xbloom-studio.sqlite3"
             )
-        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(self.dir / "xdg")}):
+        with (
+            mock.patch.dict(os.environ, {"XDG_DATA_HOME": ""}),
+            mock.patch.object(Path, "home", return_value=self.dir / "home"),
+        ):
+            self.assertEqual(
+                default_db(),
+                self.dir / "home/.local/share/xbloom-studio/xbloom-studio.sqlite3",
+            )
+
+    def test_default_store_ignores_a_database_at_the_former_path(self):
+        data = self.dir / "xdg"
+        former = data / "open-bloom/bloom.sqlite3"
+        former.parent.mkdir(parents=True)
+        decoy = Store(former)
+        decoy.create_recipe(host("Decoy"))
+        decoy.close()
+        before = {p.name: p.read_bytes() for p in former.parent.iterdir()}
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(data)}):
             store = Store()
-            store.close()
-            self.assertTrue((self.dir / "xdg/open-bloom/bloom.sqlite3").exists())
+            try:
+                self.assertEqual(store.recipes(), [])
+            finally:
+                store.close()
+        self.assertTrue((data / "xbloom-studio/xbloom-studio.sqlite3").exists())
+        after = {p.name: p.read_bytes() for p in former.parent.iterdir()}
+        self.assertEqual(after, before)
 
 
 class PaginationTest(StoreTestCase):

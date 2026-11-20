@@ -360,7 +360,7 @@ class HttpTest(unittest.TestCase):
             self.assertEqual(hubs._json(url, {"id": 1}), {"code": 200})
         request = build.return_value.open.call_args.args[0]
         self.assertEqual(request.data, b'{"id": 1}')
-        self.assertEqual(request.get_header("User-agent"), "open-bloom-studio")
+        self.assertEqual(request.get_header("User-agent"), "xbloom-studio")
         self.assertIsNone(request.get_header("Referer"))
         self.assertIsInstance(build.call_args.args[0], NoRedirects)
         self.assertEqual(build.return_value.open.call_args.kwargs, {"timeout": 15})

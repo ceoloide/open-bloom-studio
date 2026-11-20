@@ -234,15 +234,16 @@ def error_detail(exc: BaseException, *, log_unexpected: bool = True) -> dict[str
             "conflict",
             "A local socket or destination already exists.",
             "Inspect its owner/destination. For an abandoned daemon socket use "
-            "xbloom serve --recover-stale-socket; never remove an active socket.",
+            "xbloom-studio serve --recover-stale-socket; never remove an active "
+            "socket.",
         )
     if isinstance(exc, (FileNotFoundError, ConnectionRefusedError)):
         return _detail(
             name,
             "connection_unavailable",
             "The configured local daemon is unavailable.",
-            "Start or check xbloom serve and its configured socket. Do not open a "
-            "competing Bluetooth connection.",
+            "Start or check xbloom-studio serve and its configured socket. Do not "
+            "open a competing Bluetooth connection.",
         )
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
         return _detail(

@@ -10,8 +10,8 @@ importlib.resources and compared with its source, and every console script
 must be installed and run offline against the bundled simulator. The locked
 ``mcp`` extra is then installed from the uv cache, without network access,
 and the documented quickstart runs through the installed scripts: direct
-mode, a simulator daemon, the CLI as its client and ``xbloom-mcp`` over stdio
-with the README's tool groups.
+mode, a simulator daemon, the CLI as its client and ``xbloom-studio-mcp`` over
+stdio with the README's tool groups.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from typing import Any
 
 from scripts import publication_policy
 
-PROJECT = "open-bloom-studio"
+PROJECT = "xbloom-studio"
 PACKAGE = "xbloom_studio"
 LICENSE_EXPRESSION = "MIT"
 REQUIRES_PYTHON = ">=3.10"
@@ -58,8 +58,8 @@ WHEEL_METADATA_FILES = (
     "licenses/LICENSE",
 )
 ENTRY_POINTS = {
-    "xbloom": "xbloom_studio.cli:main",
-    "xbloom-mcp": "xbloom_studio.mcp_server:main",
+    "xbloom-studio": "xbloom_studio.cli:main",
+    "xbloom-studio-mcp": "xbloom_studio.mcp_server:main",
 }
 SMOKE_KEY = "installed-smoke"
 SDIST_ROOT_FILES = (
@@ -110,6 +110,9 @@ print(json.dumps({{
     "prefix": sys.prefix,
     "version": dist.version,
     "files": sorted(str(f) for f in dist.files or ()),
+    "scripts": {{
+        e.name: e.value for e in dist.entry_points if e.group == "console_scripts"
+    }},
     "resources": dict(resources(
         importlib.resources.files({package!r}), {package!r} + "/"
     )),
@@ -131,13 +134,13 @@ from mcp.client.stdio import stdio_client
 scripts, root = Path(sys.argv[1]), Path(sys.argv[2])
 (root / "home").mkdir(parents=True)
 ENV = {**os.environ, "HOME": str(root / "home"), "XDG_DATA_HOME": str(root / "data"),
-       "XDG_RUNTIME_DIR": str(root / "run"), "BLOOM_DEVICE": sys.argv[3]}
+       "XDG_RUNTIME_DIR": str(root / "run"), "XBLOOM_STUDIO_DEVICE": sys.argv[3]}
 WATER = {"kind": "water", "volume_ml": 50, "temperature_c": 20}
 ACTIVE = ("accepted", "running", "waiting_for_user")
 
 
-def xbloom(*args):
-    done = subprocess.run([str(scripts / "xbloom"), *args], env=ENV, cwd=root,
+def cli(*args):
+    done = subprocess.run([str(scripts / "xbloom-studio"), *args], env=ENV, cwd=root,
                           check=True, capture_output=True, text=True, timeout=120)
     lines = [json.loads(line) for line in done.stdout.splitlines() if line.strip()]
     return lines[-1] if lines else {}
@@ -149,7 +152,7 @@ def status(reply):
 
 
 async def tools(group, calls):
-    server = StdioServerParameters(command=str(scripts / "xbloom-mcp"),
+    server = StdioServerParameters(command=str(scripts / "xbloom-studio-mcp"),
                                    args=["--group", group], env=ENV, cwd=str(root))
     async with stdio_client(server) as (read, write):
         async with ClientSession(read, write) as session:
@@ -195,20 +198,20 @@ async def mcp():
 
 
 result = {"module": xbloom_studio.__file__}
-result["direct"] = status(xbloom("--connector", "simulator", "--direct", "water",
-                                 "--volume-ml", "100", "--key", "first",
-                                 "--allow-control"))
-result["lookup"] = status(xbloom("operation", "lookup", "first"))
-serve = [str(scripts / "xbloom"), "--connector", "simulator", "serve"]
+result["direct"] = status(cli("--connector", "simulator", "--direct", "water",
+                              "--volume-ml", "100", "--key", "first",
+                              "--allow-control"))
+result["lookup"] = status(cli("operation", "lookup", "first"))
+serve = [str(scripts / "xbloom-studio"), "--connector", "simulator", "serve"]
 daemon = subprocess.Popen(serve, env=ENV, cwd=root, stdout=subprocess.PIPE, text=True)
 try:
     ready = select.select([daemon.stdout], [], [], 60)[0]
     line = daemon.stdout.readline() if ready else ""
     result["serving"] = "serving" in (json.loads(line or "{}").get("data") or {})
     if result["serving"]:
-        result["connect"] = xbloom("machine", "connect").get("ok")
-        result["daemon"] = status(xbloom("water", "--volume-ml", "100", "--key",
-                                         "second", "--allow-control", "--wait"))
+        result["connect"] = cli("machine", "connect").get("ok")
+        result["daemon"] = status(cli("water", "--volume-ml", "100", "--key",
+                                      "second", "--allow-control", "--wait"))
         result["mcp"] = asyncio.run(asyncio.wait_for(mcp(), 300))
 finally:
     daemon.send_signal(signal.SIGTERM)
@@ -441,6 +444,8 @@ def check_install(
         problems.append("probe did not run in the new environment")
     if result["version"] != version:
         problems.append(f"installed version is {result['version']}")
+    if result["scripts"] != ENTRY_POINTS:
+        problems.append("installed entry points differ from policy")
     installed = {name for name in result["files"] if name.startswith(f"{PACKAGE}/")}
     problems += compare_names("installed", installed, set(package_files))
     problems += check_resources(result["resources"], package_files)
@@ -463,10 +468,10 @@ def check_entry_points(
         return [f"installed entry point missing: {name}" for name in missing]
     problems = []
     device = f"sim-smoke-{uuid.uuid4().hex}"
-    run([str(scripts / "xbloom-mcp"), "--help"])
+    run([str(scripts / "xbloom-studio-mcp"), "--help"])
     output = run(
         [
-            str(scripts / "xbloom"),
+            str(scripts / "xbloom-studio"),
             "--db",
             str(workdir / "smoke.sqlite3"),
             "--socket",
@@ -486,7 +491,9 @@ def check_entry_points(
     )
     lines = [json.loads(line) for line in output.splitlines() if line.strip()]
     if not lines or lines[-1].get("data", {}).get("status") != "completed":
-        problems.append("installed xbloom did not complete a simulated operation")
+        problems.append(
+            "installed xbloom-studio did not complete a simulated operation"
+        )
     # Lockfile URLs resolve from the cache the presubmit sync just filled;
     # --inexact keeps the installed wheel.
     run(
@@ -542,7 +549,7 @@ def check_probe(result: Mapping[str, Any], venv: Path) -> list[str]:
         or operation.get("replayed") is not True
         or mcp.get("history") != "completed"
     ):
-        problems.append("installed xbloom-mcp did not complete the stdio flow")
+        problems.append("installed xbloom-studio-mcp did not complete the stdio flow")
     return problems
 
 

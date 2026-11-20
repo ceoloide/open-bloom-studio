@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -110,7 +111,7 @@ class CarrierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value, {"identity": "remote"})
         audit = json.loads(self.audit.read_text())
         argv = audit["argv"]
-        self.assertEqual(argv[-4:], ["--", "operator@alias", "xbloom", "relay"])
+        self.assertEqual(argv[-4:], ["--", "operator@alias", "xbloom-studio", "relay"])
         self.assertEqual(argv[argv.index("-F") + 1], str(config))
         for option in (
             "-oBatchMode=yes",
@@ -200,9 +201,9 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         quiet_asyncio(self)
         self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
-        self.store = Store(self.root / "bloom.sqlite3")
+        self.store = Store(self.root / "xbloom-studio.sqlite3")
         self.app = Application(self.store, "00:00:5E:00:53:01")
-        self.socket = self.root / "run" / "bloom.sock"
+        self.socket = self.root / "run" / "daemon.sock"
         self.server = await LocalServer(self.app, self.socket).start()
 
     async def asyncTearDown(self):
@@ -262,8 +263,12 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ssh_rpc.main([]), 0)
         self.assertEqual(
             [c.args[0] for c in fake.call_args_list],
-            ["/x/sock", ssh_rpc.DEFAULT_RELAY_SOCKET],
+            ["/x/sock", "/run/xbloom-studio/daemon.sock"],
         )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            ssh_rpc.main(["--help"])
+        self.assertTrue(out.getvalue().startswith("usage: xbloom-studio relay "))
 
 
 if __name__ == "__main__":

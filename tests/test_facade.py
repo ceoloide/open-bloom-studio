@@ -1,4 +1,4 @@
-"""One dispatch path: Python, the xbloom CLI, the daemon and MCP agree."""
+"""One dispatch path: Python, the xbloom-studio CLI, the daemon and MCP agree."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ DOCUMENT = {"name": "Parity", "steps": [WATER]}
 
 
 def run_cli(*args):
-    """Run ``xbloom`` in this process; return (exit code, parsed stdout lines)."""
+    """Run ``xbloom-studio`` in this process; return (exit code, stdout lines)."""
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = main(list(args))
@@ -46,13 +46,13 @@ class ParityTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
-        self.db = self.root / "bloom.sqlite3"
+        self.db = self.root / "xbloom-studio.sqlite3"
         self.store = Store(self.db)
         self.machine = Machine("SIM-PARITY", auto_complete=True)
         self.app = Application(
             self.store, connector=self.machine, interaction_options=FAST
         )
-        self.socket = self.root / "run" / "bloom.sock"
+        self.socket = self.root / "run" / "daemon.sock"
         self.server = await LocalServer(self.app, self.socket).start()
 
     async def asyncTearDown(self):
@@ -188,7 +188,7 @@ class ParityTests(unittest.IsolatedAsyncioTestCase):
 class AllowlistTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.tmp.name) / "bloom.sqlite3")
+        self.store = Store(Path(self.tmp.name) / "xbloom-studio.sqlite3")
         self.app = Application(self.store)
 
     async def asyncTearDown(self):

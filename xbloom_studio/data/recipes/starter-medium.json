@@ -12,7 +12,7 @@
     "mode": "coffee",
     "description": "A balanced three-pour starting point for medium roasts.",
     "source": {
-      "provider": "open-bloom-studio",
+      "provider": "xbloom-studio",
       "template_id": "starter-medium"
     },
     "coffee_recipe": {

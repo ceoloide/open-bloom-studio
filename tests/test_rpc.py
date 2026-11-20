@@ -168,9 +168,9 @@ class ServerCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
-        self.store = Store(self.root / "bloom.sqlite3")
+        self.store = Store(self.root / "xbloom-studio.sqlite3")
         self.app = Application(self.store, "00:00:5E:00:53:01")
-        self.path = self.root / "run" / "bloom.sock"
+        self.path = self.root / "run" / "daemon.sock"
 
     async def asyncTearDown(self):
         await self.app.close()
@@ -191,8 +191,8 @@ class LocalServerTests(ServerCase):
         alias = self.root / "short"
         alias.symlink_to(parent, target_is_directory=True)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-            listener.bind(str(alias / "bloom.sock"))
-        path = parent / "bloom.sock"
+            listener.bind(str(alias / "daemon.sock"))
+        path = parent / "daemon.sock"
         with self.assertRaises(SocketPathError):
             await LocalServer(self.app, path, recover_stale=True).start()
         self.assertTrue(path.is_socket())
@@ -215,7 +215,7 @@ class LocalServerTests(ServerCase):
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.path.parent.stat().st_mode), 0o700)
         with patch.dict(os.environ, {"HOME": str(self.root)}):
-            info = await call("~/run/bloom.sock", "service_info")
+            info = await call("~/run/daemon.sock", "service_info")
         self.assertEqual(info["device"], "00:00:5E:00:53:01")
         with self.assertRaises(RemoteError) as caught:
             await call(self.path, "history_get", {"ident": "missing"})
@@ -384,7 +384,7 @@ class LocalServerTests(ServerCase):
             await self.app.machine._own()
             self.assertEqual(
                 default_socket(),
-                self.path.parent / ".local/state/open-bloom/run/bloom.sock",
+                self.path.parent / ".local/state/xbloom-studio/run/daemon.sock",
             )
             server = await LocalServer(self.app).start()
             try:
@@ -395,7 +395,7 @@ class LocalServerTests(ServerCase):
     def test_default_socket_uses_the_runtime_directory(self):
         with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1000"}):
             self.assertEqual(
-                default_socket(), Path("/run/user/1000/open-bloom/bloom.sock")
+                default_socket(), Path("/run/user/1000/xbloom-studio/daemon.sock")
             )
 
 
@@ -422,7 +422,7 @@ class CleanupBarrierTests(unittest.IsolatedAsyncioTestCase):
 class FinishContractTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.store = Store(Path(self.tmp.name) / "bloom.sqlite3")
+        self.store = Store(Path(self.tmp.name) / "xbloom-studio.sqlite3")
         self.op, _ = self.store.create_operation("D", {"kind": "x"}, {"plan": 1}, "k")
 
     def tearDown(self):

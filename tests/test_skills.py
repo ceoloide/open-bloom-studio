@@ -1,9 +1,9 @@
 """Agent skills and README examples match the shipped tools and command line.
 
 Every tool a skill names must exist in its role's MCP groups, with the
-arguments it shows. Every complete ``xbloom`` or ``xbloom-mcp`` command shown
-in the README or a skill must parse, and the README's MCP client
-configuration must launch only the public ``xbloom-mcp`` entry point.
+arguments it shows. Every complete ``xbloom-studio`` or ``xbloom-studio-mcp`` command
+shown in the README or a skill must parse, and the README's MCP client
+configuration must launch only the public ``xbloom-studio-mcp`` entry point.
 """
 
 from __future__ import annotations
@@ -26,10 +26,11 @@ from xbloom_studio.mcp_server import READ_ONLY, create_server
 ROOT = Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
 SKILLS = ROOT / "skills"
+CLI, MCP = "xbloom-studio", "xbloom-studio-mcp"
 TOOL = re.compile(
     r"`((?:recipe|provider|history|machine|operation)_\w+)(?:\(([^`)]*)\))?`"
 )
-SPAN = re.compile(r"`(xbloom(?:-mcp)? [^`]+)`")
+SPAN = re.compile(r"`(xbloom-studio(?:-mcp)? [^`]+)`")
 FENCE = re.compile(r"```(\w+)\n(.*?)```", re.S)
 # Agent Skills specification (agentskills.io/specification) fields we use,
 # each written as a single-line plain YAML scalar.
@@ -53,10 +54,10 @@ def tools(groups: tuple[str, ...] = mcp_server.GROUPS) -> dict[str, set[str]]:
 def role_tools() -> dict[str, set[str]]:
     group = {name: set(tools((name,))) for name in mcp_server.GROUPS}
     return {
-        "bloom-recipes": group["recipes"],
-        "bloom-tea": group["recipes"] & READ_ONLY,
-        "bloom-history": group["history"],
-        "bloom-operate": group["machine"] | (group["history"] & READ_ONLY),
+        "xbloom-studio-recipes": group["recipes"],
+        "xbloom-studio-tea": group["recipes"] & READ_ONLY,
+        "xbloom-studio-history": group["history"],
+        "xbloom-studio-operate": group["machine"] | (group["history"] & READ_ONLY),
     }
 
 
@@ -127,7 +128,7 @@ def commands(text: str) -> list[list[str]]:
         words = shlex.split(line, comments=True)
         if words and words[-1] == "&":
             words.pop()
-        if words and words[0] in ("xbloom", "xbloom-mcp"):
+        if words and words[0] in (CLI, MCP):
             found.append([PLACEHOLDERS.get(word, word) for word in words])
     return found
 
@@ -136,7 +137,7 @@ def command_problems(text: str) -> list[str]:
     problems = []
     for words in commands(text):
         with contextlib.redirect_stderr(io.StringIO()), contextlib.suppress(SystemExit):
-            if words[0] == "xbloom":
+            if words[0] == CLI:
                 cli.parser().parse_args(words[1:])
                 continue
             with mock.patch.object(mcp_server, "create_server"):
@@ -204,8 +205,8 @@ class SkillTests(unittest.TestCase):
         self.assertTrue(servers)
         for server in servers.values():
             self.assertEqual(set(server), {"command", "args"})
-            self.assertEqual(server["command"], "xbloom-mcp")
-            line = shlex.join(["xbloom-mcp", *server["args"]])
+            self.assertEqual(server["command"], MCP)
+            line = shlex.join([MCP, *server["args"]])
             self.assertEqual(command_problems(f"`{line}`"), [])
 
     def test_checks_reject_unknown_names_roles_and_commands(self):
@@ -220,12 +221,15 @@ class SkillTests(unittest.TestCase):
                 "x: machine_state has no argument detail",
             ],
         )
-        bad = "`xbloom recipe teaa` `xbloom-mcp --group all`\n```sh\nxbloom water\n```"
+        bad = (
+            "`xbloom-studio recipe teaa` `xbloom-studio-mcp --group all`\n"
+            "```sh\nxbloom-studio water\n```"
+        )
         self.assertEqual(
             command_problems(bad),
             [
-                "does not parse: xbloom recipe teaa",
-                "does not parse: xbloom-mcp --group all",
-                "does not parse: xbloom water",
+                "does not parse: xbloom-studio recipe teaa",
+                "does not parse: xbloom-studio-mcp --group all",
+                "does not parse: xbloom-studio water",
             ],
         )

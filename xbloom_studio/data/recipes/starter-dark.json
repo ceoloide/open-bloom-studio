@@ -12,7 +12,7 @@
     "mode": "coffee",
     "description": "Cooler water and a coarser grind to temper bitterness in dark roasts.",
     "source": {
-      "provider": "open-bloom-studio",
+      "provider": "xbloom-studio",
       "template_id": "starter-dark"
     },
     "coffee_recipe": {
