@@ -5,6 +5,8 @@ import unittest
 
 from tests.frames import reply, u32
 from xbloom_studio.preset_writes import (
+    CLOSE_PENDING,
+    CLOSED,
     FINISHED,
     STARTED,
     SUPERSEDED,
@@ -422,6 +424,59 @@ class EvidenceTests(unittest.TestCase):
                     attempt_evidence(evidence(*EXCLUDED, boundary, intent())),
                     "unsent",
                 )
+
+    def test_a_pending_close_keeps_the_window_open_until_a_boundary(self):
+        # The process stopped after a marked terminal record committed and
+        # before CLOSED did: the capture was still open, so passive rows that
+        # committed meanwhile are the attempt's.
+        sent = [intent(), chunk("aabb"), chunk("ccdd")]
+        marked, failed_marked = (
+            (kind, {**data, CLOSE_PENDING: True})
+            for kind, data in (terminal(), CANCELLED)
+        )
+        closed = (CLOSED, {"command": "write_preset"})
+        for end in (marked, failed_marked):
+            with self.subTest(end=end):
+                for save in ([packet()], incoming(SAVED_FRAME)):
+                    self.assertEqual(
+                        attempt_evidence(evidence(*sent, end, *save)), "saved"
+                    )
+                # A save wins over a durable cancellation.
+                self.assertEqual(
+                    attempt_evidence(evidence(*sent, end, CANCELLED, packet())),
+                    "saved",
+                )
+        # No committed save stays unknown; a cancellation still counts.
+        self.assertEqual(attempt_evidence(evidence(*sent, marked)), "sent")
+        self.assertEqual(
+            attempt_evidence(evidence(*sent, marked, CANCELLED)), "cancelled"
+        )
+        # Only after a preset frame could reach the machine.
+        for rows in (
+            [*EXCLUDED, marked, packet()],
+            [intent(), chunk("aabb"), marked, packet()],
+            [*sent, chunk("ccdd", "ble.outgoing_chunk_withheld"), marked, packet()],
+        ):
+            with self.subTest(rows=rows):
+                self.assertNotEqual(attempt_evidence(evidence(*rows)), "saved")
+        # A committed close, the next command or attempt, another frame's
+        # write or lost rows end it; an unmarked record ends it itself, even
+        # when a later terminal record is marked.
+        for rows in (
+            [*sent, marked, closed, packet()],
+            [*sent, marked, ("machine.command_requested", {}), packet()],
+            [*sent, marked, (STARTED, {}), packet()],
+            [*sent, marked, intent(8022, "58"), packet()],
+            [*sent, marked, chunk("58"), packet()],
+            [*sent, marked, chunk("58", "ble.outgoing_chunk_withheld"), packet()],
+            [*sent, marked, failed(8022), packet()],
+            [*sent, marked, ("capture.gap", {"lost_events": 1}), packet()],
+            [*sent, terminal(), packet()],
+            [*sent, terminal(), marked, packet()],
+            [*sent, CANCELLED, packet()],
+        ):
+            with self.subTest(rows=rows):
+                self.assertNotEqual(attempt_evidence(evidence(*rows)), "saved")
 
     def test_no_committed_preset_intent_proves_nothing_was_sent(self):
         for rows in ([], [packet()], [intent(8022, FRAME), chunk(FRAME)]):

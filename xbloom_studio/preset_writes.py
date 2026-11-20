@@ -12,7 +12,8 @@ arrived before the attempt's evidence window closed wins (``saved_late``),
 and a cancellation committed before the command released its guard makes it
 ``cancelled``. The window closes with :data:`CLOSED`, recorded once the
 command's first terminal record has committed; without it, at that terminal
-record. Anything else unexpected fails closed.
+record, unless that record is marked :data:`CLOSE_PENDING` (the process
+stopped before the close committed). Anything else unexpected fails closed.
 
 A write is the latest set of attempts for one machine and slot with identical
 flags and payload. At most :data:`MAX_ATTEMPTS` attempts that may have sent a
@@ -82,7 +83,23 @@ TERMINAL = frozenset({"machine.command_finished", "machine.command_failed"})
 # moment the attempt's capture ends: rows sequenced before it arrived before
 # that moment, whatever order they were queued and committed in.
 CLOSED = "machine.evidence_closed"
+# Set on a preset command's first terminal record when :data:`CLOSED` is to
+# follow it. Without that row (the process stopped between the two), the
+# capture was still open after the record, so passive rows up to the next
+# boundary arrived in the attempt's window. Unmarked records end it.
+CLOSE_PENDING = "evidence_close_pending"
 PASSIVE = frozenset({"ble.incoming_chunk", "ble.packet"})
+# After the terminal record, rows that end a marked window without
+# :data:`CLOSED`: another frame's write, or rows lost from the capture.
+BOUNDARY = frozenset(
+    {
+        "command.intent",
+        "command.write_failed",
+        "ble.outgoing_chunk",
+        "ble.outgoing_chunk_withheld",
+        "capture.gap",
+    }
+)
 PRESET_FRAME = 11510
 SAVE_PACKET = {
     "device": 2,
@@ -135,7 +152,10 @@ def attempt_evidence(rows: Iterable[Mapping[str, Any]]) -> str:
     terminal record; between the two only passive telemetry counts. A
     terminal record is queued before it commits, so a save can be sequenced
     after it yet arrive before it is durable; :data:`CLOSED` is recorded only
-    after that commit. Nothing after another command's request or another
+    after that commit. A terminal record marked :data:`CLOSE_PENDING` with no
+    :data:`CLOSED` after it was cut off before the close committed: its
+    window ends at the first :data:`BOUNDARY` row after it, or with the
+    session's rows. Nothing after another command's request or another
     ``started`` record is the attempt's.
 
     ``"saved"``: in the window, a save followed a preset frame that could
@@ -161,22 +181,33 @@ def attempt_evidence(rows: Iterable[Mapping[str, Any]]) -> str:
     proof_chunk = ""
     frames = FrameBuffer()
     window: list[Mapping[str, Any]] = []
-    terminal = end = None
+    terminal = end = boundary = None
+    pending_close = False
     for row in rows:
         kind = row["kind"]
         if kind in (STARTED, "machine.command_requested"):
             break
         if kind in TERMINAL:
-            terminal = len(window) if terminal is None else terminal
+            data = json.loads(row["data"])
+            if terminal is None:
+                terminal = len(window)
+                pending_close = data.get(CLOSE_PENDING) is True
             if kind == "machine.command_failed" and (
-                json.loads(row["data"]).get("type") == "CancelledError"
+                data.get("type") == "CancelledError"
             ):
                 cancelled = True
         elif kind == CLOSED and terminal is not None and end is None:
             end = len(window)
+        elif kind in BOUNDARY and terminal is not None and boundary is None:
+            boundary = len(window)
         window.append(row)
     if end is None:
-        end = len(window) if terminal is None else terminal
+        if terminal is None:
+            end = len(window)
+        elif pending_close:
+            end = len(window) if boundary is None else boundary
+        else:
+            end = terminal
     for row in window[:end]:
         kind, data = row["kind"], json.loads(row["data"])
         if pending:

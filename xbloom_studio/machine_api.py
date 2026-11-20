@@ -32,6 +32,7 @@ from .machine_controls import (
     SavedPreset,
 )
 from .preset_writes import (
+    CLOSE_PENDING,
     CLOSED,
     EVIDENCE_KINDS,
     FINISHED,
@@ -533,15 +534,18 @@ class MachineCommandAPI:
         terminal record has committed, the capture ends and :data:`CLOSED`
         is recorded in the same step, so every passive row that arrived until
         then, even one queued behind the terminal record, is sequenced inside
-        the attempt's evidence window and nothing later is. A save in that
-        window wins over the outcome, in the ledger and in the summary
-        returned here, which is read after :data:`CLOSED` and every row before
-        it commit. A cancellation that arrives at any point here is committed
-        as the command's cancellation before the guard is released, even when
-        the summary cannot be read, so it ends automatic repetition (unless a
-        save was observed) and the caller's ``CancelledError`` matches the
-        ledger. With ``exc`` the caller then re-raises it, unless a late
-        cancellation is raised here; journal failures then stay suppressed.
+        the attempt's evidence window and nothing later is. The first
+        terminal record is marked :data:`CLOSE_PENDING`, so a restart that
+        finds it without :data:`CLOSED` keeps the window open past it until
+        the next boundary. A save in that window wins over the outcome, in
+        the ledger and in the summary returned here, which is read after
+        :data:`CLOSED` and every row before it commit. A cancellation that
+        arrives at any point here is committed as the command's cancellation
+        before the guard is released, even when the summary cannot be read,
+        so it ends automatic repetition (unless a save was observed) and the
+        caller's ``CancelledError`` matches the ledger. With ``exc`` the
+        caller then re-raises it, unless a late cancellation is raised here;
+        journal failures then stay suppressed.
         """
         recorder, late = self._recorder, False
         cancel_recorded = isinstance(exc, asyncio.CancelledError)
@@ -556,25 +560,33 @@ class MachineCommandAPI:
                     late = True
             return task.result()
 
-        def cancel() -> None:
+        def cancel(**marker: Any) -> None:
             nonlocal cancel_recorded
             cancel_recorded = True
             recorder.emit(
                 "machine.command_failed",
-                {"command": command, "type": "CancelledError", "error": ""},
+                {"command": command, "type": "CancelledError", "error": "", **marker},
             )
 
         outcome = self._finish_preset_write(attempt, before, exc)
         summary: dict[str, Any] | None = None
+        # The first terminal record says CLOSED is to follow it, so a restart
+        # that finds it without one still credits rows the capture kept.
+        pending = {CLOSE_PENDING: True}
         try:
             await settle(recorder.flush())
             if exc is not None:
                 recorder.emit(
                     "machine.command_failed",
-                    {"command": command, "type": type(exc).__name__, "error": str(exc)},
+                    {
+                        "command": command,
+                        "type": type(exc).__name__,
+                        "error": str(exc),
+                        **pending,
+                    },
                 )
             elif late:
-                cancel()
+                cancel(**pending)
             else:
                 assert result is not None
                 # The summary is derived from the ledger after this record.
@@ -583,7 +595,8 @@ class MachineCommandAPI:
                     "write_id": attempt["write_id"],
                 }
                 recorder.emit(
-                    "machine.command_finished", {"command": command, "result": result}
+                    "machine.command_finished",
+                    {"command": command, "result": result, **pending},
                 )
             window_open = True
             while True:

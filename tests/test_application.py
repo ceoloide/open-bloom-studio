@@ -22,6 +22,7 @@ from xbloom_studio.journal import Recorder
 from xbloom_studio.machine_api import same_attempt, same_request
 from xbloom_studio.ownership import LeaseBusyError
 from xbloom_studio.preset_writes import (
+    CLOSE_PENDING,
     CLOSED,
     FINISHED,
     STARTED,
@@ -1708,6 +1709,8 @@ class PresetRetryTests(ServiceCase):
             "payload_hex": "25000000",
         }
         frame = "58aa"
+        marked = {"command": "write_preset", CLOSE_PENDING: True}
+        cancelled = {"command": "write_preset", "type": "CancelledError", "error": ""}
         cases = {
             "raw": [("ble.incoming_chunk", {"hex": save.hex()})],
             "decoded": [("ble.packet", packet)],
@@ -1742,7 +1745,42 @@ class PresetRetryTests(ServiceCase):
                 ("machine.command_finished", {"command": "write_preset"}),
                 ("ble.packet", packet),
             ],
+            # The process stopped after a marked terminal record committed and
+            # before CLOSED did; the capture was still open.
+            "pending_raw": [
+                ("machine.command_finished", marked),
+                ("ble.incoming_chunk", {"hex": save.hex()}),
+            ],
+            "pending_decoded": [
+                ("machine.command_finished", marked),
+                ("ble.incoming_chunk", {"hex": save.hex()}),
+                ("ble.packet", packet),
+            ],
+            "pending_cancelled": [
+                ("machine.command_failed", {**cancelled, CLOSE_PENDING: True}),
+                ("ble.packet", packet),
+            ],
+            # Controls: no committed save, a committed close or the next
+            # command or write before the save.
+            "pending_without_save": [("machine.command_finished", marked)],
+            "pending_after_closed": [
+                ("machine.command_finished", marked),
+                (CLOSED, {"command": "write_preset"}),
+                ("ble.packet", packet),
+            ],
+            "pending_after_another_command": [
+                ("machine.command_finished", marked),
+                ("machine.command_requested", {"command": "back_home"}),
+                ("ble.packet", packet),
+            ],
+            "pending_after_another_write": [
+                ("machine.command_finished", marked),
+                ("command.intent", {"command": 8022, "frame_hex": "58"}),
+                ("ble.packet", packet),
+            ],
         }
+        saved = {"raw", "decoded", "before_closed", "pending_raw", "pending_decoded"}
+        saved.add("pending_cancelled")  # A save wins over its cancellation.
         latest: dict[str, str] = {}
         for index, (name, tail) in enumerate(cases.items()):
             slot = "ABC"[index % 3]
@@ -1775,7 +1813,7 @@ class PresetRetryTests(ServiceCase):
                 self.store.append(kind, data, sequence=sequence, **context)
             write = self.latest(slot)
             with self.subTest(name=name):
-                if name in ("raw", "decoded", "before_closed"):
+                if name in saved:
                     self.assertEqual(
                         (write["state"], write["attempts"][-1]["outcome"]),
                         ("saved", "saved_late"),
@@ -1820,8 +1858,17 @@ class PresetRetryTests(ServiceCase):
                 self.assertEqual(
                     [row["data"]["outcome"] for row in finished], ["unconfirmed"]
                 )
+                # The cancellation is the first terminal record when it
+                # arrived while the outcome committed; it then marks the close.
+                cancellation = {
+                    "command": "write_preset",
+                    "type": "CancelledError",
+                    "error": "",
+                }
+                if target == FINISHED:
+                    cancellation[CLOSE_PENDING] = True
                 self.assertIn(
-                    {"command": "write_preset", "type": "CancelledError", "error": ""},
+                    cancellation,
                     [
                         e["data"]
                         for e in self.store.events(limit=10000)
@@ -1904,6 +1951,85 @@ class PresetRetryTests(ServiceCase):
         with self.assertRaisesRegex(PresetWriteRefused, "already observed a save"):
             await self.write()
         self.assertEqual(self.frames(), 3)
+
+    async def test_a_save_before_the_close_commits_survives_a_hard_exit(self):
+        # The terminal record commits, then the save's raw chunk and decoded
+        # packet; the process stops before CLOSED commits. Without the save,
+        # the attempt stays unknown and retryable.
+        self.unconfirmed()
+        for slot, with_save in (("A", True), ("B", False)):
+            entered, gate = threading.Event(), threading.Event()
+            save = self.on_loop(lambda: self.machine.state(0x25))
+
+            def hook(
+                kind, data, with_save=with_save, save=save, entered=entered, gate=gate
+            ):
+                if kind == "machine.command_finished" and with_save:
+                    save()
+                elif kind == CLOSED:
+                    entered.set()
+                    gate.wait(10)
+
+            preset = {**A, "slot": slot}
+            with self.subTest(with_save=with_save), self.on_append(hook):
+                task = asyncio.create_task(self.write(preset, save_timeout=0.05))
+                await until(entered.is_set, 5)
+                self.service.lease.release()  # The process is gone.
+                successor = self.make(Machine("00:00:5E:00:53:01"))
+                try:
+                    rows = self.session_kinds()
+                    kinds = [
+                        "save" if self.is_save(kind, data) else kind
+                        for kind, data in rows
+                    ]
+                    terminal = (
+                        len(kinds) - 1 - kinds[::-1].index("machine.command_finished")
+                    )
+                    self.assertIs(rows[terminal][1][CLOSE_PENDING], True)
+                    self.assertNotIn(CLOSED, kinds[terminal:])
+                    raw = [
+                        data["hex"]
+                        for kind, data in rows[terminal:]
+                        if kind == "ble.incoming_chunk"
+                    ]
+                    self.assertEqual(reply(8023, u32(0x25)).hex() in raw, with_save)
+                    self.assertEqual("save" in kinds[terminal:], with_save)
+                    write = successor.preset_writes(slot)["writes"][0]
+                    if with_save:
+                        self.assertEqual(
+                            [write[k] for k in ("state", "retry_allowed")],
+                            ["saved", False],
+                        )
+                        self.assertEqual(write["attempts"][-1]["outcome"], "saved_late")
+                        with self.assertRaisesRegex(
+                            PresetWriteRefused, "already observed a save"
+                        ):
+                            await successor.command(
+                                "write_preset",
+                                {"preset": preset},
+                                True,
+                                allow_untested=True,
+                            )
+                        self.assertEqual(successor.connector.calls, [])
+                    else:
+                        self.assertEqual(
+                            [write[k] for k in ("state", "retry_allowed")],
+                            ["retryable", True],
+                        )
+                        self.assertEqual(
+                            write["attempts"][-1]["outcome"], "unconfirmed"
+                        )
+                finally:
+                    await successor.close()
+                    self.service.lease.acquire()
+                    gate.set()
+                    await task
+            await self.service.disconnect()
+        self.assertEqual(self.frames(), 6)
+        # After the owner recovers its lease, the saved write is still refused.
+        with self.assertRaisesRegex(PresetWriteRefused, "already observed a save"):
+            await self.write()
+        self.assertEqual(self.frames(), 6)
 
     async def test_a_save_and_cancellation_while_the_terminal_record_commits(self):
         self.unconfirmed()
