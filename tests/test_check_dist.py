@@ -443,6 +443,9 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(sync[sync.index("--project") + 1], "/project")
         self.assertEqual(probe[1:4], ["-I", "-c", check_dist.DAEMON_PROBE])
         self.assertTrue(probe[4].endswith("bin"))
+        device = commands[1][commands[1].index("--device") + 1]
+        self.assertEqual(probe[6], device)
+        self.assertNotEqual(self.entry_points()[1][-1][6], device)
 
     def test_installed_entry_point_problems(self):
         problems, commands = self.entry_points(scripts=("xbloom",))

@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import uuid
 import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -118,8 +119,8 @@ print(json.dumps({{
 
 # Runs with the installed environment's interpreter after the locked mcp extra
 # is added. Arguments: the installed scripts directory and an empty work
-# directory. Default paths are redirected there, so the commands match the
-# README verbatim.
+# directory and a unique simulator identity. Default paths are redirected
+# there, so the probe follows the README without sharing another test's lease.
 DAEMON_PROBE = """
 import asyncio, json, os, select, signal, subprocess, sys
 from pathlib import Path
@@ -130,8 +131,7 @@ from mcp.client.stdio import stdio_client
 scripts, root = Path(sys.argv[1]), Path(sys.argv[2])
 (root / "home").mkdir(parents=True)
 ENV = {**os.environ, "HOME": str(root / "home"), "XDG_DATA_HOME": str(root / "data"),
-       "XDG_RUNTIME_DIR": str(root / "run")}
-ENV.pop("BLOOM_DEVICE", None)
+       "XDG_RUNTIME_DIR": str(root / "run"), "BLOOM_DEVICE": sys.argv[3]}
 WATER = {"kind": "water", "volume_ml": 50, "temperature_c": 20}
 ACTIVE = ("accepted", "running", "waiting_for_user")
 
@@ -462,6 +462,7 @@ def check_entry_points(
     if missing:
         return [f"installed entry point missing: {name}" for name in missing]
     problems = []
+    device = f"sim-smoke-{uuid.uuid4().hex}"
     run([str(scripts / "xbloom-mcp"), "--help"])
     output = run(
         [
@@ -470,6 +471,8 @@ def check_entry_points(
             str(workdir / "smoke.sqlite3"),
             "--socket",
             str(workdir / "smoke.sock"),
+            "--device",
+            device,
             "--connector",
             "simulator",
             "--direct",
@@ -505,7 +508,15 @@ def check_entry_points(
         ]
     )
     python = scripts / ("python.exe" if sys.platform == "win32" else "python")
-    probe = [str(python), "-I", "-c", DAEMON_PROBE, str(scripts), str(workdir / "q")]
+    probe = [
+        str(python),
+        "-I",
+        "-c",
+        DAEMON_PROBE,
+        str(scripts),
+        str(workdir / "q"),
+        device,
+    ]
     return problems + check_probe(json.loads(run(probe)), venv)
 
 

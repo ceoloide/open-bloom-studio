@@ -2,13 +2,14 @@
 name: bloom-operate
 description: Prepare, start, watch, stop and recover xBloom Studio machine actions (water, grinding, stored or inline recipes, exact repeats, settings and scale) through the Open Bloom daemon. Use when the user asks the machine to do something or asks about a running or uncertain operation, not for recipe authoring.
 license: MIT
-compatibility: Needs a running open-bloom-studio daemon (xbloom serve) reached through the machine tools of xbloom-mcp or the xbloom command, and access to the machine.
+compatibility: Needs a running open-bloom-studio daemon (xbloom serve) and access to its machine. Use the xbloom-mcp machine and history groups or the xbloom command.
 ---
 
 # Operate the machine
 
-Machine tools are those of `xbloom-mcp --group machine`; a client may prefix
-them. They reach one daemon (`xbloom serve`), locally or through
+Use `xbloom-mcp --group machine --group history` for the machine actions and
+recorded status. A client may prefix tool names. They reach one daemon
+(`xbloom serve`), locally or through
 `--ssh HOST`, which is the machine's only owner. If the daemon is not
 reachable, report the setup problem. Never fall back to a second Bluetooth
 connection, a direct mode or another host.
@@ -38,11 +39,10 @@ user already answered in this session.
   - inline recipe: `{"kind": "recipe", "document": {...}}`
   - exact repeat: `{"kind": "repeat", "operation_id": "previous-id"}`
 
-Start the preview's `resolved_request`, which pins the recipe ID and
-revision you showed, and pass the preview's digest as
-`expected_recipe_sha256` so changed content is rejected. Re-sending an alias
-could select a newer revision. A requested temperature is a target, not a
-measured outlet temperature.
+Use the preview's `resolved_request` when present to pin a saved recipe ID
+and revision. Otherwise use the original request. Always pass the preview's
+digest as `expected_recipe_sha256` so changed content is rejected. A requested
+temperature is a target, not a measured outlet temperature.
 
 ## Start, watch, stop
 
@@ -89,8 +89,7 @@ starting it and returns a single-use token. `recipe_start_uploaded(token,
 idempotency_key, allow_control)` starts it once;
 `recipe_cancel_uploaded(token, allow_control)` releases the reservation. If it
 returns `cancelled: false`, the preparation was already invalidated and no
-exit commands were sent. Other
-writes are rejected while a recipe is prepared. A disconnect invalidates the
+exit commands were sent. Other writes are rejected while a recipe is prepared. A disconnect invalidates the
 token without proving preparation was cancelled, and a token is not a readback
 of the stored recipe.
 
@@ -111,7 +110,10 @@ saved backup and stop.
 
 ## Errors
 
-Tool errors carry `error.code`, `details` and `next_step`. If an error says a
+Error envelopes carry `error.code`, `details` and `next_step`. A failed
+`machine_command`, such as an incomplete preset write, can instead return
+an MCP tool error with `status: failed`, an `error` string, `details` and
+`recovery_required`. Preserve those details and the backup location. If a
 start may already have happened, inspect its operation ID or look it up by
 key; do not start again.
 

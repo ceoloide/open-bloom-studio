@@ -50,16 +50,21 @@ Read-only sessions never change settings.
 
 `xbloom serve` keeps one owner of the machine and the database behind a
 private Unix socket; other `xbloom` commands and `xbloom-mcp` then use it.
-Pass `--device <address>` (or set `BLOOM_DEVICE`) for local Bluetooth:
+Set `BLOOM_DEVICE` to your Bluetooth address, then run the daemon in its
+own terminal:
 
 ```sh
-xbloom --device <address> serve &
+xbloom --device "$BLOOM_DEVICE" serve
+```
+
+After the daemon prints a JSON response with `serving`, use a second terminal:
+
+```sh
 xbloom machine connect
 xbloom water --volume-ml 100 --key second --allow-control --wait
 ```
 
-Replace `--device <address>` with `--connector simulator` to try the same
-flow offline. Run the daemon and the CLI under the same account; they share
+For an offline run, start the daemon with `xbloom --connector simulator serve`. Run the daemon and the CLI under the same account; they share
 ownership locks in `~/.local/state/open-bloom/leases` under that account's
 home. Stop any older daemon and finish direct-mode work before upgrading.
 The default socket is `$XDG_RUNTIME_DIR/open-bloom/bloom.sock` when configured,
