@@ -38,6 +38,11 @@ METADATA = (
     "License-File: LICENSE\n"
     "Requires-Python: >=3.10\n"
 )
+ENTRY_POINTS = (
+    b"[console_scripts]\n"
+    b"xbloom = xbloom_studio.cli:main\n"
+    b"xbloom-mcp = xbloom_studio.mcp_server:main\n"
+)
 
 
 def expected():
@@ -51,6 +56,7 @@ def wheel_files(**changes):
         f"{info}/METADATA": METADATA.encode(),
         f"{info}/WHEEL": b"Wheel-Version: 1.0\n",
         f"{info}/RECORD": b"",
+        f"{info}/entry_points.txt": ENTRY_POINTS,
         f"{info}/top_level.txt": b"xbloom_studio\n",
         f"{info}/licenses/LICENSE": b"MIT\n",
     }
@@ -67,6 +73,7 @@ def sdist_files(**changes):
         f"{egg}/PKG-INFO": METADATA.encode(),
         f"{egg}/SOURCES.txt": b"",
         f"{egg}/dependency_links.txt": b"\n",
+        f"{egg}/entry_points.txt": ENTRY_POINTS,
         f"{egg}/top_level.txt": b"xbloom_studio\n",
     }
     files.update(changes)
@@ -221,6 +228,28 @@ class ArtifactTest(unittest.TestCase):
             problems = check_dist.check_artifacts(missing, wheel_path, SOURCES, want)
             self.assertIn(f"sdist missing file: {egg}/requires.txt", problems)
 
+    def test_entry_points_must_match_policy(self):
+        info = f"{STEM}.dist-info/entry_points.txt"
+        egg = "open_bloom_studio.egg-info/entry_points.txt"
+        extra = ENTRY_POINTS + b"other = xbloom_studio.cli:main\n"
+        for value in (extra, b"[gui_scripts]\nx = y:z\n", b"not ini"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self.check(
+                        wheel=wheel_files(**{info: value}),
+                        sdist=sdist_files(**{egg: value}),
+                    ),
+                    [
+                        "wheel entry points differ from policy",
+                        "sdist entry points differ from policy",
+                    ],
+                )
+        self.assertEqual(
+            check_dist.entry_points(ENTRY_POINTS),
+            {"console_scripts": check_dist.ENTRY_POINTS},
+        )
+        self.assertEqual(check_dist.entry_points(b"\xff"), {})
+
     def test_sdist_layout_is_strict(self):
         for kwargs in ({"prefix": "other"}, {"link": "alias"}):
             path = write_sdist(self.dir, sdist_files(), **kwargs)
@@ -255,9 +284,11 @@ class ArtifactTest(unittest.TestCase):
 class InstallTest(unittest.TestCase):
     def probe(self, workdir, **changes):
         venv = (workdir / "venv").resolve()
+        purelib = str(venv / "lib/site-packages")
         result = {
             "module": str(venv / "lib/site-packages/xbloom_studio/__init__.py"),
             "prefix": str(venv),
+            "purelib": purelib,
             "version": VERSION,
             "files": [*PACKAGE_FILES, f"{STEM}.dist-info/RECORD"],
             "resources": {"xbloom_studio/py.typed": EMPTY_SHA256},
@@ -269,9 +300,16 @@ class InstallTest(unittest.TestCase):
             commands.append(command)
             return json.dumps(result) if command[1] == "-I" else ""
 
-        problems = check_dist.check_install(
-            Path("x.whl"), workdir, PACKAGE_FILES, VERSION, run
-        )
+        with mock.patch.object(
+            check_dist, "check_entry_points", return_value=[]
+        ) as entry_points:
+            problems = check_dist.check_install(
+                Path("x.whl"), workdir, PACKAGE_FILES, VERSION, run
+            )
+        if not problems:
+            entry_points.assert_called_once_with(
+                venv.parent / "venv", workdir, purelib, run
+            )
         return problems, commands
 
     def test_install_is_isolated_and_complete(self):
@@ -350,6 +388,60 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(
             json.loads(output)["resources"],
             {"xbloom_studio/data/a.json": hashlib.sha256(b"{}").hexdigest()},
+        )
+
+    def entry_points(self, scripts=("xbloom", "xbloom-mcp"), **outputs):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        workdir = Path(directory.name)
+        venv = workdir / "venv"
+        (venv / "bin").mkdir(parents=True)
+        for name in scripts:
+            (venv / "bin" / name).write_text("")
+        completed = json.dumps({"ok": True, "data": {"status": "completed"}})
+        probe = {"module": str(venv / "x.py"), "tools": 41, "status": "completed"}
+        values = {"cli": completed + "\n", "mcp": json.dumps(probe)}
+        values.update(outputs)
+        commands = []
+
+        def run(command):
+            commands.append(command)
+            if command[0] == sys.executable:
+                return values["mcp"]
+            if command[0].endswith("xbloom"):
+                return values["cli"]
+            return ""
+
+        problems = check_dist.check_entry_points(venv, workdir, "/site", run)
+        return problems, commands
+
+    def test_installed_entry_points_run_the_simulator(self):
+        problems, commands = self.entry_points()
+        self.assertEqual(problems, [])
+        self.assertEqual(commands[0][1:], ["--help"])
+        self.assertIn("simulator", commands[1])
+        self.assertIn("--direct", commands[1])
+        self.assertEqual(commands[2][1:3], ["-I", "-c"])
+        self.assertEqual(commands[2][4], "/site")
+
+    def test_installed_entry_point_problems(self):
+        problems, commands = self.entry_points(scripts=("xbloom",))
+        self.assertEqual(problems, ["installed entry point missing: xbloom-mcp"])
+        self.assertEqual(commands, [])
+        failed = json.dumps({"ok": True, "data": {"status": "failed"}})
+        elsewhere = {"module": "/elsewhere/x.py", "tools": 0, "status": "failed"}
+        problems, _ = self.entry_points(cli=failed, mcp=json.dumps(elsewhere))
+        self.assertEqual(
+            problems,
+            [
+                "installed xbloom did not complete a simulated operation",
+                "MCP probe did not import the installed package",
+                "installed MCP adapter did not complete a simulated operation",
+            ],
+        )
+        problems, _ = self.entry_points(cli="")
+        self.assertIn(
+            "installed xbloom did not complete a simulated operation", problems
         )
 
     def test_run_command_returns_output(self):

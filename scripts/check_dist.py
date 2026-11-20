@@ -6,11 +6,15 @@ DIST_DIR must hold exactly one sdist and one wheel of this project. The
 distributed package files must match the tracked files under PACKAGE exactly,
 so additions to the package extend the check without editing this script.
 After an isolated install, every package data file is read back through
-importlib.resources and compared with its source.
+importlib.resources and compared with its source, every console script must
+be installed and run offline against the bundled simulator, and the
+installed MCP adapter must complete a simulated operation with this
+environment's locked MCP SDK.
 """
 
 from __future__ import annotations
 
+import configparser
 import email.message
 import email.parser
 import hashlib
@@ -45,9 +49,15 @@ WHEEL_METADATA_FILES = (
     "METADATA",
     "WHEEL",
     "RECORD",
+    "entry_points.txt",
     "top_level.txt",
     "licenses/LICENSE",
 )
+ENTRY_POINTS = {
+    "xbloom": "xbloom_studio.cli:main",
+    "xbloom-mcp": "xbloom_studio.mcp_server:main",
+}
+SMOKE_KEY = "installed-smoke"
 SDIST_ROOT_FILES = (
     "PKG-INFO",
     "README.md",
@@ -61,6 +71,7 @@ SDIST_EGG_INFO_FILES = (
     "PKG-INFO",
     "SOURCES.txt",
     "dependency_links.txt",
+    "entry_points.txt",
     "top_level.txt",
 )
 
@@ -77,7 +88,7 @@ def egg_info_files(expected: Mapping[str, list[str]]) -> tuple[str, ...]:
 
 
 PROBE = """
-import hashlib, importlib.metadata, importlib.resources, json, sys
+import hashlib, importlib.metadata, importlib.resources, json, sys, sysconfig
 import {package}
 dist = importlib.metadata.distribution({project!r})
 
@@ -93,12 +104,49 @@ def resources(node, prefix):
 print(json.dumps({{
     "module": {package}.__file__,
     "prefix": sys.prefix,
+    "purelib": sysconfig.get_paths()["purelib"],
     "version": dist.version,
     "files": sorted(str(f) for f in dist.files or ()),
     "resources": dict(resources(
         importlib.resources.files({package!r}), {package!r} + "/"
     )),
 }}))
+"""
+
+
+# Runs with this environment's interpreter and MCP SDK, but imports the
+# package from the installed wheel's site-packages given as the first argument.
+MCP_PROBE = """
+import asyncio, json, sys
+sys.path.insert(0, sys.argv[1])
+import xbloom_studio
+from xbloom_studio.facade import Application
+from xbloom_studio.mcp_server import create_server
+from xbloom_studio.simulator import ScriptedConnector
+from xbloom_studio.storage import Store
+
+FAST = {"settle": 0, "subscription_settle": 0, "transition_delay": 0}
+REQUEST = {"kind": "water", "volume_ml": 50, "temperature_c": 20}
+
+
+async def main():
+    store = Store(sys.argv[2])
+    app = Application(store, connector=ScriptedConnector(), interaction_options=FAST)
+    try:
+        server = create_server(caller=app.call)
+        tools = await server.list_tools()
+        start = {"request": REQUEST, "idempotency_key": "mcp", "allow_control": True}
+        await server.call_tool("operation_start", start)
+        await app.machine.task
+        found = await server.call_tool("operation_lookup", {"idempotency_key": "mcp"})
+        return len(tools), found.structured_content["operation"]["status"]
+    finally:
+        await app.close()
+        store.close()
+
+
+tools, status = asyncio.run(main())
+print(json.dumps({"module": xbloom_studio.__file__, "tools": tools, "status": status}))
 """
 
 
@@ -218,12 +266,29 @@ def check_artifacts(
             if fields[field] != value:
                 problems.append(f"{kind} metadata differs from source: {field}")
 
+    for kind, raw in (
+        ("wheel", wheel_files.get(f"{dist_info}/entry_points.txt")),
+        ("sdist", sdist_files.get(f"{egg_info}/entry_points.txt")),
+    ):
+        if raw is not None and entry_points(raw) != {"console_scripts": ENTRY_POINTS}:
+            problems.append(f"{kind} entry points differ from policy")
+
     for kind, files in (("wheel", wheel_files), ("sdist", sdist_files)):
         problems.extend(
             f"{kind}:{finding}"
             for finding in publication_policy.check_files(sorted(files.items()))
         )
     return problems
+
+
+def entry_points(raw: bytes) -> dict[str, dict[str, str]]:
+    parser = configparser.ConfigParser(interpolation=None, delimiters=("=",))
+    parser.optionxform = str  # type: ignore[assignment,method-assign]
+    try:
+        parser.read_string(raw.decode("utf-8"))
+    except (configparser.Error, UnicodeDecodeError):
+        return {}
+    return {name: dict(parser[name]) for name in parser.sections()}
 
 
 def expected_metadata(source: email.message.Message) -> dict[str, list[str]]:
@@ -299,6 +364,48 @@ def check_install(
     installed = {name for name in result["files"] if name.startswith(f"{PACKAGE}/")}
     problems += compare_names("installed", installed, set(package_files))
     problems += check_resources(result["resources"], package_files)
+    if not problems:
+        problems += check_entry_points(venv, workdir, result["purelib"], run)
+    return problems
+
+
+def check_entry_points(
+    venv: Path, workdir: Path, purelib: str, run: Runner = run_command
+) -> list[str]:
+    """Run the installed console scripts and MCP adapter against the simulator."""
+    scripts = venv / ("Scripts" if sys.platform == "win32" else "bin")
+    missing = [name for name in ENTRY_POINTS if not (scripts / name).is_file()]
+    if missing:
+        return [f"installed entry point missing: {name}" for name in missing]
+    problems = []
+    run([str(scripts / "xbloom-mcp"), "--help"])
+    output = run(
+        [
+            str(scripts / "xbloom"),
+            "--db",
+            str(workdir / "smoke.sqlite3"),
+            "--socket",
+            str(workdir / "smoke.sock"),
+            "--connector",
+            "simulator",
+            "--direct",
+            "water",
+            "--volume-ml",
+            "50",
+            "--key",
+            SMOKE_KEY,
+            "--allow-control",
+        ]
+    )
+    lines = [json.loads(line) for line in output.splitlines() if line.strip()]
+    if not lines or lines[-1].get("data", {}).get("status") != "completed":
+        problems.append("installed xbloom did not complete a simulated operation")
+    probe = [sys.executable, "-I", "-c", MCP_PROBE, purelib, str(workdir / "mcp.db3")]
+    result = json.loads(run(probe))
+    if not Path(result["module"]).resolve().is_relative_to(venv.resolve()):
+        problems.append("MCP probe did not import the installed package")
+    if result["tools"] < 1 or result["status"] != "completed":
+        problems.append("installed MCP adapter did not complete a simulated operation")
     return problems
 
 

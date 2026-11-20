@@ -78,6 +78,12 @@ class FileRulesTest(unittest.TestCase):
     def test_content_shape(self):
         big = b"x" * (policy.MAX_FILE_BYTES + 1)
         self.assertEqual(policy.check_file("a", big)[0].rule, "file too large")
+        self.assertEqual(policy.check_file("uv.lock", big), [])
+        self.assertEqual(
+            policy.check_file("sub/uv.lock", big)[0].rule, "file too large"
+        )
+        lock = b"x" * (policy.SIZE_LIMITS["uv.lock"] + 1)
+        self.assertEqual(policy.check_file("uv.lock", lock)[0].rule, "file too large")
         self.assertEqual(policy.check_file("a", b"a\0b")[0].rule, "binary content")
         self.assertEqual(policy.check_file("a", b"\xff")[0].rule, "not UTF-8 text")
 

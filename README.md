@@ -77,6 +77,48 @@ this project. The example and tea lookups also accept your own collection
 through a `path` argument. Recipe imports are user-directed: one public recipe
 page at a time, or an owner-supplied xRecipe export read offline.
 
+## Command line, daemon and MCP
+
+Every interface calls the same allowlisted application methods, so Python,
+`xbloom`, the daemon and `xbloom-mcp` behave alike. Try them offline with the
+simulator:
+
+```sh
+xbloom --connector simulator --direct water --volume-ml 100 --key first --allow-control
+xbloom operation lookup first
+```
+
+`xbloom serve` keeps one owner of the machine and the database behind a
+private Unix socket; other `xbloom` commands then use it automatically.
+Pass `--device <address>` (or set `BLOOM_DEVICE`) for local Bluetooth, or
+`--connector package.module:factory` for any other connector.
+
+```sh
+xbloom --connector simulator serve &
+xbloom machine connect
+xbloom water --volume-ml 100 --key second --allow-control --wait
+```
+
+Every start needs an idempotency key. Reusing a key returns the recorded
+attempt and never starts the machine again; after any uncertainty, inspect
+`xbloom operation lookup <key>` instead of starting with a new key. A daemon
+that restarts marks interrupted work `unknown` and does not replay it.
+
+For a daemon on another host, `xbloom --ssh <host-alias> ...` runs
+`xbloom relay` there over your existing SSH configuration with strict host-key
+checking. Pin the relay as a forced command for that key, for example
+`command="xbloom relay --socket /run/open-bloom/bloom.sock"`; it forwards only
+a fixed method list, never backups. The MCP server needs the `mcp` extra and a
+running daemon:
+
+```sh
+pip install "open-bloom-studio[mcp]"
+xbloom-mcp            # or: xbloom-mcp --ssh <host-alias>
+```
+
+In Python, `xbloom_studio.facade.Application(store, connector=...)` exposes
+the same `call(method, params)` dispatch.
+
 ## Development
 
 The repository uses [uv](https://docs.astral.sh/uv/) with a committed lockfile.

@@ -19,6 +19,11 @@ classifiers = [
 
 [project.optional-dependencies]
 ble = ["bleak>=1.0,<3"]
+mcp = ["mcp>=2.3,<3"]
+
+[project.scripts]
+xbloom = "xbloom_studio.cli:main"
+xbloom-mcp = "xbloom_studio.mcp_server:main"
 
 [project.urls]
 Repository = "https://github.com/ceoloide/open-xbloom-studio-tools"
@@ -27,6 +32,7 @@ Repository = "https://github.com/ceoloide/open-xbloom-studio-tools"
 dev = [
     "bleak>=1.0,<3",
     "coverage>=7.10",
+    "mcp>=2.3,<3",
     "mypy>=2.4",
     "ruff>=0.17",
 ]
@@ -48,6 +54,12 @@ select = ["B", "E", "F", "I", "UP", "W"]
 strict = true
 python_version = "3.10"
 files = ["xbloom_studio", "scripts"]
+
+[[tool.mypy.overrides]]
+# Tool results pass through from the daemon unchanged; their contracts are
+# enforced at runtime by the MCP output models.
+module = "xbloom_studio.mcp_server"
+warn_return_any = false
 
 [tool.coverage.run]
 branch = true

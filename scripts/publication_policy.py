@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 MAX_FILE_BYTES = 512 * 1024
+# The generated root lockfile pins every platform's wheels; it is still scanned.
+SIZE_LIMITS = {"uv.lock": 2 * 1024 * 1024}
 
 FORBIDDEN_NAMES = frozenset(
     {".env", ".netrc", ".pypirc", "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa"}
@@ -134,7 +136,7 @@ def check_file(path: str, data: bytes) -> list[Finding]:
         or pure.suffix.lower() in FORBIDDEN_SUFFIXES | {".env"}
     ):
         return [Finding(path, 0, "forbidden file type")]
-    if len(data) > MAX_FILE_BYTES:
+    if len(data) > SIZE_LIMITS.get(path, MAX_FILE_BYTES):
         return [Finding(path, 0, "file too large")]
     if b"\0" in data:
         return [Finding(path, 0, "binary content")]
