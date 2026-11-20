@@ -9,6 +9,10 @@ class SocketDirectoryError(PermissionError):
     """The daemon socket directory does not meet its owner-only requirements."""
 
 
+class SocketPathError(ValueError):
+    """The Unix socket path exceeds the platform's limit."""
+
+
 class RemoteError(RuntimeError):
     """A sanitized error envelope returned by the serving side."""
 

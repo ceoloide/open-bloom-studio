@@ -559,7 +559,7 @@ async def run(a: argparse.Namespace) -> int:
             return await ssh_call(a.ssh, method, params, config_file=a.ssh_config)
 
     else:
-        a.socket = a.socket or default_socket()
+        a.socket = (a.socket or default_socket()).expanduser()
         remote = a.socket.exists() and not a.direct
         if a.direct and a.socket.exists():
             raise ValueError("Daemon socket exists; do not bypass its owner")

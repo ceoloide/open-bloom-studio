@@ -201,6 +201,7 @@ class MachineControls:
     )
     UNTESTED_METHODS = (
         "write_preset",
+        "write_presets",
         "set_water_source",
         "read_pour_radius",
         "read_vibration",
@@ -455,6 +456,7 @@ class MachineControls:
         The caller-supplied previous presets persist before the first write.
         On failure partial progress and the file remain; no same-session rollback.
         """
+        self._require_untested("Batch preset writes")
         return await self._write_preset_selection(
             _batch(presets), _batch(backup), backup_path, save_timeout
         )

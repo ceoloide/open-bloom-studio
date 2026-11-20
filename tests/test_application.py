@@ -261,8 +261,11 @@ class LifecycleTests(ServiceCase):
         self.assertTrue(state["machine"]["machine"]["connected"])
         await self.service.connect()
         self.assertEqual(self.machine.calls.count("connect"), 1)
-        with self.assertRaisesRegex(ValueError, "fresh session"):
+        with self.assertRaisesRegex(SessionError, "fresh session") as raised:
             await self.service.connect(allow_untested=True)
+        detail = error_detail(raised.exception)
+        self.assertEqual(detail["code"], "experimental_required")
+        self.assertIn("Disconnect", detail["message"])
         with self.assertRaises(ValueError):
             await self.service.connect(allow_untested="yes")
 
@@ -968,8 +971,23 @@ class CommandTests(ServiceCase):
     async def test_preset_backup_is_caller_supplied_and_never_readback(self):
         presets = [{"slot": s, "payload_hex": "414141", "flags": 4} for s in "ABC"]
         backup = [{"slot": s, "payload_hex": "6f6c64", "flags": 1} for s in "ABC"]
+        self.assertTrue(
+            self.service.capabilities()["commands"]["write_presets"][
+                "requires_allow_untested"
+            ]
+        )
+        await self.service.connect(allow_untested=True)
+        with self.assertRaisesRegex(ValueError, "allow_untested"):
+            await self.service.command(
+                "write_presets", {"presets": presets, "backup": backup}, True
+            )
+        self.assertEqual(self.machine.codes(), [8100])
+        self.assertFalse((self.root / "preset-backups").exists())
         result = await self.service.command(
-            "write_presets", {"presets": presets, "backup": backup}, True
+            "write_presets",
+            {"presets": presets, "backup": backup},
+            True,
+            allow_untested=True,
         )
         self.assertFalse(result["readback_verified"])
         path = Path(result["backup"]["path"])

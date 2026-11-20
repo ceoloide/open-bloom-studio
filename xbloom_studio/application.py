@@ -28,7 +28,7 @@ from .connector import Connector, normalize_identity
 from .control import BusyError, Interaction
 from .journal import JournalHooks, Recorder
 from .machine_api import MachineCommandAPI, encoded_step
-from .machine_controls import EncodedTeaRecipe
+from .machine_controls import EncodedTeaRecipe, UntestedOperationError
 from .ownership import AddressLease
 from .recipes import HistoryService, RecipeService, compile_recipe
 from .storage import ConflictError
@@ -243,7 +243,10 @@ class MachineService(MachineCommandAPI):
                     "Connection lost; explicitly disconnect and open a fresh session"
                 )
             if allow_untested and not self.session.allow_untested:
-                raise ValueError("Open a fresh session with experimental opt-in")
+                raise UntestedOperationError(
+                    "Open a fresh session with experimental opt-in. Disconnect, "
+                    "then connect with allow_untested=True."
+                )
             return
         if not self.device:
             raise ValueError("Configure a machine address for machine operations")

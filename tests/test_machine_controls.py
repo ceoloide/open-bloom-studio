@@ -436,11 +436,23 @@ class PresetTests(Base):
             with self.assertRaises(ValueError):
                 SavedPreset(**values)
 
+    async def test_batch_write_requires_experimental_session(self):
+        m = Machine()
+        presets = [SavedPreset(slot, b"new", 0) for slot in "ABC"]
+        backup = [SavedPreset(slot, b"old", 0) for slot in "ABC"]
+        async with interaction(m) as session:
+            with self.assertRaises(UntestedOperationError):
+                await session.write_presets(
+                    presets, backup=backup, backup_path=self.path()
+                )
+        self.assertEqual(m.codes(), [8100])
+        self.assertFalse(self.path().exists())
+
     async def test_backup_precedes_batch_write_and_save_event_is_required(self):
         m = Machine()
         presets = [SavedPreset(slot, slot.encode() * 3, 4) for slot in "CAB"]
         backup = [SavedPreset(slot, b"old", 1) for slot in "ABC"]
-        async with interaction(m) as session:
+        async with interaction(m, allow_untested=True) as session:
             result = await session.write_presets(
                 presets, backup=backup, backup_path=self.path()
             )
@@ -498,7 +510,7 @@ class PresetTests(Base):
     async def test_ack_without_save_is_not_success(self):
         m = Machine()
         m.overrides[11510] = lambda p: [reply(11510, p.payload, 0xC2)]
-        async with interaction(m) as session:
+        async with interaction(m, allow_untested=True) as session:
             with self.assertRaises(PresetWriteError) as caught:
                 await session.write_presets(
                     [SavedPreset(s, b"x", 0) for s in "ABC"],
@@ -516,7 +528,7 @@ class PresetTests(Base):
     async def test_missing_ack_does_not_retry_or_roll_back(self):
         m = Machine()
         m.studio.silent.add(11510)
-        async with interaction(m) as session:
+        async with interaction(m, allow_untested=True) as session:
             with self.assertRaises(PresetWriteError) as caught:
                 await session.write_presets(
                     [SavedPreset(s, b"x", 0) for s in "ABC"],
@@ -536,7 +548,7 @@ class PresetTests(Base):
             return m.studio(packet) if len(homes) == 1 else []
 
         m.overrides[HOME] = home
-        async with interaction(m) as session:
+        async with interaction(m, allow_untested=True) as session:
             with self.assertRaises(PresetWriteError) as caught:
                 await session.write_presets(
                     [SavedPreset(s, b"x", 0) for s in "ABC"],
@@ -551,7 +563,7 @@ class PresetTests(Base):
     async def test_cancelled_write_keeps_backup_and_propagates(self):
         m = Machine()
         m.block_code = 11510
-        async with interaction(m) as session:
+        async with interaction(m, allow_untested=True) as session:
             task = asyncio.create_task(
                 session.write_presets(
                     [SavedPreset(s, b"x", 0) for s in "ABC"],

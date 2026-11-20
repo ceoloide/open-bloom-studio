@@ -508,16 +508,18 @@ def check_entry_points(
         ]
     )
     python = scripts / ("python.exe" if sys.platform == "win32" else "python")
-    probe = [
-        str(python),
-        "-I",
-        "-c",
-        DAEMON_PROBE,
-        str(scripts),
-        str(workdir / "q"),
-        device,
-    ]
-    return problems + check_probe(json.loads(run(probe)), venv)
+    # Keep the daemon socket short even when TMPDIR is deeply nested.
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        probe = [
+            str(python),
+            "-I",
+            "-c",
+            DAEMON_PROBE,
+            str(scripts),
+            str(Path(directory) / "q"),
+            device,
+        ]
+        return problems + check_probe(json.loads(run(probe)), venv)
 
 
 def check_probe(result: Mapping[str, Any], venv: Path) -> list[str]:

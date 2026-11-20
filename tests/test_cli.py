@@ -562,7 +562,7 @@ class ConnectorSpecTests(unittest.TestCase):
 
 class DaemonClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
         self.db = self.root / "bloom.sqlite3"
         self.store = Store(self.db)
@@ -586,6 +586,25 @@ class DaemonClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def xbloom(self, *args):
         return await asyncio.to_thread(run_cli, "--socket", str(self.socket), *args)
+
+    async def test_tilde_socket_path_routes_to_daemon(self):
+        def tilde(*args):
+            return run_cli("--socket", "~/run/bloom.sock", *args)
+
+        with patch.dict("os.environ", {"HOME": str(self.root)}):
+            code, lines, errors = await asyncio.to_thread(tilde, "machine", "state")
+            self.assertEqual(code, 0, errors)
+            self.assertTrue(lines[0]["ok"])
+            # Only the daemon's identity check can reject a different device.
+            code, _, errors = await asyncio.to_thread(
+                tilde, "--device", "00:00:5E:00:53:08", "machine", "state"
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("different device", errors[0]["error"]["message"])
+            code, _, errors = await asyncio.to_thread(
+                tilde, "--direct", "machine", "state"
+            )
+            self.assertIn("do not bypass", errors[0]["error"]["message"])
 
     async def test_client_checks_the_served_machine_and_database(self):
         code, _, errors = await self.xbloom(

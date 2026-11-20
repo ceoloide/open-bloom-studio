@@ -21,7 +21,7 @@ from .machine_controls import PresetWriteError, UntestedOperationError
 from .ownership import LeaseBusyError, LeaseDirectoryError
 from .providers import ProviderError
 from .recipe_validation import RecipeValidationError
-from .rpc_types import RemoteError, SocketDirectoryError
+from .rpc_types import RemoteError, SocketDirectoryError, SocketPathError
 from .storage import ConflictError
 
 CODES = frozenset(
@@ -162,6 +162,14 @@ def error_detail(exc: BaseException, *, log_unexpected: bool = True) -> dict[str
             "permission_required",
             str(exc),
             "Select a private socket directory owned by the daemon user (mode 0700).",
+        )
+    if isinstance(exc, SocketPathError):
+        return _detail(
+            name,
+            "invalid_argument",
+            str(exc),
+            "Use a shorter --socket path in a private directory for the daemon "
+            "and clients.",
         )
     if isinstance(exc, BusyError):
         return _detail(

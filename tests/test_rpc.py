@@ -26,6 +26,7 @@ from xbloom_studio.ownership import AddressLease, LeaseDirectoryError
 from xbloom_studio.providers import ProviderError
 from xbloom_studio.recipe_validation import RecipeValidationError
 from xbloom_studio.rpc import LocalServer, RemoteError, call, default_socket
+from xbloom_studio.rpc_types import SocketPathError
 from xbloom_studio.storage import ConflictError, Store
 
 
@@ -165,7 +166,7 @@ class ErrorContractTests(unittest.TestCase):
 
 class ServerCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
         self.store = Store(self.root / "bloom.sqlite3")
         self.app = Application(self.store, "00:00:5E:00:53:01")
@@ -178,11 +179,24 @@ class ServerCase(unittest.IsolatedAsyncioTestCase):
 
 
 class LocalServerTests(ServerCase):
+    async def test_overlong_socket_path_has_actionable_error(self):
+        path = self.root / "run" / ("x" * 110 + ".sock")
+        with self.assertRaises(SocketPathError) as bind_error:
+            await LocalServer(self.app, path).start()
+        with self.assertRaises(SocketPathError) as connect_error:
+            await call(path, "service_info")
+        for exc in (bind_error.exception, connect_error.exception):
+            detail = error_detail(exc)
+            self.assertEqual(detail["code"], "invalid_argument")
+            self.assertIn("shorter --socket path", detail["next_step"])
+        self.assertFalse(self.app.machine.owned)
+
     async def test_private_socket_serves_and_removes_only_itself(self):
         server = await LocalServer(self.app, self.path).start()
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.path.parent.stat().st_mode), 0o700)
-        info = await call(self.path, "service_info")
+        with patch.dict(os.environ, {"HOME": str(self.root)}):
+            info = await call("~/run/bloom.sock", "service_info")
         self.assertEqual(info["device"], "00:00:5E:00:53:01")
         with self.assertRaises(RemoteError) as caught:
             await call(self.path, "history_get", {"ident": "missing"})
