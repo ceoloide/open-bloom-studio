@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import io
 import json
 import logging
@@ -172,8 +173,10 @@ class CarrierTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_closed_input_is_uncertain(self):
         self.mode("closed")
-        # Python 3.10 also logs its unretrieved stdin-closed future at ERROR.
+        # Python 3.10 also logs its unretrieved stdin-closed future at ERROR
+        # when a later garbage collection frees it; collect it while quiet.
         logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+        self.addCleanup(gc.collect)
         with self.assertRaisesRegex(ConnectionError, "connection closed"):
             await ssh_call("host", "recipe_validate", {"document": "x" * 1_000_000})
 
