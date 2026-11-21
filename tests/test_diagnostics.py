@@ -1999,6 +1999,8 @@ class SolR2HardeningTests(unittest.IsolatedAsyncioTestCase):
             "do not resend",
             mcp_pw.structured_content["writes"][1]["next_step"].lower(),
         )
+        self.assertFalse(mcp_pw.structured_content["writes"][1]["retry_allowed"])
+        self.assertTrue(mcp_pw.structured_content["writes"][0]["retry_allowed"])
 
         mcp_state = await server.call_tool("machine_state", {"detail": "full"})
         self.assertFalse(mcp_state.is_error)
@@ -2334,10 +2336,51 @@ class SolR3HardeningTests(unittest.IsolatedAsyncioTestCase):
             "attempts": [{"attempt_id": "a1", "outcome": "unconfirmed"}],
             "next_step": evil,
         }
+        write_preset_args_b = {
+            "command": "write_preset",
+            "params": {"preset": {"slot": "B", "payload_hex": "bb", "flags": 4}},
+            "allow_control": True,
+            "allow_untested": True,
+        }
+        write_preset_args_a = {
+            "command": "write_preset",
+            "params": {"preset": {"slot": "A", "payload_hex": "aa", "flags": 4}},
+            "allow_control": True,
+            "allow_untested": True,
+        }
 
-        # 1. Mocked MCP write_preset success with top-level saved_observed=True,
+        def assert_no_resend_guidance(text: str, *, expect_disconnect: bool) -> None:
+            low = text.lower()
+            self.assertNotIn(evil, text)
+            self.assertNotIn("resubmit", low)
+            self.assertNotIn("repeat", low)
+            self.assertNotIn("may be submitted", low)
+            self.assertNotIn("retry_allowed", low)
+            self.assertIn("machine_preset_writes", text)
+            self.assertIn("do not resend", low)
+            if expect_disconnect:
+                self.assertIn("machine_disconnect", text)
+            else:
+                self.assertNotIn("machine_disconnect", text)
+
+        def assert_safe_diagnostic(
+            diag,
+            *,
+            expect_disconnect: bool,
+            expect_no_slot: bool,
+        ) -> None:
+            assert_no_resend_guidance(diag["fix"], expect_disconnect=expect_disconnect)
+            if expect_no_slot:
+                self.assertNotIn("slot", diag.get("location") or {})
+            summary = (diag.get("context") or {}).get("summary", "")
+            self.assertNotIn("retry_allowed=true", summary.lower())
+            self.assertNotIn("state=retryable", summary.lower())
+            if expect_disconnect:
+                self.assertIn("recovery_required=true", summary)
+
+        # 1. Mocked MCP + RPC write_preset success with top-level saved_observed=True,
         # outcome="saved" and contradictory retryable nested attempt must never
-        # advise resend and must fall back to safe read-only inspection.
+        # advise resend and must clear retry_allowed on the nested attempt.
         contradictory_success = {
             "requested_slots": ["A"],
             "acknowledged_write_count": 1,
@@ -2353,8 +2396,9 @@ class SolR3HardeningTests(unittest.IsolatedAsyncioTestCase):
             "attempt": dict(retryable_slot_a),
         }
 
-        # 2. Failed MCP reply with details.requested_slots=['B'] (and batch /
-        # empty / malformed) + retryable slot A attempt must never advise retry.
+        # 2. Failed MCP + RPC write_preset replies with mismatched requested_slots
+        # OR conflicting top-level save must apply safe policy consistently across
+        # attempt.next_step, attempt.retry_allowed, diagnostic.fix, location, summary.
         failed_slot_b_rec_false = {
             "status": "failed",
             "error": "Preset write incomplete",
@@ -2383,15 +2427,45 @@ class SolR3HardeningTests(unittest.IsolatedAsyncioTestCase):
             },
             "recovery_required": True,
             "attempt": dict(retryable_slot_a),
+            "diagnostic": {"code": "XB_PRESET_WRITE_INCOMPLETE", "fix": evil},
         }
 
-        for label, reply, expect_error, expect_disconnect in (
-            ("success_saved_vs_retryable", contradictory_success, False, False),
-            ("nonfailed_unconfirmed_vs_retryable", nonfailed_unconfirmed, False, False),
-            ("failed_slot_b_rec_false", failed_slot_b_rec_false, True, False),
-            ("failed_slot_b_rec_true", failed_slot_b_rec_true, True, True),
+        mcp_cases = (
+            (
+                "success_saved_vs_retryable",
+                write_preset_args_a,
+                contradictory_success,
+                False,
+                False,
+                False,
+            ),
+            (
+                "nonfailed_unconfirmed_vs_retryable",
+                write_preset_args_a,
+                nonfailed_unconfirmed,
+                False,
+                False,
+                False,
+            ),
+            (
+                "failed_slot_b_rec_false",
+                write_preset_args_b,
+                failed_slot_b_rec_false,
+                True,
+                False,
+                True,
+            ),
+            (
+                "failed_slot_b_rec_true",
+                write_preset_args_b,
+                failed_slot_b_rec_true,
+                True,
+                True,
+                True,
+            ),
             (
                 "failed_batch_slots",
+                write_preset_args_b,
                 {
                     **failed_slot_b_rec_false,
                     "details": {
@@ -2402,9 +2476,11 @@ class SolR3HardeningTests(unittest.IsolatedAsyncioTestCase):
                 },
                 True,
                 False,
+                True,
             ),
             (
                 "failed_empty_slots",
+                write_preset_args_b,
                 {
                     **failed_slot_b_rec_false,
                     "details": {
@@ -2415,9 +2491,11 @@ class SolR3HardeningTests(unittest.IsolatedAsyncioTestCase):
                 },
                 True,
                 False,
+                True,
             ),
             (
-                "failed_top_level_saved_contradicts_details",
+                "failed_top_level_saved_contradicts_details_rec_false",
+                write_preset_args_a,
                 {
                     **failed_consistent_slot_a,
                     "saved_observed": True,
@@ -2426,53 +2504,168 @@ class SolR3HardeningTests(unittest.IsolatedAsyncioTestCase):
                 },
                 True,
                 False,
+                False,
             ),
-        ):
+            (
+                "failed_top_level_saved_contradicts_details_rec_true",
+                write_preset_args_a,
+                {
+                    **failed_consistent_slot_a,
+                    "saved_observed": True,
+                    "outcome": "saved",
+                    "recovery_required": True,
+                },
+                True,
+                True,
+                False,
+            ),
+        )
+        dispatch = self.app.call
+        for (
+            label,
+            tool_args,
+            reply,
+            expect_error,
+            expect_disconnect,
+            expect_no_slot,
+        ) in mcp_cases:
             with self.subTest(mcp_case=label):
 
                 async def caller(_method, _params, payload=reply):
                     return payload
 
                 server = create_server(caller=caller)
-                res = await server.call_tool(
-                    "machine_command", {"command": "wake", "allow_control": True}
-                )
+                res = await server.call_tool("machine_command", tool_args)
                 self.assertEqual(res.is_error, expect_error)
-                step = res.structured_content["attempt"]["next_step"]
-                self.assertNotIn(evil, json.dumps(res.structured_content))
-                self.assertNotIn("resubmit", step.lower())
-                self.assertNotIn("may be submitted", step.lower())
-                self.assertIn("machine_preset_writes", step)
-                self.assertIn("do not resend", step.lower())
-                if expect_disconnect:
-                    self.assertIn("machine_disconnect", step)
-                else:
-                    self.assertNotIn("machine_disconnect", step)
-                if "diagnostic" in res.structured_content:
-                    self.assertNotIn(
-                        "slot",
-                        res.structured_content["diagnostic"].get("location") or {},
+                sc = res.structured_content
+                self.assertNotIn(evil, json.dumps(sc))
+                self.assertEqual(sc["attempt"]["write_id"], "w-slot-a-1")
+                self.assertFalse(sc["attempt"]["retry_allowed"])
+                assert_no_resend_guidance(
+                    sc["attempt"]["next_step"], expect_disconnect=expect_disconnect
+                )
+                if "diagnostic" in sc:
+                    assert_safe_diagnostic(
+                        sc["diagnostic"],
+                        expect_disconnect=expect_disconnect,
+                        expect_no_slot=expect_no_slot,
                     )
 
-        # Genuine consistent failed write_preset still renders retryable policy.
+                # Same boundary over local Unix RPC.
+                async def rpc_spoof(method, params=None, payload=reply):
+                    if method == "machine_command":
+                        return payload
+                    return await dispatch(method, params)
+
+                with patch.object(self.app, "call", rpc_spoof):
+                    rpc_res = await call(self.sock, "machine_command", tool_args)
+                self.assertNotIn(evil, json.dumps(rpc_res))
+                self.assertFalse(rpc_res["attempt"]["retry_allowed"])
+                assert_no_resend_guidance(
+                    rpc_res["attempt"]["next_step"],
+                    expect_disconnect=expect_disconnect,
+                )
+                if "diagnostic" in rpc_res:
+                    assert_safe_diagnostic(
+                        rpc_res["diagnostic"],
+                        expect_disconnect=expect_disconnect,
+                        expect_no_slot=expect_no_slot,
+                    )
+
+        # Positive control 1: genuine consistent failed write_preset (mocked & real)
+        # preserves retry_allowed=True and consistent retryable guidance across MCP+RPC.
         async def ok_retry_caller(_method, _params):
             return failed_consistent_slot_a
 
         ok_srv = create_server(caller=ok_retry_caller)
-        ok_res = await ok_srv.call_tool(
-            "machine_command", {"command": "wake", "allow_control": True}
-        )
+        ok_res = await ok_srv.call_tool("machine_command", write_preset_args_a)
         self.assertTrue(ok_res.is_error)
+        ok_sc = ok_res.structured_content
+        self.assertTrue(ok_sc["attempt"]["retry_allowed"])
+        self.assertIn(
+            "Disconnect, then resubmit write_preset", ok_sc["attempt"]["next_step"]
+        )
+        self.assertIn(
+            "Disconnect, then resubmit write_preset", ok_sc["diagnostic"]["fix"]
+        )
+        self.assertEqual(ok_sc["diagnostic"]["location"]["slot"], "A")
+        self.assertIn("retry_allowed=true", ok_sc["diagnostic"]["context"]["summary"])
+
+        # Real daemon write_preset failure through local RPC + MCP.
+        self.machine.studio.silent.add(11510)
+        self.app.machine.options["ack_timeout"] = 0.05
+        real_rpc = await call(self.sock, "machine_command", write_preset_args_a)
+        self.assertEqual(real_rpc["status"], "failed")
+        self.assertTrue(real_rpc["attempt"]["retry_allowed"])
         self.assertIn(
             "Disconnect, then resubmit write_preset",
-            ok_res.structured_content["attempt"]["next_step"],
+            real_rpc["attempt"]["next_step"],
+        )
+        self.assertIn(
+            "Disconnect, then resubmit write_preset",
+            real_rpc["diagnostic"]["fix"],
+        )
+        self.assertEqual(real_rpc["diagnostic"]["location"]["slot"], "A")
+        self.assertIn(
+            "retry_allowed=true", real_rpc["diagnostic"]["context"]["summary"]
+        )
+        self.machine.studio.silent.discard(11510)
+
+        # Positive control 2: consistent saved_cleanup_failed on write_preset.
+        saved_cleanup_reply = {
+            "status": "failed",
+            "error": "cleanup timed out",
+            "type": "PresetWriteError",
+            "details": {
+                "requested_slots": ["A"],
+                "outcome": "saved_cleanup_failed",
+                "saved_observed": True,
+            },
+            "recovery_required": True,
+            "attempt": {
+                "write_id": "w-cleanup-3",
+                "preset": {"slot": "A", "payload_hex": "aa", "flags": 4},
+                "state": "saved",
+                "outcome": "saved_cleanup_failed",
+                "attempts_used": 1,
+                "max_attempts": 3,
+                "remaining_attempts": 0,
+                "retry_allowed": False,
+                "attempts": [{"attempt_id": "a1", "outcome": "saved_cleanup_failed"}],
+                "next_step": evil,
+            },
+            "diagnostic": {"code": "XB_PRESET_WRITE_INCOMPLETE", "fix": evil},
+        }
+
+        async def cleanup_caller(_method, _params):
+            return saved_cleanup_reply
+
+        cleanup_srv = create_server(caller=cleanup_caller)
+        cleanup_res = await cleanup_srv.call_tool(
+            "machine_command", write_preset_args_a
+        )
+        self.assertTrue(cleanup_res.is_error)
+        cl_sc = cleanup_res.structured_content
+        self.assertFalse(cl_sc["attempt"]["retry_allowed"])
+        self.assertIn("machine_disconnect", cl_sc["attempt"]["next_step"])
+        self.assertIn("do not replay", cl_sc["attempt"]["next_step"].lower())
+        self.assertEqual(cl_sc["diagnostic"]["fix"], cl_sc["attempt"]["next_step"])
+        self.assertIn(
+            "outcome=saved_cleanup_failed", cl_sc["diagnostic"]["context"]["summary"]
+        )
+        self.assertIn(
+            "recovery_required=true", cl_sc["diagnostic"]["context"]["summary"]
         )
 
-        # 3. Nested error_detail(RemoteError(...)) with details.requested_slots=['B']
-        # or saved evidence alongside retryable slot A attempt never advises retry.
-        for label, remote_details, attempt_getter in (
+        # 3. RemoteError error_detail: BOTH flat and wrapped details.preset_write
+        # forms (including sibling details.requested_slots=['B'] / saved_observed /
+        # recovery_required) must unify outer next_step, diagnostic.fix/summary,
+        # nested next_step, and retry_allowed flags.
+        remote_contradictory_cases = (
             (
-                "nested_preset_write_slot_b",
+                "wrapped_preset_write_slot_b_attempt",
+                "PresetWriteError",
+                "preset_write_incomplete",
                 {
                     "preset_write": {
                         "requested_slots": ["B"],
@@ -2481,10 +2674,14 @@ class SolR3HardeningTests(unittest.IsolatedAsyncioTestCase):
                         "attempt": dict(retryable_slot_a),
                     }
                 },
-                lambda d: d["details"]["preset_write"]["attempt"]["next_step"],
+                lambda d: [d["details"]["preset_write"]["attempt"]],
+                False,
+                True,
             ),
             (
-                "nested_preset_write_saved",
+                "wrapped_preset_write_saved_attempt",
+                "PresetWriteError",
+                "preset_write_incomplete",
                 {
                     "preset_write": {
                         "requested_slots": ["A"],
@@ -2493,37 +2690,282 @@ class SolR3HardeningTests(unittest.IsolatedAsyncioTestCase):
                         "attempt": dict(retryable_slot_a),
                     }
                 },
-                lambda d: d["details"]["preset_write"]["attempt"]["next_step"],
+                lambda d: [d["details"]["preset_write"]["attempt"]],
+                False,
+                False,
             ),
             (
-                "top_details_slot_b_with_attempt",
+                "wrapped_sibling_requested_slots_b_with_preset_write_record",
+                "PresetWriteRefused",
+                "conflict",
+                {
+                    "requested_slots": ["B"],
+                    "preset_write": dict(retryable_slot_a),
+                },
+                lambda d: [d["details"]["preset_write"]],
+                False,
+                True,
+            ),
+            (
+                "wrapped_sibling_requested_slots_b_with_preset_write_nested_attempt",
+                "PresetWriteError",
+                "preset_write_incomplete",
+                {
+                    "requested_slots": ["B"],
+                    "preset_write": {
+                        "requested_slots": ["A"],
+                        "outcome": "unconfirmed",
+                        "saved_observed": False,
+                        "attempt": dict(retryable_slot_a),
+                    },
+                },
+                lambda d: [d["details"]["preset_write"]["attempt"]],
+                False,
+                True,
+            ),
+            (
+                "wrapped_sibling_saved_with_preset_write_record",
+                "PresetWriteRefused",
+                "conflict",
+                {
+                    "saved_observed": True,
+                    "outcome": "saved",
+                    "preset_write": dict(retryable_slot_a),
+                },
+                lambda d: [d["details"]["preset_write"]],
+                False,
+                False,
+            ),
+            (
+                "wrapped_sibling_slot_b_and_recovery_required",
+                "PresetWriteError",
+                "preset_write_incomplete",
+                {
+                    "requested_slots": ["B"],
+                    "recovery_required": True,
+                    "preset_write": dict(retryable_slot_a),
+                },
+                lambda d: [d["details"]["preset_write"]],
+                True,
+                True,
+            ),
+            (
+                "flat_details_slot_b_with_attempt",
+                "PresetWriteError",
+                "preset_write_incomplete",
                 {
                     "requested_slots": ["B"],
                     "outcome": "unconfirmed",
                     "saved_observed": False,
                     "attempt": dict(retryable_slot_a),
                 },
-                lambda d: d["details"]["attempt"]["next_step"],
+                lambda d: [d["details"]["attempt"]],
+                False,
+                True,
             ),
-        ):
+            (
+                "flat_details_saved_with_attempt",
+                "PresetWriteError",
+                "preset_write_incomplete",
+                {
+                    "requested_slots": ["A"],
+                    "outcome": "saved",
+                    "saved_observed": True,
+                    "attempt": dict(retryable_slot_a),
+                },
+                lambda d: [d["details"]["attempt"]],
+                False,
+                False,
+            ),
+            (
+                "flat_details_direct_record_slot_b",
+                "PresetWriteError",
+                "preset_write_incomplete",
+                {
+                    **retryable_slot_a,
+                    "requested_slots": ["B"],
+                },
+                lambda d: [d["details"]],
+                False,
+                True,
+            ),
+            (
+                "flat_conflict_slot_b_with_attempt",
+                "PresetWriteRefused",
+                "conflict",
+                {
+                    "requested_slots": ["B"],
+                    "attempt": dict(retryable_slot_a),
+                },
+                lambda d: [d["details"]["attempt"]],
+                False,
+                True,
+            ),
+        )
+        for (
+            label,
+            err_type,
+            err_code,
+            remote_details,
+            nested_getter,
+            expect_disconnect,
+            expect_no_slot,
+        ) in remote_contradictory_cases:
             with self.subTest(error_detail_case=label):
+                diag_code = (
+                    "XB_PRESET_WRITE_REFUSED"
+                    if err_code == "conflict"
+                    else "XB_PRESET_WRITE_INCOMPLETE"
+                )
                 rebuilt = error_detail(
                     RemoteError(
+                        {
+                            "type": err_type,
+                            "code": err_code,
+                            "message": "Preset write did not finish.",
+                            "next_step": evil,
+                            "retryable": False,
+                            "details": remote_details,
+                            "diagnostic": {"code": diag_code, "fix": evil},
+                        }
+                    )
+                )
+                self.assertEqual(rebuilt["type"], err_type)
+                self.assertEqual(rebuilt["code"], err_code)
+                self.assertEqual(rebuilt["retryable"], False)
+                self.assertNotIn(evil, json.dumps(rebuilt))
+                assert_no_resend_guidance(
+                    rebuilt["next_step"], expect_disconnect=expect_disconnect
+                )
+                assert_safe_diagnostic(
+                    rebuilt["diagnostic"],
+                    expect_disconnect=expect_disconnect,
+                    expect_no_slot=expect_no_slot,
+                )
+                for nested in nested_getter(rebuilt):
+                    self.assertFalse(nested["retry_allowed"])
+                    assert_no_resend_guidance(
+                        nested["next_step"], expect_disconnect=expect_disconnect
+                    )
+
+        # Same sibling/flat RemoteError propagated through MCP write_preset tool.
+        for label, remote_details, nested_getter in (
+            (
+                "mcp_remote_err_wrapped_sibling",
+                {
+                    "requested_slots": ["B"],
+                    "preset_write": dict(retryable_slot_a),
+                },
+                lambda err: err["details"]["preset_write"],
+            ),
+            (
+                "mcp_remote_err_flat_attempt",
+                {
+                    "requested_slots": ["B"],
+                    "outcome": "unconfirmed",
+                    "saved_observed": False,
+                    "attempt": dict(retryable_slot_a),
+                },
+                lambda err: err["details"]["attempt"],
+            ),
+        ):
+            with self.subTest(mcp_remote_error=label):
+
+                async def err_caller(_method, _params, rd=remote_details):
+                    raise RemoteError(
                         {
                             "type": "PresetWriteError",
                             "code": "preset_write_incomplete",
                             "message": "Preset write did not finish.",
                             "next_step": evil,
+                            "retryable": False,
+                            "details": rd,
+                            "diagnostic": {
+                                "code": "XB_PRESET_WRITE_INCOMPLETE",
+                                "fix": evil,
+                            },
+                        }
+                    )
+
+                err_srv = create_server(caller=err_caller)
+                err_res = await err_srv.call_tool(
+                    "machine_command", write_preset_args_b
+                )
+                self.assertTrue(err_res.is_error)
+                err_body = err_res.structured_content["error"]
+                assert_no_resend_guidance(
+                    err_body["next_step"], expect_disconnect=False
+                )
+                assert_safe_diagnostic(
+                    err_body["diagnostic"],
+                    expect_disconnect=False,
+                    expect_no_slot=True,
+                )
+                nested_err = nested_getter(err_body)
+                self.assertFalse(nested_err["retry_allowed"])
+                assert_no_resend_guidance(
+                    nested_err["next_step"], expect_disconnect=False
+                )
+
+        # Positive eligible RemoteError controls (both wrapped and flat forms).
+        for label, err_type, err_code, remote_details, nested_getter in (
+            (
+                "eligible_wrapped_preset_write",
+                "PresetWriteRefused",
+                "conflict",
+                {"preset_write": dict(retryable_slot_a)},
+                lambda d: d["details"]["preset_write"],
+            ),
+            (
+                "eligible_flat_attempt",
+                "PresetWriteError",
+                "preset_write_incomplete",
+                {
+                    "requested_slots": ["A"],
+                    "outcome": "unconfirmed",
+                    "saved_observed": False,
+                    "attempt": dict(retryable_slot_a),
+                },
+                lambda d: d["details"]["attempt"],
+            ),
+        ):
+            with self.subTest(eligible_remote_error=label):
+                rebuilt_ok = error_detail(
+                    RemoteError(
+                        {
+                            "type": err_type,
+                            "code": err_code,
+                            "message": "Preset write incomplete.",
+                            "next_step": evil,
+                            "retryable": False,
                             "details": remote_details,
+                            "diagnostic": {
+                                "code": "XB_PRESET_WRITE_REFUSED"
+                                if err_code == "conflict"
+                                else "XB_PRESET_WRITE_INCOMPLETE",
+                                "fix": evil,
+                            },
                         }
                     )
                 )
-                step = attempt_getter(rebuilt)
-                self.assertNotIn(evil, json.dumps(rebuilt))
-                self.assertNotIn("resubmit", step.lower())
-                self.assertNotIn("machine_disconnect", step)
-                self.assertIn("machine_preset_writes", step)
-                self.assertIn("do not resend", step.lower())
+                self.assertNotIn(evil, json.dumps(rebuilt_ok))
+                self.assertIn(
+                    "Disconnect, then resubmit write_preset", rebuilt_ok["next_step"]
+                )
+                self.assertIn(
+                    "Disconnect, then resubmit write_preset",
+                    rebuilt_ok["diagnostic"]["fix"],
+                )
+                self.assertEqual(rebuilt_ok["diagnostic"]["location"]["slot"], "A")
+                self.assertIn(
+                    "retry_allowed=true",
+                    rebuilt_ok["diagnostic"]["context"]["summary"],
+                )
+                nested_ok = nested_getter(rebuilt_ok)
+                self.assertTrue(nested_ok["retry_allowed"])
+                self.assertIn(
+                    "Disconnect, then resubmit write_preset", nested_ok["next_step"]
+                )
 
     async def test_s2_should_folded_saved_cleanup_failed_and_superseded_history(self):
         from xbloom_studio.preset_writes import (

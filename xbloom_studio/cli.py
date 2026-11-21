@@ -716,6 +716,7 @@ def _emit_human_result_diagnostic(
                 cause=cause,
                 payload=payload,
                 attempt=attempt,
+                enclosing=result,
                 recovery_required=rec_req,
                 context=context,
                 trusted=not remote,

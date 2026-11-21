@@ -24,8 +24,7 @@ from .diagnostics import (
     build_diagnostic,
     extract_json_excerpt,
     preset_write_diagnostic,
-    rebuild_remote_diagnostic,
-    render_preset_write_next_step,
+    sanitize_remote_error,
     validation_diagnostic,
 )
 from .machine_controls import PresetWriteError, UntestedOperationError
@@ -144,43 +143,6 @@ def _internal(context: DiagnosticContext | None = None) -> dict[str, Any]:
     }
 
 
-def _sanitize_remote_preset_write_details(filtered: dict[str, Any]) -> None:
-    details = filtered.get("details")
-    if not isinstance(details, dict):
-        return
-    details_copy = dict(details)
-    changed = False
-    raw_pw = details.get("preset_write")
-    if isinstance(raw_pw, dict):
-        pw_copy = dict(raw_pw)
-        pw_changed = False
-        if "next_step" in pw_copy:
-            pw_copy["next_step"] = render_preset_write_next_step(pw_copy)
-            pw_changed = True
-        raw_attempt = pw_copy.get("attempt")
-        if isinstance(raw_attempt, dict) and "next_step" in raw_attempt:
-            att_copy = dict(raw_attempt)
-            att_copy["next_step"] = render_preset_write_next_step(
-                att_copy, payload=pw_copy
-            )
-            pw_copy["attempt"] = att_copy
-            pw_changed = True
-        if pw_changed:
-            details_copy["preset_write"] = pw_copy
-            changed = True
-    raw_top_attempt = details.get("attempt")
-    if isinstance(raw_top_attempt, dict) and "next_step" in raw_top_attempt:
-        att_copy = dict(raw_top_attempt)
-        att_copy["next_step"] = render_preset_write_next_step(
-            att_copy,
-            payload=details,
-        )
-        details_copy["attempt"] = att_copy
-        changed = True
-    if changed:
-        filtered["details"] = details_copy
-
-
 def _validate_remote_envelope(detail: Any) -> dict[str, Any] | None:
     if not isinstance(detail, dict):
         return None
@@ -219,13 +181,7 @@ def error_detail(
     if isinstance(exc, RemoteError):
         filtered = _validate_remote_envelope(exc.detail)
         if filtered is not None:
-            rebuilt = rebuild_remote_diagnostic(filtered, context=context)
-            if "diagnostic" in filtered:
-                filtered["diagnostic"] = rebuilt
-            if "next_step" in filtered:
-                filtered["next_step"] = rebuilt["fix"]
-            _sanitize_remote_preset_write_details(filtered)
-            return filtered
+            return sanitize_remote_error(filtered, context=context)
         return _internal(context)
     name = type(exc).__name__
     location = _context_location(context)
