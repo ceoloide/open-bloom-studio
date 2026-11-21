@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -59,7 +60,8 @@ _SENSITIVE_VALUE = re.compile(
     r"|https?://[^/\s@]+:[^/\s@]+@"
     r")"
 )
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SHELL_META = re.compile(r"[;|&$`<>\\]")
 _JSON_TOKEN = re.compile(
     r"""
     (?P<ws>[ \t\r\n]+)
@@ -103,6 +105,50 @@ _VALID_SLOTS = frozenset({"A", "B", "C"})
 _SAVED_OUTCOMES = frozenset(
     {"saved", "saved_cleanup_failed", "saved_interrupted", "saved_late"}
 )
+_SAFE_PRESET_READONLY_RECOVERY = (
+    "Inspect `machine_preset_writes`, `machine_state`, and the physical "
+    "machine before any further control. Do not resend or roll back "
+    "automatically."
+)
+_SAFE_PRESET_DISCONNECT_RECOVERY = (
+    "Session recovery is required: call `machine_disconnect` and inspect "
+    "`machine_state`, `machine_preset_writes`, and the physical machine "
+    "before any further control. Do not resend or roll back automatically."
+)
+_SAVED_CLEANUP_FAILED_FIX = (
+    "A save event was observed (not a readback); do not replay this preset "
+    "write. Because post-save cleanup failed and session recovery is "
+    "required, call `machine_disconnect` and inspect `machine_state`, "
+    "`machine_preset_writes`, and the physical machine before any further "
+    "control."
+)
+_SAFE_PREPARED_INVALIDATED_RECOVERY = (
+    "Disconnect and explicitly upload again; retained machine content is not verified"
+)
+_SAFE_PREPARED_FALLBACK_RECOVERY = (
+    "Inspect `machine_state` and disconnect before uploading again; retained "
+    "machine content is not verified."
+)
+
+
+def _is_unsafe_char(ch: str) -> bool:
+    return unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp")
+
+
+def safe_identifier(value: Any) -> str | None:
+    """Return ``value`` only when it is a plain, shell-safe identifier."""
+    if type(value) is str and _SAFE_IDENTIFIER.fullmatch(value):
+        return value
+    return None
+
+
+def is_safe_human_note(value: Any) -> bool:
+    """Return whether ``value`` is plain text free of shell meta/controls/secrets."""
+    if type(value) is not str or not value.strip():
+        return False
+    if _SHELL_META.search(value) or _SENSITIVE_VALUE.search(value):
+        return False
+    return not any(_is_unsafe_char(ch) for ch in value)
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -581,7 +627,7 @@ FALLBACK_BY_ERROR_CODE: dict[str, str] = {
 
 
 def _truncate(text: str, limit: int) -> str:
-    cleaned = _CONTROL_CHARS.sub(" ", text).strip()
+    cleaned = "".join(" " if _is_unsafe_char(ch) else ch for ch in text).strip()
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 3].rstrip() + "..."
@@ -589,10 +635,31 @@ def _truncate(text: str, limit: int) -> str:
 
 def _truncate_line(text: str, limit: int) -> str:
     """Sanitize a source excerpt line while preserving leading indentation."""
-    cleaned = _CONTROL_CHARS.sub(" ", text).rstrip("\r\n")
+    stripped = text.rstrip("\r\n")
+    cleaned = "".join(
+        "  " if ch == "\t" else " " if _is_unsafe_char(ch) else ch for ch in stripped
+    )
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 3] + "..."
+
+
+def _split_lf_lines(text: str) -> list[tuple[int, int, str]]:
+    """Split ``text`` strictly on LF to match JSON parser and pointer spans."""
+    lines: list[tuple[int, int, str]] = []
+    start = 0
+    length = len(text)
+    while start < length:
+        nl = text.find("\n", start)
+        if nl == -1:
+            end = length
+            next_start = length
+        else:
+            end = nl - 1 if nl > start and text[nl - 1] == "\r" else nl
+            next_start = nl + 1
+        lines.append((start, end, text[start:end]))
+        start = next_start
+    return lines
 
 
 def _window_line(text: str, column: int | None) -> tuple[str, int | None]:
@@ -676,7 +743,8 @@ def _parse_json_structure(
                     return False, 0
                 if not isinstance(key, str):
                     return False, 0
-                key_indices.add(key_idx)
+                if not any(_is_unsafe_char(ch) for ch in key):
+                    key_indices.add(key_idx)
                 key_sensitive = (
                     _is_sensitive_key(key)
                     or bool(_SENSITIVE_VALUE.search(key))
@@ -732,16 +800,19 @@ def _parse_json_structure(
 
 
 def _reconstruct_excerpt_line(
-    raw_line: str,
+    line_text: str,
     line_start: int,
     line_tokens: Sequence[tuple[int, str, str, int, int]],
     *,
     keep_string_indices: set[int],
     sensitive_spans: Sequence[tuple[int, int]],
     target_column: int | None,
-) -> tuple[str, int | None]:
-    line_text = raw_line.rstrip("\r\n")
+) -> tuple[str, int | None] | None:
     line_end = line_start + len(line_text)
+    for tok_idx, _, _, tok_start, tok_end in line_tokens:
+        if tok_start < line_start or tok_end > line_end:
+            return None
+        _ = tok_idx
     for s_start, s_end in sensitive_spans:
         if s_start < line_end and s_end > line_start:
             return "<redacted>", None
@@ -759,13 +830,16 @@ def _reconstruct_excerpt_line(
         for idx, ch in enumerate(segment):
             if target_offset is not None and seg_start + idx == target_offset:
                 adjusted_col = out_len + 1
-            rep = "  " if ch == "\t" else _CONTROL_CHARS.sub(" ", ch)
+            rep = "  " if ch == "\t" else " " if _is_unsafe_char(ch) else ch
             out.append(rep)
             out_len += len(rep)
 
     for tok_idx, kind, raw, tok_start, tok_end in line_tokens:
         if tok_start > cursor:
-            emit_plain(line_text[cursor - line_start : tok_start - line_start], cursor)
+            gap = line_text[cursor - line_start : tok_start - line_start]
+            if any(ch not in " \t\r" for ch in gap):
+                return None
+            emit_plain(gap, cursor)
         if kind == "string" and tok_idx not in keep_string_indices:
             if target_offset is not None and tok_start <= target_offset < tok_end:
                 adjusted_col = out_len + 1 if target_offset == tok_start else None
@@ -777,7 +851,10 @@ def _reconstruct_excerpt_line(
         cursor = tok_end
 
     if cursor < line_end:
-        emit_plain(line_text[cursor - line_start :], cursor)
+        tail = line_text[cursor - line_start :]
+        if any(ch not in " \t\r" for ch in tail):
+            return None
+        emit_plain(tail, cursor)
     if target_offset is not None and target_offset >= line_end and adjusted_col is None:
         adjusted_col = out_len + 1
 
@@ -794,10 +871,10 @@ def extract_json_excerpt(
     """Return a minimal fail-closed structural/redacted excerpt for local JSON."""
     if not text or line < 1 or len(text.encode("utf-8")) > MAX_JSON_LOCATE_BYTES:
         return None
-    raw_lines = text.splitlines(keepends=True)
-    if line > len(raw_lines):
+    lf_lines = _split_lf_lines(text)
+    if line > len(lf_lines):
         return None
-    target_raw = raw_lines[line - 1].rstrip("\r\n")
+    _, _, target_raw = lf_lines[line - 1]
     if column is None and len(target_raw) > 200:
         return None
 
@@ -836,32 +913,31 @@ def extract_json_excerpt(
             and _SAFE_MALFORMED_KEY.fullmatch(decoded) is not None
         }
 
-    line_offsets: list[int] = []
-    offset = 0
-    for raw_line in raw_lines:
-        line_offsets.append(offset)
-        offset += len(raw_line)
-
     start = max(1, line - radius)
-    end = min(len(raw_lines), line + radius)
+    end = min(len(lf_lines), line + radius)
     excerpt: list[dict[str, Any]] = []
     for number in range(start, end + 1):
         is_target = number == line
-        l_start = line_offsets[number - 1]
-        l_end = l_start + len(raw_lines[number - 1].rstrip("\r\n"))
-        l_tokens = [
-            (idx, kind, raw, t_start, t_end)
-            for idx, (kind, raw, t_start, t_end) in enumerate(tokens)
-            if t_start >= l_start and t_end <= l_end
-        ]
-        cleaned, col = _reconstruct_excerpt_line(
-            raw_lines[number - 1],
+        l_start, l_end, l_text = lf_lines[number - 1]
+        l_tokens: list[tuple[int, str, str, int, int]] = []
+        for idx, (kind, raw, t_start, t_end) in enumerate(tokens):
+            if t_end <= l_start or t_start >= l_end:
+                continue
+            # Fail closed if any token crosses an excerpt line boundary.
+            if t_start < l_start or t_end > l_end:
+                return None
+            l_tokens.append((idx, kind, raw, t_start, t_end))
+        rebuilt_line = _reconstruct_excerpt_line(
+            l_text,
             l_start,
             l_tokens,
             keep_string_indices=keep_string_indices,
             sensitive_spans=sensitive_spans,
             target_column=column if is_target else None,
         )
+        if rebuilt_line is None:
+            return None
+        cleaned, col = rebuilt_line
         entry: dict[str, Any] = {
             "line": number,
             "text": cleaned,
@@ -904,54 +980,77 @@ def locate_json_pointer_line(text: str, pointer: str) -> tuple[int, int] | None:
     return line, found - last_nl
 
 
+def _sequence_values(value: Any, *, limit: int = 8) -> str | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return None
+    if not value:
+        return None
+    items = [str(v) for v in value[:limit] if type(v) in (str, int, float, bool)]
+    if not items:
+        return None
+    text = ", ".join(items)
+    if len(value) > limit:
+        text += ", ..."
+    return text
+
+
 def _format_expected(expected: Any) -> str | None:
     if not isinstance(expected, Mapping):
         return None
     parts: list[str] = []
-    if (
-        "enum" in expected
-        and isinstance(expected["enum"], Sequence)
-        and not isinstance(expected["enum"], (str, bytes))
+    enum_vals = _sequence_values(expected.get("enum"))
+    if enum_vals is not None:
+        parts.append(f"one of [{enum_vals}]")
+    elif (
+        "minimum" in expected
+        and "maximum" in expected
+        and type(expected["minimum"]) in (int, float)
+        and type(expected["maximum"]) in (int, float)
     ):
-        values = ", ".join(str(v) for v in expected["enum"][:8])
-        if len(expected["enum"]) > 8:
-            values += ", ..."
-        parts.append(f"one of [{values}]")
-    elif "minimum" in expected and "maximum" in expected:
         raw_kind = expected.get("type", "number")
-        kind = "integer" if raw_kind == "tea_temperature" else raw_kind
+        kind = (
+            "integer"
+            if raw_kind == "tea_temperature"
+            else raw_kind
+            if type(raw_kind) is str and raw_kind.strip()
+            else "number"
+        )
         bound = f"{kind} {expected['minimum']}..{expected['maximum']}"
-        if expected.get("enum_alternatives"):
-            alts = ", ".join(str(v) for v in expected["enum_alternatives"])
+        alts = _sequence_values(expected.get("enum_alternatives"))
+        if alts is not None:
             bound += f" or {alts}"
-        if expected.get("numeric_exclusions"):
-            excl = ", ".join(str(v) for v in expected["numeric_exclusions"])
+        excl = _sequence_values(expected.get("numeric_exclusions"))
+        if excl is not None:
             bound += f" (excluding {excl})"
         parts.append(bound)
-    elif "min_items" in expected and "max_items" in expected:
+    elif (
+        "min_items" in expected
+        and "max_items" in expected
+        and type(expected["min_items"]) is int
+        and type(expected["max_items"]) is int
+    ):
         parts.append(f"{expected['min_items']}..{expected['max_items']} items")
-    elif "minItems" in expected and "maxItems" in expected:
+    elif (
+        "minItems" in expected
+        and "maxItems" in expected
+        and type(expected["minItems"]) is int
+        and type(expected["maxItems"]) is int
+    ):
         parts.append(f"{expected['minItems']}..{expected['maxItems']} items")
-    elif (
-        "allowed_fields" in expected
-        and isinstance(expected["allowed_fields"], Sequence)
-        and not isinstance(expected["allowed_fields"], (str, bytes))
-    ):
-        fields = ", ".join(str(v) for v in expected["allowed_fields"][:8])
+    elif (fields := _sequence_values(expected.get("allowed_fields"))) is not None:
         parts.append(f"fields [{fields}]")
-    elif (
-        "properties" in expected
-        and isinstance(expected["properties"], Sequence)
-        and not isinstance(expected["properties"], (str, bytes))
-    ):
-        fields = ", ".join(str(v) for v in expected["properties"][:8])
-        parts.append(f"properties [{fields}]")
-    elif "total_ml" in expected:
+    elif (props := _sequence_values(expected.get("properties"))) is not None:
+        parts.append(f"properties [{props}]")
+    elif "total_ml" in expected and type(expected["total_ml"]) in (int, float):
         parts.append(f"total_ml={expected['total_ml']}")
-    elif "steep_count" in expected:
+    elif "steep_count" in expected and type(expected["steep_count"]) is int:
         parts.append(f"steep_count={expected['steep_count']}")
-    elif "type" in expected:
-        parts.append(str(expected["type"]))
+    elif (
+        "type" in expected
+        and type(expected["type"]) is str
+        and expected["type"].strip()
+    ):
+        parts.append(expected["type"])
     return "; ".join(parts) if parts else None
 
 
@@ -981,7 +1080,9 @@ def _summarize_validation_issue(
             bits.append("got <string>")
         else:
             bits.append(f"got <{type(val).__name__}>")
-    expected = _format_expected(first.get("expected") or first.get("allowed"))
+    expected = _format_expected(first.get("expected")) or _format_expected(
+        first.get("allowed")
+    )
     if expected:
         bits.append(f"expected {expected}")
     if len(valid_issues) > 1:
@@ -1186,9 +1287,9 @@ def sanitize_diagnostic(
         if slot is not None:
             safe_loc.setdefault("kind", "slot")
             safe_loc["slot"] = slot
-        op_id = raw_loc.get("operation_id")
-        if isinstance(op_id, str) and op_id.strip():
-            safe_loc["operation_id"] = _truncate(op_id, MAX_SANITISED_TEXT)
+        op_id = safe_identifier(raw_loc.get("operation_id"))
+        if op_id is not None:
+            safe_loc["operation_id"] = op_id
         if spec.code == "XB_JSON_SYNTAX":
             line = raw_loc.get("line")
             col = raw_loc.get("column")
@@ -1250,6 +1351,235 @@ def validation_diagnostic(
     return diagnostic
 
 
+def _parse_attempt_outcomes(
+    raw_attempts: Any, valid_outcomes: frozenset[str]
+) -> list[str] | None:
+    if not isinstance(raw_attempts, list):
+        return None
+    outcomes: list[str] = []
+    for item in raw_attempts:
+        if not isinstance(item, Mapping):
+            return None
+        item_out = item.get("outcome")
+        if type(item_out) is not str or item_out not in valid_outcomes:
+            return None
+        outcomes.append(item_out)
+    return outcomes
+
+
+def _consistent_single_slot(
+    record: Mapping[str, Any], payload: Mapping[str, Any] | None
+) -> bool:
+    slots: set[str] = set()
+    for candidate in (
+        record.get("slot") if "slot" in record else None,
+        record["preset"].get("slot")
+        if isinstance(record.get("preset"), Mapping)
+        else None,
+        payload.get("slot")
+        if isinstance(payload, Mapping) and "slot" in payload
+        else None,
+    ):
+        if candidate is None:
+            continue
+        valid = _valid_slot_value(candidate)
+        if valid is None or "," in valid:
+            return False
+        slots.add(valid)
+    if "slot" in record and _valid_slot_value(record["slot"]) is None:
+        return False
+    if "preset" in record:
+        preset = record["preset"]
+        if (
+            not isinstance(preset, Mapping)
+            or _valid_slot_value(preset.get("slot")) is None
+        ):
+            return False
+    if isinstance(payload, Mapping) and "slot" in payload:
+        if _valid_slot_value(payload["slot"]) is None:
+            return False
+    return len(slots) <= 1
+
+
+def render_preset_write_next_step(
+    record: Mapping[str, Any],
+    *,
+    payload: Mapping[str, Any] | None = None,
+    recovery_required: bool | None = None,
+) -> str:
+    """Render preset-write ``next_step`` strictly from local policy and evidence.
+
+    Never forwards peer-supplied prose. Unknown or inconsistent evidence never
+    authorizes a resend and falls back to safe read-only or disconnect recovery.
+    """
+    from .preset_writes import (
+        MAX_ATTEMPTS,
+        NEXT_STEPS,
+        NO_PRESET_FRAME,
+        OUTCOMES,
+        RETRYABLE,
+        SAVED,
+    )
+
+    valid_outcomes = frozenset(
+        OUTCOMES | {"interrupted", "saved_interrupted", "saved_late", "in_progress"}
+    )
+    fallback = (
+        _SAFE_PRESET_DISCONNECT_RECOVERY
+        if recovery_required is True
+        else _SAFE_PRESET_READONLY_RECOVERY
+    )
+    raw_outcome = record.get("outcome")
+    outcome_valid = "outcome" not in record or (
+        type(raw_outcome) is str and raw_outcome in valid_outcomes
+    )
+    outcome = raw_outcome if type(raw_outcome) is str and outcome_valid else None
+
+    payload_outcome: str | None = None
+    payload_valid = True
+    saved_observed = False
+    if isinstance(payload, Mapping):
+        if "saved_observed" in payload:
+            if type(payload["saved_observed"]) is bool:
+                saved_observed = payload["saved_observed"]
+            else:
+                payload_valid = False
+        if "outcome" in payload:
+            p_out = payload["outcome"]
+            if type(p_out) is str and p_out in valid_outcomes:
+                payload_outcome = p_out
+            else:
+                payload_valid = False
+
+    attempts_outcomes = _parse_attempt_outcomes(record.get("attempts"), valid_outcomes)
+    any_attempt_saved = bool(
+        attempts_outcomes is not None and (SAVED & set(attempts_outcomes))
+    )
+    any_saved = (
+        outcome in SAVED
+        or payload_outcome in SAVED
+        or saved_observed
+        or any_attempt_saved
+    )
+    cleanup_failed = (
+        outcome == "saved_cleanup_failed"
+        or payload_outcome == "saved_cleanup_failed"
+        or (
+            attempts_outcomes is not None
+            and "saved_cleanup_failed" in attempts_outcomes
+        )
+    )
+    if cleanup_failed or (any_saved and recovery_required is True):
+        return _SAVED_CLEANUP_FAILED_FIX
+
+    write_id = safe_identifier(record.get("write_id"))
+    raw_state = record.get("state")
+    state = raw_state if type(raw_state) is str and raw_state in NEXT_STEPS else None
+    if (
+        write_id is None
+        or state is None
+        or not outcome_valid
+        or not payload_valid
+        or not _consistent_single_slot(record, payload)
+        or attempts_outcomes is None
+    ):
+        return fallback
+
+    retry_allowed = record.get("retry_allowed")
+    attempts_used = record.get("attempts_used")
+    max_attempts = record.get("max_attempts")
+    remaining = record.get("remaining_attempts")
+    if (
+        type(retry_allowed) is not bool
+        or type(attempts_used) is not int
+        or type(max_attempts) is not int
+        or type(remaining) is not int
+        or max_attempts < 1
+        or max_attempts > MAX_ATTEMPTS
+        or attempts_used < 0
+        or remaining < 0
+    ):
+        return fallback
+
+    counted = [out for out in attempts_outcomes if out != "refused"]
+    if len(counted) != attempts_used:
+        return fallback
+
+    if state == "saved":
+        if retry_allowed is not False or remaining != 0 or not any_saved:
+            return fallback
+        return NEXT_STEPS["saved"].format(write_id=write_id)
+
+    if any_saved:
+        return fallback
+
+    if state == "cancelled":
+        if retry_allowed is not False or remaining != 0 or "cancelled" not in counted:
+            return fallback
+        return NEXT_STEPS["cancelled"].format(write_id=write_id)
+
+    if state == "in_progress":
+        if (
+            retry_allowed is not False
+            or remaining != 0
+            or not counted
+            or counted[-1] != "in_progress"
+            or "cancelled" in counted
+        ):
+            return fallback
+        return NEXT_STEPS["in_progress"]
+
+    if state == "exhausted":
+        if (
+            retry_allowed is not False
+            or remaining != 0
+            or attempts_used < max_attempts
+            or not all(out in RETRYABLE for out in counted)
+        ):
+            return fallback
+        step = NEXT_STEPS["exhausted"].format(write_id=write_id, max=max_attempts)
+        if counted and all(out == "no_preset_frame" for out in counted):
+            step += NO_PRESET_FRAME
+        return step
+
+    if state == "retryable":
+        if (
+            retry_allowed is not True
+            or attempts_used < 1
+            or attempts_used >= max_attempts
+            or remaining != max_attempts - attempts_used
+            or not all(out in RETRYABLE for out in counted)
+            or (
+                outcome is not None
+                and outcome not in RETRYABLE
+                and outcome != "refused"
+            )
+        ):
+            return fallback
+        step = NEXT_STEPS["retryable"].format(
+            write_id=write_id, max=max_attempts, remaining=remaining
+        )
+        if all(out == "no_preset_frame" for out in counted):
+            step += NO_PRESET_FRAME
+        return step
+
+    if state == "not_sent":
+        if (
+            recovery_required is True
+            or retry_allowed is not True
+            or attempts_used != 0
+            or remaining != max_attempts
+            or (outcome is not None and outcome != "refused")
+        ):
+            return fallback
+        return NEXT_STEPS["not_sent"]
+
+    # state == "superseded"
+    if recovery_required is True or retry_allowed is not False or remaining != 0:
+        return fallback
+    return NEXT_STEPS["superseded"]
+
+
 def _preset_write_fix(
     *,
     refused: bool,
@@ -1265,13 +1595,7 @@ def _preset_write_fix(
     if not refused and (
         outcome == "saved_cleanup_failed" or (saved and recovery_required is True)
     ):
-        return (
-            "A save event was observed (not a readback); do not replay this preset "
-            "write. Because post-save cleanup failed and session recovery is "
-            "required, call `machine_disconnect` and inspect `machine_state`, "
-            "`machine_preset_writes`, and the physical machine before any further "
-            "control."
-        )
+        return _SAVED_CLEANUP_FAILED_FIX
     if not refused and recovery_required is True:
         return (
             "Session recovery is required: call `machine_disconnect` and inspect "
@@ -1408,7 +1732,11 @@ def _extract_preset_slot(data: Mapping[str, Any] | None) -> str | None:
         if preset_slot:
             return preset_slot
     slots = data.get("requested_slots")
-    if isinstance(slots, list) and slots and all(s in _VALID_SLOTS for s in slots):
+    if (
+        isinstance(slots, list)
+        and slots
+        and all(type(s) is str and s in _VALID_SLOTS for s in slots)
+    ):
         return ",".join(slots)
     return None
 
@@ -1517,7 +1845,11 @@ def attach_local_context(
 
 
 def _local_fix_for_remote(
-    diag_code: str, details: Mapping[str, Any] | None
+    diag_code: str,
+    details: Mapping[str, Any] | None,
+    *,
+    error_type: str | None = None,
+    message: str = "",
 ) -> str | None:
     if (
         diag_code == "XB_RESPONSE_TOO_LARGE"
@@ -1530,6 +1862,18 @@ def _local_fix_for_remote(
             "or replay the same idempotency key to retrieve it. Never start "
             "again with a new key."
         )
+    if diag_code == "XB_DIRECTORY_PERMISSION_REQUIRED":
+        lower_msg = message.lower()
+        if error_type == "LeaseDirectoryError" or "lease directory" in lower_msg:
+            return (
+                "Check ownership and mode 0700 for the lease directory under "
+                "the account's home. Ensure the daemon user can write there."
+            )
+        if error_type == "SocketDirectoryError" or "socket directory" in lower_msg:
+            return (
+                "Select a private socket directory owned by the daemon user "
+                "(mode 0700)."
+            )
     return None
 
 
@@ -1541,12 +1885,16 @@ def rebuild_remote_diagnostic(
     """Rebuild a trusted diagnostic from an enclosing validated remote envelope."""
     raw_code = detail.get("code")
     error_code = raw_code if type(raw_code) is str else "internal_error"
+    raw_type = detail.get("type")
+    error_type = raw_type if type(raw_type) is str else None
     raw_message = detail.get("message")
     message = raw_message if isinstance(raw_message, str) else ""
     raw_details = detail.get("details")
     details = raw_details if isinstance(raw_details, Mapping) else None
 
-    diag_code = _infer_code(error_code, message, details, context=context)
+    diag_code = _infer_code(
+        error_code, message, details, error_type=error_type, context=context
+    )
     raw_diag = detail.get("diagnostic")
     if has_valid_diagnostic_types(raw_diag):
         assert isinstance(raw_diag, Mapping)
@@ -1570,6 +1918,11 @@ def rebuild_remote_diagnostic(
                     diag_code = "XB_RECIPE_VALIDATION"
                 else:
                     diag_code = candidate
+            elif (
+                error_code == "permission_required"
+                and diag_code == "XB_DIRECTORY_PERMISSION_REQUIRED"
+            ):
+                diag_code = "XB_DIRECTORY_PERMISSION_REQUIRED"
             elif candidate == "XB_PRESET_WRITE_REFUSED":
                 if (isinstance(details, Mapping) and "preset_write" in details) or (
                     context is not None and context.method == "machine_command"
@@ -1605,8 +1958,8 @@ def rebuild_remote_diagnostic(
     location: dict[str, Any] = {}
     ctx_payload: dict[str, Any] = {}
     if isinstance(details, Mapping):
-        op_id = details.get("operation_id")
-        if isinstance(op_id, str) and op_id.strip():
+        op_id = safe_identifier(details.get("operation_id"))
+        if op_id is not None:
             location["kind"] = "method"
             location["operation_id"] = op_id
         http_status = details.get("http_status")
@@ -1652,7 +2005,9 @@ def rebuild_remote_diagnostic(
     diagnostic = build_diagnostic(
         diag_code,
         cause=message or None,
-        fix=_local_fix_for_remote(diag_code, details),
+        fix=_local_fix_for_remote(
+            diag_code, details, error_type=error_type, message=message
+        ),
         location=location or None,
         context=ctx_payload or None,
     )
@@ -1666,7 +2021,7 @@ def sanitize_remote_result(
     context: DiagnosticContext | None = None,
     strict: bool = False,
 ) -> Any:
-    """Sanitize and rebuild diagnostics on remote validation or command results."""
+    """Sanitize and rebuild diagnostics and machine recovery text on remote results."""
     if not isinstance(data, Mapping):
         return data
     if method in ("recipe_validate", "recipe_tea_validate"):
@@ -1700,23 +2055,29 @@ def sanitize_remote_result(
             and not has_valid_diagnostic_types(cleaned["diagnostic"])
         ):
             raise ValueError("Remote diagnostic contains unexpected nested types")
+        payload = (
+            cleaned.get("details")
+            if isinstance(cleaned.get("details"), Mapping)
+            else None
+        )
+        rec_req = (
+            cleaned.get("recovery_required")
+            if type(cleaned.get("recovery_required")) is bool
+            else None
+        )
+        raw_attempt = cleaned.get("attempt")
+        attempt: dict[str, Any] | None = None
+        if isinstance(raw_attempt, Mapping):
+            attempt = dict(raw_attempt)
+            if "next_step" in attempt:
+                if strict and type(attempt["next_step"]) is not str:
+                    raise ValueError("Remote preset attempt next_step must be a string")
+                attempt["next_step"] = render_preset_write_next_step(
+                    attempt, payload=payload, recovery_required=rec_req
+                )
+            cleaned["attempt"] = attempt
         if cleaned.get("status") == "failed":
             if has_diag:
-                payload = (
-                    cleaned.get("details")
-                    if isinstance(cleaned.get("details"), Mapping)
-                    else None
-                )
-                attempt = (
-                    cleaned.get("attempt")
-                    if isinstance(cleaned.get("attempt"), Mapping)
-                    else None
-                )
-                rec_req = (
-                    cleaned.get("recovery_required")
-                    if type(cleaned.get("recovery_required")) is bool
-                    else None
-                )
                 raw_error = cleaned.get("error")
                 cause = (
                     raw_error
@@ -1734,6 +2095,39 @@ def sanitize_remote_result(
                 )
         else:
             cleaned.pop("diagnostic", None)
+        return cleaned
+    if method == "machine_preset_writes":
+        cleaned = dict(data)
+        raw_writes = cleaned.get("writes")
+        if isinstance(raw_writes, list):
+            sanitized_writes: list[Any] = []
+            for item in raw_writes:
+                if isinstance(item, Mapping) and "next_step" in item:
+                    if strict and type(item["next_step"]) is not str:
+                        raise ValueError(
+                            "Remote preset write next_step must be a string"
+                        )
+                    item_copy = dict(item)
+                    item_copy["next_step"] = render_preset_write_next_step(item_copy)
+                    sanitized_writes.append(item_copy)
+                else:
+                    sanitized_writes.append(item)
+            cleaned["writes"] = sanitized_writes
+        return cleaned
+    if method in ("machine_state", "machine_connect", "operation_pause_resume"):
+        cleaned = dict(data)
+        raw_prepared = cleaned.get("prepared")
+        if isinstance(raw_prepared, Mapping) and "recovery" in raw_prepared:
+            prep_copy = dict(raw_prepared)
+            if prep_copy["recovery"] is not None:
+                if strict and type(prep_copy["recovery"]) is not str:
+                    raise ValueError("Remote prepared recovery must be a string")
+                prep_copy["recovery"] = (
+                    _SAFE_PREPARED_INVALIDATED_RECOVERY
+                    if prep_copy.get("status") == "invalidated"
+                    else _SAFE_PREPARED_FALLBACK_RECOVERY
+                )
+            cleaned["prepared"] = prep_copy
         return cleaned
     return data
 
@@ -1780,6 +2174,7 @@ def _infer_code(
     message: str,
     details: Any,
     *,
+    error_type: str | None = None,
     context: DiagnosticContext | None = None,
 ) -> str:
     if error_code == "not_found":
@@ -1792,6 +2187,16 @@ def _infer_code(
         return "XB_NOT_FOUND"
     if error_code == "validation_error":
         if context is not None and context.method == "machine_command":
+            return "XB_COMMAND_VALIDATION"
+        if context is not None and context.method in (
+            "recipe_validate",
+            "recipe_tea_validate",
+            "recipe_preview",
+            "recipe_create",
+            "recipe_update",
+        ):
+            return "XB_RECIPE_VALIDATION"
+        if error_type == "CommandValidationError":
             return "XB_COMMAND_VALIDATION"
         if isinstance(details, Mapping):
             validation = details.get("validation")
@@ -1811,9 +2216,33 @@ def _infer_code(
                     if isinstance(path, str) and path.startswith("/params"):
                         return "XB_COMMAND_VALIDATION"
         return "XB_RECIPE_VALIDATION"
-    if error_code == "conflict" and isinstance(details, Mapping):
-        if "preset_write" in details:
+    if error_code == "permission_required":
+        lower_msg = message.lower()
+        if error_type in ("LeaseDirectoryError", "SocketDirectoryError") or (
+            "lease directory" in lower_msg or "socket directory" in lower_msg
+        ):
+            return "XB_DIRECTORY_PERMISSION_REQUIRED"
+        return "XB_CONTROL_PERMISSION_REQUIRED"
+    if error_code == "busy":
+        if error_type == "LeaseBusyError":
+            return "XB_OWNER_LEASE_BUSY"
+        return "XB_MACHINE_BUSY"
+    if error_code == "invalid_argument":
+        if error_type == "SocketPathError":
+            return "XB_SOCKET_PATH_TOO_LONG"
+        if error_type in ("JSONDecodeError", "LocalJsonSyntaxError"):
+            return "XB_JSON_SYNTAX"
+        return "XB_INVALID_ARGUMENT"
+    if error_code == "conflict":
+        if error_type == "PresetWriteRefused" or (
+            isinstance(details, Mapping) and "preset_write" in details
+        ):
             return "XB_PRESET_WRITE_REFUSED"
+        if error_type == "FileExistsError":
+            return "XB_SOCKET_EXISTS"
+        return "XB_CONFLICT"
+    if error_code == "connection_unavailable" and error_type == "SessionError":
+        return "XB_SESSION_UNAVAILABLE"
     return FALLBACK_BY_ERROR_CODE.get(error_code, "XB_INTERNAL_ERROR")
 
 

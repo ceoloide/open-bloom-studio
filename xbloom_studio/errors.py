@@ -25,6 +25,7 @@ from .diagnostics import (
     extract_json_excerpt,
     preset_write_diagnostic,
     rebuild_remote_diagnostic,
+    render_preset_write_next_step,
     validation_diagnostic,
 )
 from .machine_controls import PresetWriteError, UntestedOperationError
@@ -143,18 +144,28 @@ def _internal(context: DiagnosticContext | None = None) -> dict[str, Any]:
     }
 
 
-_LOCAL_FIX_REMOTE_CODES = frozenset(
-    {
-        "connection_unavailable",
-        "machine_protocol_error",
-        "preset_write_incomplete",
-        "response_too_large",
-        "internal_error",
-        "busy",
-        "permission_required",
-        "experimental_required",
-    }
-)
+def _sanitize_remote_preset_write_details(filtered: dict[str, Any]) -> None:
+    details = filtered.get("details")
+    if not isinstance(details, dict):
+        return
+    raw_pw = details.get("preset_write")
+    if not isinstance(raw_pw, dict):
+        return
+    pw_copy = dict(raw_pw)
+    changed = False
+    if "next_step" in pw_copy:
+        pw_copy["next_step"] = render_preset_write_next_step(pw_copy)
+        changed = True
+    raw_attempt = pw_copy.get("attempt")
+    if isinstance(raw_attempt, dict) and "next_step" in raw_attempt:
+        att_copy = dict(raw_attempt)
+        att_copy["next_step"] = render_preset_write_next_step(att_copy, payload=pw_copy)
+        pw_copy["attempt"] = att_copy
+        changed = True
+    if changed:
+        details_copy = dict(details)
+        details_copy["preset_write"] = pw_copy
+        filtered["details"] = details_copy
 
 
 def _validate_remote_envelope(detail: Any) -> dict[str, Any] | None:
@@ -198,15 +209,9 @@ def error_detail(
             rebuilt = rebuild_remote_diagnostic(filtered, context=context)
             if "diagnostic" in filtered:
                 filtered["diagnostic"] = rebuilt
-            if "next_step" in filtered and (
-                filtered["code"] in _LOCAL_FIX_REMOTE_CODES
-                or (
-                    filtered["code"] == "conflict"
-                    and isinstance(filtered.get("details"), dict)
-                    and "preset_write" in filtered["details"]
-                )
-            ):
+            if "next_step" in filtered:
                 filtered["next_step"] = rebuilt["fix"]
+            _sanitize_remote_preset_write_details(filtered)
             return filtered
         return _internal(context)
     name = type(exc).__name__

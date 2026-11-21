@@ -126,6 +126,7 @@ def create_server(  # noqa: C901 - one registration per tool
     from .diagnostics import (
         DiagnosticContext,
         build_diagnostic,
+        safe_identifier,
         sanitize_remote_result,
     )
     from .errors import error_detail
@@ -277,8 +278,9 @@ def create_server(  # noqa: C901 - one registration per tool
                     and isinstance(value.get("id"), str)
                     else None
                 )
-                if op_id is not None:
-                    out_loc["operation_id"] = op_id
+                safe_op_id = safe_identifier(op_id)
+                if safe_op_id is not None:
+                    out_loc["operation_id"] = safe_op_id
                 failure = _error(
                     "output_contract_error",
                     msg,

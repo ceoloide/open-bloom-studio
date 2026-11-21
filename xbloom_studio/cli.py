@@ -29,8 +29,10 @@ from .diagnostics import (
     InputFileReadError,
     LocalJsonSyntaxError,
     build_diagnostic,
+    is_safe_human_note,
     preset_write_diagnostic,
     render_human_diagnostic,
+    safe_identifier,
 )
 from .errors import error_detail
 from .facade import PURE_METHODS, Application, bind_parameters
@@ -87,6 +89,9 @@ _GLOBAL_VALUE_OPTIONS = frozenset(
 _GLOBAL_FLAG_OPTIONS = frozenset({"--direct"})
 _GLOBAL_OPTIONS = _GLOBAL_VALUE_OPTIONS | _GLOBAL_FLAG_OPTIONS
 _ERROR_FORMATS = frozenset({"auto", "json", "human"})
+_KNOWN_CLEANUP_STATUSES = frozenset(
+    {"pending", "completed", "failed", "skipped_uncertain"}
+)
 
 _ARGPARSE_REQUIRED = re.compile(r"^the following arguments are required: .+$")
 _ARGPARSE_EXPECTED = re.compile(
@@ -434,6 +439,16 @@ def _subcommand_tree(p: argparse.ArgumentParser) -> dict[str, set[str]]:
     return tree
 
 
+def _match_global_option(name: str) -> str | None:
+    """Resolve exact global option or unique argparse long-option prefix."""
+    if not name.startswith("--") or len(name) < 3:
+        return None
+    if name in _GLOBAL_OPTIONS:
+        return name
+    matches = [opt for opt in _GLOBAL_OPTIONS if opt.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _scan_cli_args(
     args: Sequence[str], p: argparse.ArgumentParser
 ) -> tuple[str, str | None, bool]:
@@ -445,27 +460,24 @@ def _scan_cli_args(
         token = args[index]
         if token == "--":
             return error_format, None, False
-        if token.startswith("--error-format="):
-            val = token.partition("=")[2]
-            if val in _ERROR_FORMATS:
-                error_format = val
-            index += 1
-            continue
-        if token == "--error-format":
-            if index + 1 < len(args) and not args[index + 1].startswith("-"):
+        opt_name, has_eq, opt_val = token.partition("=")
+        matched = _match_global_option(opt_name)
+        if matched == "--error-format":
+            if has_eq:
+                if opt_val in _ERROR_FORMATS:
+                    error_format = opt_val
+                index += 1
+            elif index + 1 < len(args) and not args[index + 1].startswith("-"):
                 if args[index + 1] in _ERROR_FORMATS:
                     error_format = args[index + 1]
                 index += 2
             else:
                 index += 1
             continue
-        if token in _GLOBAL_VALUE_OPTIONS:
-            index += 2 if index + 1 < len(args) else 1
+        if matched in _GLOBAL_VALUE_OPTIONS:
+            index += 1 if has_eq else (2 if index + 1 < len(args) else 1)
             continue
-        if any(token.startswith(opt + "=") for opt in _GLOBAL_VALUE_OPTIONS):
-            index += 1
-            continue
-        if token in _GLOBAL_FLAG_OPTIONS:
+        if matched in _GLOBAL_FLAG_OPTIONS and not has_eq:
             index += 1
             continue
         if token.startswith("-"):
@@ -486,9 +498,9 @@ def _scan_cli_args(
     for token in args[index:]:
         if token == "--":
             break
-        if token in _GLOBAL_OPTIONS or any(
-            token.startswith(opt + "=") for opt in _GLOBAL_VALUE_OPTIONS
-        ):
+        opt_name, has_eq, _ = token.partition("=")
+        matched = _match_global_option(opt_name)
+        if matched is not None and (not has_eq or matched in _GLOBAL_VALUE_OPTIONS):
             trailing_global = True
             break
     return error_format, known_cmd, trailing_global
@@ -734,15 +746,21 @@ def _emit_human_operation_diagnostic(
 ) -> None:
     if _effective_error_format(getattr(a, "error_format", "auto")) != "human":
         return
-    status = str(result.get("status") or "unknown")
-    op_id = result.get("id")
-    op_id_str = op_id if isinstance(op_id, str) and op_id.strip() else None
+    raw_status = result.get("status")
+    status = raw_status if raw_status in ("failed", "unknown") else "unknown"
+    raw_op_id = result.get("id")
+    safe_op_id = safe_identifier(raw_op_id)
+    unsafe_raw_id = (
+        raw_op_id.strip()
+        if isinstance(raw_op_id, str) and safe_op_id is None and raw_op_id.strip()
+        else None
+    )
     context = _command_context(a, tracker)
     location: dict[str, Any] = {"kind": "command", "command": _command_label(a)}
     if tracker is not None and tracker.method:
         location["method"] = tracker.method
-    if op_id_str is not None:
-        location["operation_id"] = op_id_str
+    if safe_op_id is not None:
+        location["operation_id"] = safe_op_id
 
     summary_bits = [f"status={status}"]
     reason: str | None = None
@@ -754,8 +772,8 @@ def _emit_human_operation_diagnostic(
                 reason = val.strip()
                 break
         cleanup = outcome.get("cleanup_status")
-        if isinstance(cleanup, str) and cleanup.strip():
-            summary_bits.append(f"cleanup_status={cleanup.strip()}")
+        if type(cleanup) is str and cleanup in _KNOWN_CLEANUP_STATUSES:
+            summary_bits.append(f"cleanup_status={cleanup}")
         steps = outcome.get("steps")
         if reason is None and isinstance(steps, list):
             for step in steps:
@@ -772,13 +790,17 @@ def _emit_human_operation_diagnostic(
         )
     else:
         cause = f"Watched operation ended with status '{status}'."
-    if reason:
+    if (
+        reason is not None
+        and is_safe_human_note(reason)
+        and (unsafe_raw_id is None or unsafe_raw_id not in reason)
+    ):
         cause = f"{cause} {reason}"
 
-    if op_id_str is not None:
+    if safe_op_id is not None:
         fix = (
-            f"Inspect read-only `xbloom-studio history get {op_id_str}`, "
-            f"`xbloom-studio history events {op_id_str}`, `xbloom-studio machine "
+            f"Inspect read-only `xbloom-studio history get {safe_op_id}`, "
+            f"`xbloom-studio history events {safe_op_id}`, `xbloom-studio machine "
             "state`, and the physical machine. Never automatically replay a "
             "start with a new idempotency key."
         )
