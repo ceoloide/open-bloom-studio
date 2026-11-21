@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 from .command_schema import MAX_OPERATION_TIMEOUT, water_timeout
+from .diagnostics import validation_diagnostic
 
 Rule = dict[str, Any]
 
@@ -565,7 +566,7 @@ def check_recipe(document: Any) -> dict[str, Any]:
     json_value(document)
     warnings = _warnings(document, mode, bool(errors))
     normalized = None if errors else _normalize(document, mode, profile)
-    return {
+    report: dict[str, Any] = {
         "valid": not errors,
         "errors": errors,
         "warnings": warnings,
@@ -576,6 +577,9 @@ def check_recipe(document: Any) -> dict[str, Any]:
         "execution_supported": not errors
         and mode in ("host", "native", "tea", "coffee"),
     }
+    if errors:
+        report["diagnostic"] = validation_diagnostic(errors)
+    return report
 
 
 def _check_host(steps: Any, field: Any, obj: Any, issue: Any) -> None:

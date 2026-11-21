@@ -24,6 +24,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
+from .diagnostics import DiagnosticContext
 from .errors import error_detail
 from .rpc import call
 from .rpc_types import RemoteError
@@ -229,6 +230,7 @@ async def ssh_call(
 async def relay(socket_path: str | os.PathLike[str]) -> int:
     """Relay one request/response on stdio; the forced command fixes the socket."""
     transport = None
+    method: str | None = None
     try:
         reader = asyncio.StreamReader(limit=MAX_REQUEST)
         protocol = asyncio.StreamReaderProtocol(reader)
@@ -237,21 +239,24 @@ async def relay(socket_path: str | os.PathLike[str]) -> int:
         )
         raw = await asyncio.wait_for(_bounded(reader, MAX_REQUEST), 10)
         envelope = request(raw)
-        if envelope["method"] not in REMOTE_METHODS:
+        method = envelope["method"]
+        if method not in REMOTE_METHODS:
             raise ValueError(
                 "Method is not available through the SSH endpoint; backups require a "
                 "local operator"
             )
-        result = await call(socket_path, envelope["method"], envelope.get("params"))
+        result = await call(socket_path, method, envelope.get("params"))
         reply = {"ok": True, "data": result}
     except Exception as exc:
-        reply = {"ok": False, "error": error_detail(exc)}
+        context = DiagnosticContext(method=method) if method is not None else None
+        reply = {"ok": False, "error": error_detail(exc, context=context)}
     finally:
         if transport is not None:
             transport.close()
     try:
         encoded = frame(reply, MAX_RESPONSE)
     except ValueError:
+        context = DiagnosticContext(method=method) if method is not None else None
         encoded = frame(
             {
                 "ok": False,
@@ -259,7 +264,8 @@ async def relay(socket_path: str | os.PathLike[str]) -> int:
                     ConnectionError(
                         "RPC response exceeds its limit; inspect history with "
                         "pagination"
-                    )
+                    ),
+                    context=context,
                 ),
             },
             MAX_RESPONSE,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .diagnostics import validation_diagnostic
 from .recipe_validation import _actual, check_recipe, recipe_constraints
 
 OUTPUT_TARGETS = (120, 240, 360)
@@ -132,5 +133,9 @@ def validate_tea_recipe(
         }
     )
     if errors:
-        report.update(normalized=None, execution_supported=False)
+        report.update(
+            normalized=None,
+            execution_supported=False,
+            diagnostic=validation_diagnostic(errors, tea=True),
+        )
     return report

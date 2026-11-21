@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import Any
 
 from .connector import Connector, normalize_identity
+from .diagnostics import (
+    DiagnosticContext,
+    InputFileReadError,
+    LocalJsonSyntaxError,
+    render_human_diagnostic,
+)
 from .errors import error_detail
 from .facade import PURE_METHODS, Application, bind_parameters
 from .grind_profiles import grind_profile
@@ -90,6 +96,13 @@ def parser() -> argparse.ArgumentParser:
         "--direct",
         action="store_true",
         help="Use attached local execution; never compete with a daemon",
+    )
+    p.add_argument(
+        "--error-format",
+        choices=("auto", "json", "human"),
+        default="auto",
+        help="Error output format on stderr: auto (human on TTY, json otherwise), "
+        "json, or human",
     )
     sub = p.add_subparsers(dest="command", required=True)
     daemon = sub.add_parser("serve", help="Run the private Unix socket daemon")
@@ -321,40 +334,192 @@ def control_flags(p: argparse.ArgumentParser) -> None:
     )
 
 
-def load(path: Path) -> Any:
+class _SourceTracker:
+    """Local CLI invocation context; never serialized across RPC or SSH."""
+
+    def __init__(self) -> None:
+        self.method: str | None = None
+        self.path: str | None = None
+        self.text: str | None = None
+        self.parameter: str | None = None
+        self.allow_excerpt: bool = False
+
+    def record(
+        self,
+        path: str,
+        text: str,
+        *,
+        parameter: str = "file",
+        allow_excerpt: bool = True,
+    ) -> None:
+        self.path = path
+        self.text = text
+        self.parameter = parameter
+        self.allow_excerpt = allow_excerpt
+
+
+def _effective_error_format(choice: str) -> str:
+    if choice in ("json", "human"):
+        return choice
+    return "human" if bool(getattr(sys.stderr, "isatty", lambda: False)()) else "json"
+
+
+def _command_label(a: argparse.Namespace) -> str:
+    command = str(a.command)
+    if command == "call":
+        return f"call {a.method}"
+    action = getattr(a, "action", None)
+    if command == "machine" and action == "command":
+        return f"machine command {a.machine_command}"
+    if isinstance(action, str):
+        return f"{command} {action}"
+    return command
+
+
+def _command_parameter(a: argparse.Namespace) -> str | None:
+    command = a.command
+    action = getattr(a, "action", None)
+    if command == "call":
+        return "params" if a.params else None
+    if command == "recipe":
+        if action in ("get", "compile", "archive", "alias", "update", "refresh"):
+            return "reference"
+        if action in (
+            "validate",
+            "tea-validate",
+            "preview",
+            "create",
+            "examples",
+            "match",
+            "import-export",
+        ):
+            return "file"
+        if action == "import":
+            return "url"
+    if command == "history" and action in (
+        "get",
+        "events",
+        "export",
+        "feedback",
+        "save-recipe",
+        "repeat",
+    ):
+        return "operation_id"
+    if command == "operation":
+        return "idempotency_key" if action == "lookup" else "operation_id"
+    if command == "machine":
+        if action == "command" and a.params:
+            return "params"
+        if action == "preset-writes" and a.slot:
+            return "slot"
+        if action in ("start-uploaded", "cancel-uploaded"):
+            return "token"
+        if action == "upload":
+            return "file" if a.file else "reference" if a.reference else None
+    if command == "brew":
+        return "file" if a.file else "reference" if a.reference else None
+    return None
+
+
+def _command_context(
+    a: argparse.Namespace, tracker: _SourceTracker | None = None
+) -> DiagnosticContext:
+    parameter = (
+        tracker.parameter
+        if tracker is not None and tracker.parameter is not None
+        else _command_parameter(a)
+    )
+    return DiagnosticContext(
+        command=_command_label(a),
+        method=tracker.method if tracker is not None else None,
+        parameter=parameter,
+        source_path=tracker.path if tracker is not None else None,
+        source_text=tracker.text if tracker is not None else None,
+        allow_excerpt=tracker.allow_excerpt if tracker is not None else False,
+    )
+
+
+def _emit_human_result_diagnostic(
+    a: argparse.Namespace,
+    result: dict[str, Any],
+    code: str,
+    fallback_message: str,
+    tracker: _SourceTracker | None,
+) -> None:
+    if _effective_error_format(getattr(a, "error_format", "auto")) != "human":
+        return
+    envelope: dict[str, Any] = {
+        "code": code,
+        "message": str(result.get("error") or fallback_message),
+        "details": {"validation": result}
+        if code == "validation_error"
+        else {"preset_write": result.get("details") or {}},
+    }
+    if "diagnostic" in result:
+        envelope["diagnostic"] = result["diagnostic"]
+    print(
+        render_human_diagnostic(envelope, context=_command_context(a, tracker)),
+        file=sys.stderr,
+    )
+
+
+def load(
+    path: Path,
+    tracker: _SourceTracker | None = None,
+    *,
+    parameter: str = "file",
+    allow_excerpt: bool = True,
+) -> Any:
+    if tracker is not None:
+        tracker.record(str(path), "", parameter=parameter, allow_excerpt=allow_excerpt)
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
-        raise ValueError(f"Unable to read JSON input file: {path}") from exc
-    return json.loads(text)
+        raise InputFileReadError(
+            f"Unable to read JSON input file: {path}", display_path=str(path)
+        ) from exc
+    if tracker is not None:
+        tracker.record(
+            str(path), text, parameter=parameter, allow_excerpt=allow_excerpt
+        )
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise LocalJsonSyntaxError(
+            exc.msg, exc.doc, exc.pos, display_path=str(path)
+        ) from exc
 
 
-def _recipe_source(a: argparse.Namespace) -> dict[str, Any]:
+def _recipe_source(
+    a: argparse.Namespace, tracker: _SourceTracker | None = None
+) -> dict[str, Any]:
     if bool(a.reference) == bool(a.file):
         raise ValueError("Provide exactly one recipe reference or --file")
     if a.reference:
         return {"kind": "recipe", "reference": a.reference, "revision": a.revision}
     if a.revision is not None:
         raise ValueError("--revision requires a saved recipe reference")
-    return {"kind": "recipe", "document": load(a.file)}
+    return {"kind": "recipe", "document": load(a.file, tracker, parameter="file")}
 
 
-def _recipe_route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+def _recipe_route(
+    a: argparse.Namespace, tracker: _SourceTracker | None = None
+) -> tuple[str, dict[str, Any]]:
     action = a.action
     if action == "tea-references":
         return "recipe_tea_references", {"family": a.family}
     if action == "tea-validate":
         return "recipe_tea_validate", {
-            "document": load(a.file),
+            "document": load(a.file, tracker),
             "expected_output_ml": a.expected_output_ml,
         }
     if action in ("preview", "validate"):
-        return "recipe_" + action, {"document": load(a.file)}
+        return "recipe_" + action, {"document": load(a.file, tracker)}
     if action in ("constraints", "templates"):
         return "recipe_" + action, {}
     if action == "examples":
         return "recipe_examples", {
-            "coffee": load(a.file),
+            "coffee": load(a.file, tracker),
             "water_ml": a.water_ml,
             "limit": a.limit,
         }
@@ -362,11 +527,14 @@ def _recipe_route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         document = grind_profile(a.name, a.size, a.rpm, a.duration_s)
         return "recipe_validate", {"document": document}
     if action == "create":
-        return "recipe_create", {"document": load(a.file), "temporary": a.temporary}
+        return "recipe_create", {
+            "document": load(a.file, tracker),
+            "temporary": a.temporary,
+        }
     if action == "update":
         return "recipe_update", {
             "reference": a.reference,
-            "document": load(a.file),
+            "document": load(a.file, tracker),
             "expected_revision": a.expected_revision,
         }
     if action in ("get", "compile"):
@@ -404,20 +572,22 @@ def _recipe_route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     if action == "search-online":
         return "provider_search", {"query": a.query, "page": a.page}
     limit = {"limit": a.limit} if a.limit is not None else {}
-    return "recipe_match", {"coffee": load(a.file), **limit}
+    return "recipe_match", {"coffee": load(a.file, tracker), **limit}
 
 
-def _machine_route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+def _machine_route(
+    a: argparse.Namespace, tracker: _SourceTracker | None = None
+) -> tuple[str, dict[str, Any]]:
     if a.action == "command":
         return "machine_command", {
             "command": a.machine_command,
-            "params": load(a.params) if a.params else {},
+            "params": load(a.params, tracker, parameter="params") if a.params else {},
             "allow_control": a.allow_control,
             "allow_untested": a.allow_untested,
         }
     if a.action == "upload":
         return "recipe_upload", {
-            "request": _recipe_source(a),
+            "request": _recipe_source(a, tracker),
             "allow_control": a.allow_control,
             "allow_untested": a.allow_untested,
             "expected_recipe_sha256": a.expected_recipe_sha256,
@@ -453,14 +623,19 @@ def _operation_route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     return "operation_" + a.action, {"operation_id": a.operation_id, **token}
 
 
-def route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+def route(
+    a: argparse.Namespace, tracker: _SourceTracker | None = None
+) -> tuple[str, dict[str, Any]]:
     """Map parsed arguments to one application method and its parameters."""
     if a.command == "call":
-        return a.method, load(a.params) if a.params else {}
+        return (
+            a.method,
+            load(a.params, tracker, parameter="params") if a.params else {},
+        )
     if a.command == "recipe":
-        return _recipe_route(a)
+        return _recipe_route(a, tracker)
     if a.command == "machine":
-        return _machine_route(a)
+        return _machine_route(a, tracker)
     if a.command == "operation":
         return _operation_route(a)
     if a.command == "history":
@@ -483,7 +658,7 @@ def route(a: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             }
         request: dict[str, Any] = {"kind": "repeat", "operation_id": a.operation_id}
     elif a.command == "brew":
-        request = _recipe_source(a)
+        request = _recipe_source(a, tracker)
     else:
         fields = (
             ("volume_ml", "temperature_c", "flow_ml_s", "pattern")
@@ -540,7 +715,7 @@ def _same_device(configured: str | None, served: object) -> bool:
         return False
 
 
-async def run(a: argparse.Namespace) -> int:
+async def run(a: argparse.Namespace, *, _tracker: _SourceTracker | None = None) -> int:
     _check_options(a)
     app: Application | None = None
     invoke: Invoke
@@ -586,12 +761,19 @@ async def run(a: argparse.Namespace) -> int:
         (a.command == "recipe" and a.action in PURE_ACTIONS)
         or (a.command == "call" and a.method in PURE_METHODS)
     ):
-        method, params = route(a)
+        method, params = route(a, _tracker)
+        if _tracker is not None:
+            _tracker.method = method
         fn, _ = PURE_METHODS[method]
         result = fn(**bind_parameters(fn, params))
         output(result)
         validation = method in ("recipe_validate", "recipe_tea_validate")
-        return 2 if validation and not result["valid"] else 0
+        if validation and not result["valid"]:
+            _emit_human_result_diagnostic(
+                a, result, "validation_error", "Recipe validation failed.", _tracker
+            )
+            return 2
+        return 0
     if remote and a.command != "serve":
         if a.connector is not None:
             raise ValueError(
@@ -604,7 +786,9 @@ async def run(a: argparse.Namespace) -> int:
         if a.db and a.db.expanduser().resolve() != Path(identity["database"]):
             raise ValueError("Configured daemon uses a different database")
     if a.command != "serve":
-        method, params = route(a)
+        method, params = route(a, _tracker)
+        if _tracker is not None:
+            _tracker.method = method
         if not remote and method in RETAINED_CONNECTION_METHODS:
             raise ValueError(
                 "Retained connections require a daemon; start xbloom-studio serve first"
@@ -634,7 +818,7 @@ async def run(a: argparse.Namespace) -> int:
             return await serve(
                 app, a.socket or default_socket(), a.recover_stale_socket
             )
-        return await _execute(a, method, params, invoke, remote, store, app)
+        return await _execute(a, method, params, invoke, remote, store, app, _tracker)
     finally:
         try:
             if app is not None:
@@ -667,6 +851,7 @@ async def _execute(
     remote: bool,
     store: Store | None,
     app: Application | None,
+    tracker: _SourceTracker | None = None,
 ) -> int:
     if not remote and method == "operation_start":
         assert store is not None and app is not None
@@ -697,8 +882,20 @@ async def _execute(
         return 0
     output(result)
     if method in ("recipe_validate", "recipe_tea_validate"):
-        return 0 if result["valid"] else 2
+        if not result["valid"]:
+            _emit_human_result_diagnostic(
+                a, result, "validation_error", "Recipe validation failed.", tracker
+            )
+            return 2
+        return 0
     if method == "machine_command" and result.get("status") == "failed":
+        _emit_human_result_diagnostic(
+            a,
+            result,
+            "preset_write_incomplete",
+            "Machine command reported failure.",
+            tracker,
+        )
         return 2
     started = method in ("operation_start", "recipe_start_uploaded")
     watch = (started and (not remote or getattr(a, "wait", False))) or (
@@ -728,11 +925,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .ssh_rpc import main as relay_main
 
         return relay_main(args[1:])
+    parsed = parser().parse_args(args)
+    tracker = _SourceTracker()
     try:
-        return asyncio.run(run(parser().parse_args(args)))
+        return asyncio.run(run(parsed, _tracker=tracker))
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
-        detail = error_detail(exc, log_unexpected=False)
-        print(dumps({"ok": False, "error": detail}), file=sys.stderr)
+        context = _command_context(parsed, tracker)
+        detail = error_detail(exc, log_unexpected=False, context=context)
+        if _effective_error_format(parsed.error_format) == "human":
+            print(
+                render_human_diagnostic(detail, context=context),
+                file=sys.stderr,
+            )
+        else:
+            print(dumps({"ok": False, "error": detail}), file=sys.stderr)
         return 2

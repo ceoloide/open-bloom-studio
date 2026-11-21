@@ -505,6 +505,12 @@ Validation = model(
         ...,
         "Whether execution compilation is supported; not hardware verification.",
     ),
+    diagnostic=(
+        optional(dict[str, Any]),
+        None,
+        "Canonical diagnostic with stable code, location, fix and documentation "
+        "links when validation fails.",
+    ),
 )
 
 
@@ -683,6 +689,11 @@ class CommandOutcome(Output):
     saved_observed: bool | None = Field(
         None,
         description="Temporally correlated save event; not stored contents readback.",
+    )
+    diagnostic: dict[str, Any] | None = Field(
+        None,
+        description="Canonical diagnostic with stable code, location, fix and "
+        "documentation links when a command reports failure.",
     )
 
     @model_validator(mode="after")
