@@ -5393,5 +5393,318 @@ class CouncilR2FindingsTests(unittest.IsolatedAsyncioTestCase):
                 )
 
 
+class CouncilR3RedactionTests(unittest.TestCase):
+    """Focused regression probes for council R3 credential redaction (C7a-C7d)."""
+
+    def test_c7a_scan_boundary_url_and_auth_tails_preserve_public_urls(self):
+        # Exact Astra leak: scan cap (4096) lands inside URL username before ':'.
+        astra = (
+            "Bearer "
+            + ("z" * 4075)
+            + " https://alice:password@example.com "
+            + ("x" * 5000)
+        )
+        out_astra = diagnostics._truncate(astra, 512)
+        self.assertLessEqual(len(out_astra), 512)
+        self.assertTrue(out_astra.endswith("..."))
+        for secret_piece in ("alice", "password", "zzzz"):
+            self.assertNotIn(secret_piece, out_astra)
+        self.assertIn("<redacted>", out_astra)
+
+        # Conservative scan-boundary protection across URL/auth/token tail cuts.
+        for label, payload, forbidden in (
+            (
+                "http_before_colon",
+                "Bearer "
+                + ("z" * 4075)
+                + " http://bob:secret@example.com "
+                + ("x" * 5000),
+                ("bob", "secret"),
+            ),
+            (
+                "https_scheme_only_at_cap",
+                "Bearer "
+                + ("z" * 4080)
+                + " https://alice:password@example.com "
+                + ("x" * 5000),
+                ("alice", "password"),
+            ),
+            (
+                "nested_basic_cut_at_cap",
+                "Bearer "
+                + ("z" * 4072)
+                + " Basic Basic YWRtaW46aHVudGVyMg== "
+                + ("x" * 5000),
+                ("YWR", "taW4"),
+            ),
+            (
+                "nested_bearer_cut_at_cap",
+                "Bearer "
+                + ("z" * 4068)
+                + " Basic Bearer opaqueTokenValue1234567890 "
+                + ("x" * 5000),
+                ("opaq", "Token"),
+            ),
+            (
+                "token_prefix_cut_at_cap",
+                "Bearer "
+                + ("z" * 4073)
+                + " token=ghp_1234567890abcdef123456 "
+                + ("x" * 5000),
+                ("ghp_", "123456"),
+            ),
+        ):
+            with self.subTest(case=label):
+                out = diagnostics._truncate(payload, 512)
+                self.assertLessEqual(len(out), 512)
+                self.assertIn("<redacted>", out)
+                for piece in forbidden:
+                    self.assertNotIn(piece, out)
+
+        # Safe public URLs are preserved when uncropped, before crop, or past '/'.
+        for label, payload, expected_url in (
+            (
+                "uncropped_path",
+                "Failed to reach https://example.com/docs/guide",
+                "https://example.com/docs/guide",
+            ),
+            (
+                "uncropped_host",
+                "Failed to reach https://example.com",
+                "https://example.com",
+            ),
+            (
+                "cropped_after_space",
+                "Failed to reach https://example.com/docs/guide " + ("x" * 5000),
+                "https://example.com/docs/guide",
+            ),
+            (
+                "cropped_mid_path",
+                "Bearer "
+                + ("z" * 4050)
+                + " https://example.com/docs/guide/"
+                + ("a" * 5000),
+                "https://example.com/docs/guide/",
+            ),
+        ):
+            with self.subTest(public_url=label):
+                out = diagnostics._truncate(payload, 512)
+                self.assertIn(expected_url, out)
+
+    def test_c7b_adjacent_auth_labels_and_title_case_basic_secret(self):
+        # Exact Fable blocker examples + adjacent label combinations must redact
+        # and detect consistently across _redact_text, _has_sensitive_value,
+        # is_safe_human_note, and error_detail.
+        for label, raw, expected, forbidden in (
+            (
+                "double_basic",
+                "Malformed Authorization header: Basic Basic YWRtaW46aHVudGVyMg==",
+                "Malformed Authorization header: Basic <redacted>",
+                ("YWRtaW46aHVudGVyMg==",),
+            ),
+            (
+                "basic_then_bearer",
+                "auth schemes Basic Bearer opaqueTokenValue1234567890 rejected",
+                "auth schemes Basic <redacted> rejected",
+                ("opaqueTokenValue1234567890",),
+            ),
+            (
+                "triple_basic",
+                "Basic Basic Basic YWRtaW46aHVudGVyMg==",
+                "Basic Basic <redacted>",
+                ("YWRtaW46aHVudGVyMg==",),
+            ),
+            (
+                "basic_then_url_cred",
+                "Basic https://alice:password@example.com/api",
+                "Basic <redacted>example.com/api",
+                ("alice", "password"),
+            ),
+            (
+                "basic_then_ghp",
+                "Basic ghp_1234567890abcdef123456",
+                "Basic <redacted>",
+                ("ghp_1234567890abcdef123456",),
+            ),
+            (
+                "title_case_alpha_basic_base64",
+                "Authorization: Basic Yjphamhz",
+                "Authorization: <redacted>",
+                ("Yjphamhz",),
+            ),
+        ):
+            with self.subTest(case=label):
+                redacted = diagnostics._redact_text(raw)
+                self.assertEqual(redacted, expected)
+                self.assertTrue(diagnostics._has_sensitive_value(raw))
+                self.assertFalse(diagnostics.is_safe_human_note(raw))
+                detail = error_detail(ValueError(raw))
+                self.assertEqual(detail["diagnostic"]["cause"], expected)
+                for piece in forbidden:
+                    self.assertNotIn(piece, redacted)
+                    self.assertNotIn(piece, detail["diagnostic"]["cause"])
+
+        # Plain English controls remain untouched and non-sensitive.
+        for plain in (
+            "basic validation failed",
+            "Basic Validation failed",
+            "BASIC VALIDATION FAILED",
+            "Basic Authentication required",
+            "Basic Authorization header missing",
+            "Basic Credentials rejected",
+            "Basic Basic failed",
+            "Basic Bearer scheme unsupported",
+        ):
+            with self.subTest(plain=plain):
+                self.assertEqual(diagnostics._redact_text(plain), plain)
+                self.assertFalse(diagnostics._has_sensitive_value(plain))
+
+        # Long chain of non-secret Basic labels before a real secret stays linear.
+        chained = ("Basic " * 4000) + "Bearer opaqueTokenValue1234567890"
+        redacted_chain = diagnostics._redact_text(chained)
+        self.assertTrue(redacted_chain.endswith("<redacted>"))
+        self.assertNotIn("opaqueTokenValue1234567890", redacted_chain)
+        self.assertTrue(diagnostics._has_sensitive_value(chained))
+
+    def test_c7c_non_overlapping_bounded_tail_guard(self):
+        # Exact Fable dash-repetition probe must stay bounded and non-overlapping.
+        dash_probe = ("-" * 4095) + "!" + ("y" * 10)
+        out_dash = diagnostics._truncate(dash_probe, 512)
+        self.assertEqual(len(out_dash), 512)
+        self.assertEqual(out_dash, ("-" * 509) + "...")
+
+        # Additional adversarial tail probes across PEM, token-prefix, URL, auth.
+        for label, probe in (
+            ("dashes_header_bang", ("-" * 4095) + ("A" * 60) + "!" + ("y" * 10)),
+            ("eyj_repeat_bang", ("eyJaaaaaaaa-" * 341) + "!" + ("y" * 10)),
+            ("basic_repeat_bang", ("Basic " * 682) + "!" + ("y" * 10)),
+            ("https_repeat_bang", ("https://" * 512) + "!" + ("y" * 10)),
+        ):
+            with self.subTest(probe=label):
+                out = diagnostics._truncate(probe, 512)
+                self.assertLessEqual(len(out), 512)
+                self.assertTrue(out.endswith("..."))
+
+        # Truncated PEM header at the scan boundary is still redacted.
+        pem_tail = (
+            "Bearer "
+            + ("z" * 4076)
+            + " -----BEGIN RSA PRI"
+            + "VATE KEY-----\nMIIESecretBody"
+        )
+        out_pem = diagnostics._truncate(pem_tail, 512)
+        self.assertNotIn("PRIVATE", out_pem)
+        self.assertNotIn("BEGIN", out_pem)
+        self.assertNotIn("SecretBody", out_pem)
+        self.assertIn("<redacted>", out_pem)
+
+    def test_c7d_linear_jwt_scan_and_bounded_remote_error_compaction(self):
+        # 1. Direct _redact_text / _has_sensitive_value handle 120KB repeated
+        #    JWT-shaped prefixes linearly while still catching real JWTs.
+        jwt_flood = "eyJaaaaaaaa-" * 10_000
+        self.assertEqual(diagnostics._redact_text(jwt_flood), jwt_flood)
+        self.assertFalse(diagnostics._has_sensitive_value(jwt_flood))
+
+        real_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig12345"
+        with_real = f"{jwt_flood} {real_jwt}"
+        redacted_real = diagnostics._redact_text(with_real)
+        self.assertNotIn(real_jwt, redacted_real)
+        self.assertTrue(redacted_real.endswith(" <redacted>"))
+        self.assertTrue(diagnostics._has_sensitive_value(with_real))
+
+        # 2. sanitize_remote_error compacts peer messages early so even a 32MB
+        #    RPC-limit payload never feeds unbounded text to _redact_text, while
+        #    preserving legacy keys, operational guidance, and secret redaction.
+        seen_lengths: list[int] = []
+        real_redact = diagnostics._redact_text
+
+        def spy_redact(value: str) -> str:
+            seen_lengths.append(len(value))
+            return real_redact(value)
+
+        huge_peer_msg = "eyJaaaaaaaa-" * (32 * 1024 * 1024 // 12)
+        with patch("xbloom_studio.diagnostics._redact_text", side_effect=spy_redact):
+            sanitized = error_detail(
+                RemoteError(
+                    {
+                        "type": "ProviderError",
+                        "code": "provider_error",
+                        "message": huge_peer_msg,
+                        "next_step": "Evil retry immediately!",
+                        "retryable": True,
+                        "correlation_id": "corr-32mb-1",
+                        "details": {"http_status": 502},
+                    }
+                ),
+                context=DiagnosticContext(method="provider_search"),
+            )
+        self.assertTrue(seen_lengths)
+        self.assertTrue(
+            all(n <= diagnostics._MAX_TRUNCATE_SCAN for n in seen_lengths),
+            seen_lengths,
+        )
+        self.assertLessEqual(len(sanitized["message"]), diagnostics.MAX_SANITISED_TEXT)
+        self.assertLessEqual(
+            len(sanitized["diagnostic"]["cause"]), diagnostics.MAX_SANITISED_TEXT
+        )
+        self.assertEqual(sanitized["type"], "ProviderError")
+        self.assertEqual(sanitized["code"], "provider_error")
+        self.assertFalse(sanitized["retryable"])
+        self.assertEqual(sanitized["correlation_id"], "corr-32mb-1")
+        self.assertEqual(sanitized["details"], {"http_status": 502})
+        self.assertEqual(sanitized["next_step"], sanitized["diagnostic"]["fix"])
+        self.assertNotIn("Evil retry", json.dumps(sanitized))
+        self.assertEqual(
+            sanitized["diagnostic"]["context"]["summary"], "http_status=502"
+        )
+
+        # Leading whitespace + boundary secret on a large peer message also stays
+        # bounded and redacts without leaking the credential.
+        seen_lengths.clear()
+        ws_secret_msg = (
+            "   Bearer "
+            + ("z" * 4075)
+            + " https://alice:password@example.com "
+            + ("x" * (1024 * 1024))
+        )
+        with patch("xbloom_studio.diagnostics._redact_text", side_effect=spy_redact):
+            san_secret = error_detail(
+                RemoteError(
+                    {
+                        "type": "ProviderError",
+                        "code": "provider_error",
+                        "message": ws_secret_msg,
+                    }
+                )
+            )
+        self.assertTrue(
+            all(n <= diagnostics._MAX_TRUNCATE_SCAN for n in seen_lengths),
+            seen_lengths,
+        )
+        for piece in ("alice", "password", "zzzz"):
+            self.assertNotIn(piece, san_secret["message"])
+            self.assertNotIn(piece, san_secret["diagnostic"]["cause"])
+
+        # Normal operational peer errors keep exact classification and guidance.
+        perm_err = error_detail(
+            RemoteError(
+                {
+                    "type": "PermissionError",
+                    "code": "permission_required",
+                    "message": "Lease directory /var/run/xbloom must have mode 0700.",
+                    "next_step": "Spoofed advice",
+                }
+            )
+        )
+        self.assertEqual(
+            perm_err["diagnostic"]["code"], "XB_DIRECTORY_PERMISSION_REQUIRED"
+        )
+        self.assertEqual(
+            perm_err["message"], "Lease directory /var/run/xbloom must have mode 0700."
+        )
+        self.assertIn("0700", perm_err["next_step"])
+        self.assertNotIn("Spoofed", perm_err["next_step"])
+
+
 if __name__ == "__main__":
     unittest.main()

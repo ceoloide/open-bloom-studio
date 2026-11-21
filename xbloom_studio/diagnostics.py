@@ -12,7 +12,7 @@ import base64
 import json
 import re
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -61,18 +61,21 @@ _REDACT_VALUE = re.compile(
     r"|\bAIza[0-9A-Za-z_-]{20,}"
     r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"
     r"|\bbasic\s+(?P<basic_tok>[A-Za-z0-9+/=]+)"
-    r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?"
+    r"|(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?"
     r"|https?://[^/\s:@]+:[^/\s@]+@"
     r")"
 )
 _TRUNCATED_SECRET_TAIL = re.compile(
     r"(?i)(?:"
-    r"https?://[^/\s:@]+:[^/\s@]*$"
-    r"|-----+(?:[A-Z0-9 ]{0,60}-{0,5})?$"
-    r"|\b(?:gh[opsur]_|github_pat_|AKIA|ASIA|xox[abposr]-|sk-|pypi-AgEI|AIza|eyJ)"
-    r"[A-Za-z0-9._~+/=-]*$"
+    r"https?://[^/\s@]*$"
+    r"|(?<!-)-{5,}(?:[A-Z0-9 ]{1,60}-{0,5})?$"
     r"|\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]*$"
     r")"
+)
+_LEADING_WS = re.compile(r"\s+")
+_TAIL_TOKEN = re.compile(r"(?<![A-Za-z0-9._~+/=-])[A-Za-z0-9._~+/=-]+$")
+_TRUNCATED_TOKEN_PREFIX = re.compile(
+    r"(?i)\b(?:gh[opsur]_|github_pat_|AKIA|ASIA|xox[abposr]-|sk-|pypi-AgEI|AIza|eyJ)"
 )
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SHELL_META = re.compile(r"[;|&$`<>\\]")
@@ -766,9 +769,10 @@ def _is_basic_secret(token: str) -> bool:
         pad_len = n - len(stripped)
         if 1 <= pad_len <= 2 and len(stripped) >= 2 and "=" not in stripped:
             return True
-    if n >= 8:
-        if token.isalpha():
-            return not (token.islower() or token.isupper() or token.istitle())
+    if n >= 8 and (
+        not token.isalpha()
+        or not (token.islower() or token.isupper() or token.istitle())
+    ):
         return True
     if "=" in token:
         return False
@@ -805,36 +809,64 @@ def _redact_pem(text: str) -> str:
     return "".join(out)
 
 
-def _redact_match(match: re.Match[str]) -> str:
-    basic_tok = match.group("basic_tok")
-    if basic_tok is not None and not _is_basic_secret(basic_tok):
-        return match.group(0)
-    return "<redacted>"
+def _iter_sensitive_matches(text: str) -> Iterator[re.Match[str]]:
+    """Yield secret matches in ``text`` without consuming adjacent auth labels."""
+    pos = 0
+    length = len(text)
+    while pos < length:
+        match = _REDACT_VALUE.search(text, pos)
+        if match is None:
+            return
+        basic_tok = match.group("basic_tok")
+        if basic_tok is not None and not _is_basic_secret(basic_tok):
+            pos = match.start("basic_tok")
+            continue
+        yield match
+        pos = match.end()
 
 
 def _has_sensitive_value(text: str) -> bool:
     if "-----" in text and _PEM_BEGIN.search(text):
         return True
-    for match in _REDACT_VALUE.finditer(text):
-        basic_tok = match.group("basic_tok")
-        if basic_tok is None or _is_basic_secret(basic_tok):
-            return True
-    return False
+    return next(_iter_sensitive_matches(text), None) is not None
 
 
 def _redact_text(text: str) -> str:
-    return _REDACT_VALUE.sub(_redact_match, _redact_pem(text))
+    cleaned = _redact_pem(text)
+    out: list[str] = []
+    pos = 0
+    for match in _iter_sensitive_matches(cleaned):
+        out.append(cleaned[pos : match.start()])
+        out.append("<redacted>")
+        pos = match.end()
+    if not out:
+        return cleaned
+    out.append(cleaned[pos:])
+    return "".join(out)
+
+
+def _redact_truncated_tail(text: str) -> str:
+    cleaned = _TRUNCATED_SECRET_TAIL.sub("<redacted>", text)
+    tail = _TAIL_TOKEN.search(cleaned)
+    if tail is not None:
+        prefix = _TRUNCATED_TOKEN_PREFIX.search(cleaned, tail.start())
+        if prefix is not None:
+            return cleaned[: prefix.start()] + "<redacted>"
+    return cleaned
 
 
 def _truncate(text: str, limit: int) -> str:
-    trimmed = text.lstrip()
+    start = 0
+    if text and text[0].isspace():
+        ws = _LEADING_WS.match(text)
+        start = ws.end() if ws is not None else 0
     scan_limit = max(limit * 8, _MAX_TRUNCATE_SCAN)
-    cropped = len(trimmed) > scan_limit
-    sample = trimmed[:scan_limit] if cropped else trimmed
+    cropped = (len(text) - start) > scan_limit
+    sample = text[start : start + scan_limit] if cropped else text[start:]
     normalized = "".join(" " if _is_unsafe_char(ch) else ch for ch in sample).strip()
     cleaned = _redact_text(normalized)
     if cropped:
-        cleaned = _TRUNCATED_SECRET_TAIL.sub("<redacted>", cleaned)
+        cleaned = _redact_truncated_tail(cleaned)
         if len(cleaned) <= limit:
             if cleaned.endswith("..."):
                 return cleaned
@@ -3098,7 +3130,11 @@ def _rebuild_remote_diagnostic(
     raw_type = detail.get("type")
     error_type = raw_type if type(raw_type) is str else None
     raw_message = detail.get("message")
-    message = raw_message if isinstance(raw_message, str) else ""
+    message = (
+        _truncate(raw_message, MAX_SANITISED_TEXT)
+        if isinstance(raw_message, str)
+        else ""
+    )
     raw_details = detail.get("details")
     details = raw_details if isinstance(raw_details, Mapping) else None
 
@@ -3287,6 +3323,7 @@ def sanitize_remote_error(
                 )
                 if changed:
                     filtered["details"] = details_copy
+        message_replaced = False
         if policy is not None:
             is_preset_diag = rebuilt["code"] in (
                 "XB_PRESET_WRITE_REFUSED",
@@ -3300,10 +3337,11 @@ def sanitize_remote_error(
                 )
                 if "message" in filtered:
                     filtered["message"] = local_cause
+                    message_replaced = True
                 if not is_preset_diag:
                     rebuilt = dict(rebuilt, cause=local_cause)
-        if isinstance(filtered.get("message"), str):
-            filtered["message"] = _redact_text(filtered["message"])
+        if not message_replaced and isinstance(filtered.get("message"), str):
+            filtered["message"] = _truncate(filtered["message"], MAX_SANITISED_TEXT)
     filtered["diagnostic"] = rebuilt
     if "next_step" in filtered:
         filtered["next_step"] = rebuilt["fix"]
