@@ -102,6 +102,7 @@ def expect_shielded_failures(test, count):
         else:
             loop.default_exception_handler(context)
 
+    test.addCleanup(loop.set_exception_handler, loop.get_exception_handler())
     loop.set_exception_handler(handler)
     expected = count if sys.version_info >= (3, 14) else 0
     test.addCleanup(lambda: test.assertEqual(len(seen), expected, seen))

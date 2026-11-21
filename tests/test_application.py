@@ -2605,6 +2605,7 @@ class PresetRetryTests(ServiceCase):
             try:
                 await until(entered.is_set, 5)
                 task.cancel()
+                await asyncio.sleep(0)
             finally:
                 release.set()
             with self.assertRaises(asyncio.CancelledError):
