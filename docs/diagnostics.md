@@ -357,7 +357,7 @@ include a canonical `diagnostic` object.
 
 - **Machine code:** `machine_protocol_error`
 - **Meaning:** The machine returned a protocol-level error frame; physical effects of the command may be uncertain.
-- **Location:** Numeric protocol command when known (and invoking command/method).
+- **Location:** Invoking command, tool, or method when known (numeric protocol command is reported in `context.summary`).
 - **Fix:** Inspect `machine_state`, `history_get`, and the physical machine. Reuse an existing idempotency key only to inspect its recorded attempt.
 
 ### XB_MACHINE_PROTOCOL_ERROR agent repair

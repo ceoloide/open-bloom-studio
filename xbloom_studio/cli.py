@@ -100,13 +100,15 @@ _ARGPARSE_EXPECTED = re.compile(
 )
 _ARGPARSE_INVALID_VALUE = re.compile(
     r"^argument (--?[A-Za-z0-9_-]+(?:/--?[A-Za-z0-9_-]+)*): "
-    r"invalid ([A-Za-z0-9_]+) value:.*$"
+    r"invalid ([A-Za-z0-9_]+) value:"
 )
-_ARGPARSE_ARG_CHOICE = re.compile(
-    r"^argument (--?[A-Za-z0-9_-]+(?:/--?[A-Za-z0-9_-]+)*): "
-    r"invalid choice: .* (\((?:choose from .*)\))$"
+_ARGPARSE_CHOICE = re.compile(
+    r"^argument ("
+    r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*"
+    r"|--?[A-Za-z0-9_-]+(?:/--?[A-Za-z0-9_-]+)*"
+    r"): invalid choice:"
 )
-_ARGPARSE_POS_CHOICE = re.compile(r"^invalid choice: .* (\((?:choose from .*)\))$")
+_ARGPARSE_POS_CHOICE = re.compile(r"^invalid choice:")
 
 
 class _CliParseError(ValueError):
@@ -508,22 +510,74 @@ def _scan_cli_args(
     return error_format, known_cmd, trailing_global
 
 
-def _sanitize_argparse_message(message: str, *, trailing_global: bool) -> str:
+def _parser_choices(
+    p: argparse.ArgumentParser | None, known_cmd: str | None, arg_name: str | None
+) -> tuple[str, ...] | None:
+    """Derive permitted option or subcommand choices directly from ``p``."""
+    if p is None:
+        return None
+    target: argparse.ArgumentParser = p
+    if known_cmd:
+        for part in known_cmd.split():
+            found_sub: argparse.ArgumentParser | None = None
+            for action in target._actions:
+                if (
+                    isinstance(action, argparse._SubParsersAction)
+                    and part in action.choices
+                ):
+                    found_sub = action.choices[part]
+                    break
+            if found_sub is None:
+                break
+            target = found_sub
+
+    parsers = (target,) if target is p else (target, p)
+    for candidate in parsers:
+        for action in candidate._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                if arg_name is None or action.dest == arg_name:
+                    return tuple(str(choice) for choice in action.choices.keys())
+            elif action.choices is not None and arg_name is not None:
+                names = set(action.option_strings)
+                if action.dest:
+                    names.add(action.dest)
+                if arg_name in names or any(
+                    part in names for part in arg_name.split("/")
+                ):
+                    return tuple(str(choice) for choice in action.choices)
+    return None
+
+
+def _sanitize_argparse_message(
+    message: str,
+    *,
+    trailing_global: bool,
+    p: argparse.ArgumentParser | None = None,
+    known_cmd: str | None = None,
+) -> str:
     """Remove raw CLI argument values from argparse error messages."""
     text = message.strip()
     if _ARGPARSE_REQUIRED.fullmatch(text):
         return text
     if _ARGPARSE_EXPECTED.fullmatch(text):
         return text
-    invalid_val = _ARGPARSE_INVALID_VALUE.fullmatch(text)
+    invalid_val = _ARGPARSE_INVALID_VALUE.match(text)
     if invalid_val:
         return f"argument {invalid_val.group(1)}: invalid {invalid_val.group(2)} value"
-    arg_choice = _ARGPARSE_ARG_CHOICE.fullmatch(text)
-    if arg_choice:
-        return f"argument {arg_choice.group(1)}: invalid choice {arg_choice.group(2)}"
-    pos_choice = _ARGPARSE_POS_CHOICE.fullmatch(text)
-    if pos_choice:
-        return f"invalid choice {pos_choice.group(1)}"
+    choice_match = _ARGPARSE_CHOICE.match(text)
+    if choice_match:
+        arg_name = choice_match.group(1)
+        choices = _parser_choices(p, known_cmd, arg_name)
+        if choices:
+            formatted = ", ".join(repr(choice) for choice in choices)
+            return f"argument {arg_name}: invalid choice (choose from {formatted})"
+        return f"argument {arg_name}: invalid choice"
+    if _ARGPARSE_POS_CHOICE.match(text):
+        choices = _parser_choices(p, known_cmd, None)
+        if choices:
+            formatted = ", ".join(repr(choice) for choice in choices)
+            return f"invalid choice (choose from {formatted})"
+        return "invalid choice"
     if text.startswith("unrecognized arguments:"):
         if trailing_global:
             return (
@@ -544,7 +598,9 @@ def _parse_error_detail(
         prog_cmd = exc.prog.removeprefix("xbloom-studio ").strip()
         if prog_cmd:
             known_cmd = prog_cmd
-    cause = _sanitize_argparse_message(str(exc), trailing_global=trailing_global)
+    cause = _sanitize_argparse_message(
+        str(exc), trailing_global=trailing_global, p=p, known_cmd=known_cmd
+    )
     if known_cmd:
         fix = (
             f"Run `xbloom-studio {known_cmd} --help` to check required arguments "

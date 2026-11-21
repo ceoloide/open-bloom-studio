@@ -56,7 +56,27 @@ _SENSITIVE_VALUE = re.compile(
     r"|\bAIza[0-9A-Za-z_-]{20,}"
     r"|\bbearer\s+[A-Za-z0-9._~+/-]{8,}"
     r"|\bbasic\s+[A-Za-z0-9+/=]{8,}"
-    r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}"
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?"
+    r"|https?://[^/\s@]+:[^/\s@]+@"
+    r")"
+)
+_REDACT_VALUE = re.compile(
+    r"(?i)(?:"
+    r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"
+    r"[^-]*-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----"
+    r"|-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"
+    r"|\b(?:gh[opsur]_[A-Za-z0-9]{16,}|github_pat_\w{20,})"
+    r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
+    r"|\bxox[abposr]-[A-Za-z0-9-]{10,}"
+    r"|\bsk-[A-Za-z0-9_-]{20,}"
+    r"|\bpypi-AgEI[A-Za-z0-9_-]{20,}"
+    r"|\bAIza[0-9A-Za-z_-]{20,}"
+    r"|\bbearer\s+[A-Za-z0-9._~+/-]{8,}"
+    r"|\bbasic\s+(?=[A-Za-z0-9+/=]{8,}\b)"
+    r"(?:[A-Za-z0-9+/]*[0-9+/=][A-Za-z0-9+/=]*"
+    r"|(?-i:[A-Za-z]*[A-Z][A-Za-z]*[a-z][A-Za-z]*"
+    r"|[A-Za-z]*[a-z][A-Za-z]*[A-Z][A-Za-z]*))\b"
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?"
     r"|https?://[^/\s@]+:[^/\s@]+@"
     r")"
 )
@@ -199,6 +219,7 @@ class DiagnosticContext:
     requested_command: str | None = None
     requested_preset: tuple[str, str, int] | None = None
     requested_slot: str | None = None
+    requested_slots: frozenset[str] | None = None
 
 
 def _normalize_preset(value: Any) -> tuple[str, str, int] | None:
@@ -227,25 +248,47 @@ def _normalize_preset(value: Any) -> tuple[str, str, int] | None:
 
 def request_provenance(
     method: str | None, params: Mapping[str, Any] | None
-) -> tuple[str | None, tuple[str, str, int] | None, str | None]:
+) -> tuple[
+    str | None,
+    tuple[str, str, int] | None,
+    str | None,
+    frozenset[str] | None,
+]:
     """Extract truthful local request provenance for preset-write verification."""
     if not isinstance(params, Mapping):
-        return None, None, None
+        return None, None, None, None
     if method == "machine_command":
         raw_cmd = params.get("command")
         req_cmd = raw_cmd if type(raw_cmd) is str and raw_cmd.strip() else None
+        cmd_params = params.get("params")
         if req_cmd == "write_preset":
-            cmd_params = params.get("params")
             preset = (
                 _normalize_preset(cmd_params.get("preset"))
                 if isinstance(cmd_params, Mapping)
                 else None
             )
-            return req_cmd, preset, (preset[0] if preset is not None else None)
-        return req_cmd, None, None
+            slot = preset[0] if preset is not None else None
+            return req_cmd, preset, slot, (frozenset({slot}) if slot else None)
+        if req_cmd == "write_presets":
+            raw_presets = (
+                cmd_params.get("presets") if isinstance(cmd_params, Mapping) else None
+            )
+            slots: frozenset[str] | None = None
+            if isinstance(raw_presets, list) and raw_presets:
+                extracted = [
+                    _single_slot(item.get("slot"))
+                    if isinstance(item, Mapping)
+                    else None
+                    for item in raw_presets
+                ]
+                if all(slot is not None for slot in extracted):
+                    slots = frozenset(slot for slot in extracted if slot is not None)
+            return req_cmd, None, None, slots
+        return req_cmd, None, None, None
     if method == "machine_preset_writes":
-        return None, None, _single_slot(params.get("slot"))
-    return None, None, None
+        slot = _single_slot(params.get("slot"))
+        return None, None, slot, (frozenset({slot}) if slot else None)
+    return None, None, None, None
 
 
 def request_context(
@@ -261,7 +304,7 @@ def request_context(
     allow_excerpt: bool = False,
 ) -> DiagnosticContext:
     """Build a :class:`DiagnosticContext` with truthful local request provenance."""
-    req_cmd, req_preset, req_slot = request_provenance(method, params)
+    req_cmd, req_preset, req_slot, req_slots = request_provenance(method, params)
     return DiagnosticContext(
         command=command,
         method=method,
@@ -274,6 +317,7 @@ def request_context(
         requested_command=req_cmd,
         requested_preset=req_preset,
         requested_slot=req_slot,
+        requested_slots=req_slots,
     )
 
 
@@ -705,8 +749,14 @@ FALLBACK_BY_ERROR_CODE: dict[str, str] = {
 }
 
 
+def _redact_text(text: str) -> str:
+    return _REDACT_VALUE.sub("<redacted>", text)
+
+
 def _truncate(text: str, limit: int) -> str:
-    cleaned = "".join(" " if _is_unsafe_char(ch) else ch for ch in text).strip()
+    cleaned = _redact_text(
+        "".join(" " if _is_unsafe_char(ch) else ch for ch in text).strip()
+    )
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 3].rstrip() + "..."
@@ -782,46 +832,47 @@ def _parse_json_structure(
 ) -> tuple[int | None, list[tuple[int, int]], set[int]] | None:
     """Validate JSON token structure, locate an optional pointer, and mark secrets."""
     index = 0
-    found: int | None = None
     sensitive_spans: list[tuple[int, int]] = []
     key_indices: set[int] = set()
 
-    def parse_value(path: list[str], depth: int) -> tuple[bool, int]:
-        nonlocal index, found
+    def parse_value(path: list[str], depth: int) -> tuple[bool, int, int | None]:
+        nonlocal index
         if depth > MAX_JSON_LOCATE_DEPTH or index >= len(tokens):
-            return False, 0
+            return False, 0, None
         kind, raw, start, end = tokens[index]
-        if target_segments is not None and path == target_segments:
-            found = start
+        self_match = (
+            start if target_segments is not None and path == target_segments else None
+        )
         if kind == "string":
             try:
                 decoded = json.loads(raw)
             except json.JSONDecodeError:
-                return False, 0
+                return False, 0, None
             if isinstance(decoded, str) and _SENSITIVE_VALUE.search(decoded):
                 sensitive_spans.append((start, end))
             index += 1
-            return True, end
+            return True, end, self_match
         if kind == "atom":
             index += 1
-            return True, end
+            return True, end, self_match
         if kind == "punct" and raw == "{":
             index += 1
             if index < len(tokens) and tokens[index][1] == "}":
                 close_end = tokens[index][3]
                 index += 1
-                return True, close_end
+                return True, close_end, self_match
+            matches_by_key: dict[str, int | None] = {}
             while index < len(tokens):
                 if tokens[index][0] != "string":
-                    return False, 0
+                    return False, 0, None
                 key_idx = index
                 _, key_raw, key_start, _ = tokens[index]
                 try:
                     key = json.loads(key_raw)
                 except json.JSONDecodeError:
-                    return False, 0
+                    return False, 0, None
                 if not isinstance(key, str):
-                    return False, 0
+                    return False, 0, None
                 if not any(_is_unsafe_char(ch) for ch in key):
                     key_indices.add(key_idx)
                 key_sensitive = (
@@ -831,51 +882,157 @@ def _parse_json_structure(
                 )
                 index += 1
                 if index >= len(tokens) or tokens[index][1] != ":":
-                    return False, 0
+                    return False, 0, None
                 index += 1
-                ok, val_end = parse_value([*path, key], depth + 1)
+                ok, val_end, child_match = parse_value([*path, key], depth + 1)
                 if not ok:
-                    return False, 0
+                    return False, 0, None
+                # Match json.loads last-key-wins semantics so dead overwritten
+                # duplicate keys never hijack pointer locations.
+                matches_by_key[key] = child_match
                 if key_sensitive:
                     sensitive_spans.append((key_start, val_end))
                 if index >= len(tokens):
-                    return False, 0
+                    return False, 0, None
                 sep = tokens[index][1]
                 sep_end = tokens[index][3]
                 index += 1
                 if sep == "}":
-                    return True, sep_end
+                    resolved = (
+                        self_match
+                        if self_match is not None
+                        else next(
+                            (pos for pos in matches_by_key.values() if pos is not None),
+                            None,
+                        )
+                    )
+                    return True, sep_end, resolved
                 if sep != ",":
-                    return False, 0
-            return False, 0
+                    return False, 0, None
+            return False, 0, None
         if kind == "punct" and raw == "[":
             index += 1
             if index < len(tokens) and tokens[index][1] == "]":
                 close_end = tokens[index][3]
                 index += 1
-                return True, close_end
+                return True, close_end, self_match
             item = 0
+            arr_match = self_match
             while index < len(tokens):
-                ok, _ = parse_value([*path, str(item)], depth + 1)
+                ok, _, child_match = parse_value([*path, str(item)], depth + 1)
                 if not ok:
-                    return False, 0
+                    return False, 0, None
+                if arr_match is None and child_match is not None:
+                    arr_match = child_match
                 item += 1
                 if index >= len(tokens):
-                    return False, 0
+                    return False, 0, None
                 sep = tokens[index][1]
                 sep_end = tokens[index][3]
                 index += 1
                 if sep == "]":
-                    return True, sep_end
+                    return True, sep_end, arr_match
                 if sep != ",":
-                    return False, 0
-            return False, 0
-        return False, 0
+                    return False, 0, None
+            return False, 0, None
+        return False, 0, None
 
-    ok, _ = parse_value([], 0)
+    ok, _, found = parse_value([], 0)
     if not ok or index != len(tokens):
         return None
     return found, sensitive_spans, key_indices
+
+
+def _proven_malformed_key_indices(
+    tokens: Sequence[tuple[str, str, int, int]],
+    decoded_strings: Mapping[int, str],
+) -> set[int]:
+    """Return string token indices grammatically proven to be object keys.
+
+    Tracks container state from token 0 up to the first JSON grammar error so
+    strings in array positions (such as ``["first", "Secret": 1]``) or after a
+    syntax break are never mistaken for object keys.
+    """
+    proven: set[int] = set()
+    stack: list[str] = ["val"]
+
+    def finish_value() -> bool:
+        if not stack:
+            return False
+        top = stack[-1]
+        if top == "val":
+            stack[-1] = "done"
+            return True
+        if top == "obj_val":
+            stack[-1] = "obj_comma_or_end"
+            return True
+        if top in ("arr_val_or_end", "arr_val"):
+            stack[-1] = "arr_comma_or_end"
+            return True
+        return False
+
+    for idx, (kind, raw, _, _) in enumerate(tokens):
+        if not stack or len(stack) > MAX_JSON_LOCATE_DEPTH:
+            break
+        state = stack[-1]
+        if state in ("val", "obj_val", "arr_val_or_end", "arr_val"):
+            if kind == "punct" and raw == "]" and state == "arr_val_or_end":
+                stack.pop()
+                if not finish_value():
+                    break
+            elif kind == "punct" and raw == "{":
+                stack.append("obj_key_or_end")
+            elif kind == "punct" and raw == "[":
+                stack.append("arr_val_or_end")
+            elif kind in ("string", "atom"):
+                if not finish_value():
+                    break
+            else:
+                break
+        elif state in ("obj_key_or_end", "obj_key"):
+            if kind == "punct" and raw == "}" and state == "obj_key_or_end":
+                stack.pop()
+                if not finish_value():
+                    break
+            elif kind == "string":
+                if idx + 1 < len(tokens) and tokens[idx + 1][1] == ":":
+                    decoded = decoded_strings.get(idx)
+                    if (
+                        decoded is not None
+                        and _SAFE_MALFORMED_KEY.fullmatch(decoded) is not None
+                    ):
+                        proven.add(idx)
+                    stack[-1] = "obj_colon"
+                else:
+                    break
+            else:
+                break
+        elif state == "obj_colon":
+            if kind == "punct" and raw == ":":
+                stack[-1] = "obj_val"
+            else:
+                break
+        elif state == "obj_comma_or_end":
+            if kind == "punct" and raw == ",":
+                stack[-1] = "obj_key"
+            elif kind == "punct" and raw == "}":
+                stack.pop()
+                if not finish_value():
+                    break
+            else:
+                break
+        elif state == "arr_comma_or_end":
+            if kind == "punct" and raw == ",":
+                stack[-1] = "arr_val"
+            elif kind == "punct" and raw == "]":
+                stack.pop()
+                if not finish_value():
+                    break
+            else:
+                break
+        else:
+            break
+    return proven
 
 
 def _reconstruct_excerpt_line(
@@ -982,15 +1139,7 @@ def extract_json_excerpt(
                 return None
             decoded_strings[idx] = decoded
         sensitive_spans = []
-        keep_string_indices = {
-            idx
-            for idx, decoded in decoded_strings.items()
-            if idx > 0
-            and tokens[idx - 1][1] in ("{", ",")
-            and idx + 1 < len(tokens)
-            and tokens[idx + 1][1] == ":"
-            and _SAFE_MALFORMED_KEY.fullmatch(decoded) is not None
-        }
+        keep_string_indices = _proven_malformed_key_indices(tokens, decoded_strings)
 
     start = max(1, line - radius)
     end = min(len(lf_lines), line + radius)
@@ -1143,12 +1292,16 @@ def _summarize_validation_issue(
     pointer = first.get("path")
     pointer_str = pointer if isinstance(pointer, str) else None
     bits: list[str] = []
-    if "value" in first:
+    is_missing = first.get("actual_type") == "missing" or (
+        first.get("code") in ("missing", "missing_field")
+        and first.get("value", "<missing>") == "<missing>"
+    )
+    if is_missing:
+        bits.append("missing required field")
+    elif "value" in first:
         val = first["value"]
         if _is_sensitive_pointer(pointer_str):
             bits.append("got <redacted>")
-        elif first.get("code") == "missing_field" and val == "<missing>":
-            bits.append("missing required field")
         elif type(val) is bool:
             bits.append(f"got {'true' if val else 'false'}")
         elif type(val) in (int, float):
@@ -1394,6 +1547,8 @@ def validation_diagnostic(
     code = "XB_COMMAND_VALIDATION" if command_validation else "XB_RECIPE_VALIDATION"
     valid_errors = [item for item in errors if isinstance(item, Mapping)]
     pointer, summary = _summarize_validation_issue(valid_errors)
+    if not trusted:
+        pointer = _valid_pointer_value(pointer)
     cause = None
     fix = None
     if valid_errors:
@@ -1530,6 +1685,89 @@ class _PresetWritePolicy:
     outcome: str | None = None
     attempts_used: int | None = None
     max_attempts: int | None = None
+    different_contents: bool = False
+    batch_refused: bool = False
+
+
+def _refusal_next_step(
+    *,
+    valid: bool,
+    conflict: bool,
+    saved_cleanup_failed: bool,
+    recovery_required: bool,
+    slot: str | None = None,
+    write_id: str | None = None,
+    state: str | None = None,
+    max_attempts: int | None = None,
+    different_contents: bool = False,
+    batch_refused: bool = False,
+) -> str:
+    """Return safe, non-resending inspection/ask-user advice for a refused write."""
+    if saved_cleanup_failed:
+        return _SAVED_CLEANUP_FAILED_FIX
+    if recovery_required:
+        return _SAFE_PRESET_DISCONNECT_RECOVERY
+    if not valid:
+        if conflict:
+            return _SAFE_PRESET_READONLY_RECOVERY
+        return (
+            "Nothing was sent. Inspect `machine_preset_writes` for the slot's "
+            "write ID, outcomes and exact contents; do not resend automatically, "
+            "and ask the user before acknowledging an incomplete write."
+        )
+    slot_part = f" for slot {slot}" if slot else ""
+    write_part = f" write {write_id}" if write_id else ""
+    ack_part = (
+        f"`acknowledge_incomplete={write_id}`"
+        if write_id
+        else "`acknowledge_incomplete`"
+    )
+    if state == "saved":
+        return (
+            f"Nothing was sent. A save event was already observed{slot_part}"
+            f"{write_part} (not a readback); no further write is needed. "
+            "Inspect `machine_preset_writes` and do not resend or replay "
+            f"without explicit user direction and {ack_part}."
+        )
+    if state == "exhausted":
+        attempts_text = f"All {max_attempts}" if max_attempts is not None else "All"
+        return (
+            f"Nothing was sent. {attempts_text} attempts{slot_part}{write_part} "
+            "were used without an observed save: inspect `machine_preset_writes`, "
+            "stop, do not resend automatically, and ask the user. Only after "
+            f"their direction, start a new write with {ack_part}."
+        )
+    if state == "cancelled":
+        return (
+            f"Nothing was sent. Recorded write{slot_part}{write_part} was "
+            "cancelled: inspect `machine_preset_writes`, stop, do not resend "
+            "automatically, and ask the user. Only after their direction, start "
+            f"a new write with {ack_part}."
+        )
+    if state == "in_progress":
+        return (
+            f"Nothing was sent. An attempt{slot_part}{write_part} is already in "
+            "progress; inspect `machine_preset_writes`, wait for its result, "
+            "and do not resend automatically."
+        )
+    if batch_refused:
+        return (
+            f"Nothing was sent. Inspect `machine_preset_writes`{slot_part}"
+            f"{write_part}; do not resend automatically, and finish or ask the "
+            f"user before acknowledging it ({ack_part}) with `write_preset` "
+            "before running a batch."
+        )
+    if different_contents:
+        return (
+            f"Nothing was sent. Inspect `machine_preset_writes`{slot_part}"
+            f"{write_part} and its exact contents; do not resend automatically, "
+            f"and ask the user before passing {ack_part}."
+        )
+    return (
+        f"Nothing was sent. Inspect `machine_preset_writes`{slot_part}"
+        f"{write_part}, outcomes and exact contents; do not resend automatically, "
+        f"and ask the user before passing {ack_part}."
+    )
 
 
 def _validate_preset_guidance_types(container: Mapping[str, Any]) -> None:
@@ -1698,30 +1936,51 @@ def _untrusted_preset_write_cause(policy: _PresetWritePolicy, *, refused: bool) 
         ].default_cause
     slot_label = f" for slot {policy.display_slot}" if policy.display_slot else ""
     if refused:
-        if policy.state == "saved":
+        wid = policy.write_id
+        if policy.batch_refused and wid and policy.display_slot and policy.state:
             return (
-                f"Preset write{slot_label} was refused because a save event was "
-                "already observed; nothing was sent."
+                f"Write {wid} for slot {policy.display_slot} is {policy.state}; "
+                "a batch would overwrite it. Nothing was sent."
             )
+        if (
+            policy.different_contents
+            and wid
+            and policy.display_slot
+            and policy.state == "retryable"
+        ):
+            return (
+                f"Incomplete write {wid} for slot {policy.display_slot} has "
+                "different contents; nothing was sent. Ask the user before "
+                "acknowledging it."
+            )
+        if policy.state == "saved":
+            lead = f"Write {wid}{slot_label}" if wid else f"Preset write{slot_label}"
+            return f"{lead} already observed a save; nothing was sent."
         if policy.state == "retryable":
+            if wid:
+                return (
+                    f"Preset write{slot_label} was refused while incomplete "
+                    f"write {wid} remains recorded; nothing was sent."
+                )
             return (
                 f"Preset write{slot_label} was refused while an incomplete "
                 "retryable write remains recorded; nothing was sent."
             )
         if policy.state == "exhausted":
+            lead = f"Write {wid}{slot_label}" if wid else f"Preset write{slot_label}"
             return (
-                f"Preset write{slot_label} was refused because all "
-                f"{policy.max_attempts} attempts were used; nothing was sent."
+                f"{lead} is exhausted ({policy.max_attempts} attempts used); "
+                "nothing was sent. Stop and ask the user."
             )
         if policy.state == "cancelled":
-            return (
-                f"Preset write{slot_label} was refused because the recorded "
-                "write was cancelled; nothing was sent."
-            )
+            lead = f"Write {wid}{slot_label}" if wid else f"Preset write{slot_label}"
+            return f"{lead} is cancelled; nothing was sent. Stop and ask the user."
         if policy.state == "in_progress":
+            lead = f"Write {wid}{slot_label}" if wid else f"Preset write{slot_label}"
+            return f"{lead} is in_progress; nothing was sent."
+        if policy.state == "not_sent" and wid:
             return (
-                f"Preset write{slot_label} was refused because an attempt is "
-                "already in progress; nothing was sent."
+                f"Preset write{slot_label} (write {wid}) was refused; nothing was sent."
             )
         return CATALOG["XB_PRESET_WRITE_REFUSED"].default_cause
     if policy.state == "retryable":
@@ -1828,31 +2087,63 @@ def _evaluate_preset_write(
     req_cmd = context.requested_command if context is not None else None
     req_preset = context.requested_preset if context is not None else None
     req_slot = context.requested_slot if context is not None else None
+    req_slots = context.requested_slots if context is not None else None
 
     request_mismatch = False
-    if req_preset is not None:
-        if (record_preset is not None and record_preset != req_preset) or (
-            display_slot is not None and display_slot != req_preset[0]
-        ):
+    different_contents = False
+    batch_refused = False
+    if refused:
+        if req_cmd is not None and req_cmd not in ("write_preset", "write_presets"):
             request_mismatch = True
-    elif req_slot is not None:
-        if display_slot is not None and display_slot != req_slot:
-            request_mismatch = True
+        elif req_preset is not None:
+            if display_slot is not None and display_slot != req_preset[0]:
+                request_mismatch = True
+            elif (
+                display_slot == req_preset[0]
+                and record_preset is not None
+                and record_preset != req_preset
+            ):
+                different_contents = True
+        elif req_cmd == "write_presets":
+            if display_slot is not None:
+                if req_slots is not None and (
+                    single_slot is None or single_slot not in req_slots
+                ):
+                    request_mismatch = True
+                elif single_slot is not None and (
+                    req_slots is None or single_slot in req_slots
+                ):
+                    batch_refused = True
+        elif req_slot is not None:
+            if display_slot is not None and display_slot != req_slot:
+                request_mismatch = True
+    else:
+        if req_preset is not None:
+            if (record_preset is not None and record_preset != req_preset) or (
+                display_slot is not None and display_slot != req_preset[0]
+            ):
+                request_mismatch = True
+        elif req_slot is not None:
+            if display_slot is not None and display_slot != req_slot:
+                request_mismatch = True
 
     if request_mismatch:
         enclosing_valid = False
         display_slot = None
+        different_contents = False
+        batch_refused = False
 
-    request_allows_resend = True
-    if require_request_match:
-        request_allows_resend = (
-            req_cmd == "write_preset"
-            and req_preset is not None
-            and record_preset == req_preset
-            and single_slot == req_preset[0]
-        )
-    elif req_slot is not None:
-        request_allows_resend = single_slot == req_slot
+    request_allows_resend = not refused
+    if not refused:
+        if require_request_match:
+            request_allows_resend = (
+                req_cmd == "write_preset"
+                and req_preset is not None
+                and record_preset == req_preset
+                and single_slot == req_preset[0]
+            )
+        elif req_slot is not None:
+            request_allows_resend = single_slot == req_slot
 
     rec_outcome: str | None = None
     outcome_valid = True
@@ -1987,6 +2278,12 @@ def _evaluate_preset_write(
     )
 
     def make_fallback() -> _PresetWritePolicy:
+        is_conflict = not saved_cleanup_failed and (
+            not enclosing_valid
+            or not outcome_valid
+            or any_layer_claims_retry
+            or has_record_fields
+        )
         step = fallback
         if saved_cleanup_failed:
             step = _SAVED_CLEANUP_FAILED_FIX
@@ -1998,19 +2295,21 @@ def _evaluate_preset_write(
         ):
             step = (
                 "Nothing was sent. A save event was already observed (not a "
-                "readback); inspect `machine_preset_writes` and do not replay the "
-                "write without explicit user direction and `acknowledge_incomplete`."
+                "readback); no further write is needed. Inspect "
+                "`machine_preset_writes` and do not resend or replay without "
+                "explicit user direction and `acknowledge_incomplete`."
                 if refused
                 else "A save event was observed (not a readback); do not replay this "
                 "preset write. Inspect `machine_preset_writes` and `machine_state` "
                 "before any further control."
             )
-        is_conflict = not saved_cleanup_failed and (
-            not enclosing_valid
-            or not outcome_valid
-            or any_layer_claims_retry
-            or has_record_fields
-        )
+        elif refused and not eff_recovery and not is_conflict:
+            step = _refusal_next_step(
+                valid=False,
+                conflict=False,
+                saved_cleanup_failed=False,
+                recovery_required=False,
+            )
         return _PresetWritePolicy(
             valid=False,
             next_step=step,
@@ -2090,6 +2389,25 @@ def _evaluate_preset_write(
             outcome=resolved_outcome,
             attempts_used=attempts_used,
             max_attempts=max_attempts,
+            different_contents=different_contents,
+            batch_refused=batch_refused,
+        )
+
+    def make_valid_refusal() -> _PresetWritePolicy:
+        return make_valid(
+            _refusal_next_step(
+                valid=True,
+                conflict=False,
+                saved_cleanup_failed=False,
+                recovery_required=eff_recovery,
+                slot=display_slot,
+                write_id=write_id,
+                state=state,
+                max_attempts=max_attempts,
+                different_contents=different_contents,
+                batch_refused=batch_refused,
+            ),
+            False,
         )
 
     if state == "superseded":
@@ -2108,6 +2426,8 @@ def _evaluate_preset_write(
     if state == "saved":
         if retry_allowed is not False or remaining != 0 or not any_attempt_saved:
             return make_fallback()
+        if refused:
+            return make_valid_refusal()
         return make_valid(NEXT_STEPS["saved"].format(write_id=write_id), False)
 
     if any_saved:
@@ -2116,6 +2436,8 @@ def _evaluate_preset_write(
     if state == "cancelled":
         if retry_allowed is not False or remaining != 0 or "cancelled" not in counted:
             return make_fallback()
+        if refused:
+            return make_valid_refusal()
         return make_valid(NEXT_STEPS["cancelled"].format(write_id=write_id), False)
 
     if state == "in_progress":
@@ -2127,6 +2449,8 @@ def _evaluate_preset_write(
             or "cancelled" in counted
         ):
             return make_fallback()
+        if refused:
+            return make_valid_refusal()
         return make_valid(NEXT_STEPS["in_progress"], False)
 
     if state == "exhausted":
@@ -2137,6 +2461,8 @@ def _evaluate_preset_write(
             or not all(out in RETRYABLE for out in counted)
         ):
             return make_fallback()
+        if refused:
+            return make_valid_refusal()
         step = NEXT_STEPS["exhausted"].format(write_id=write_id, max=max_attempts)
         if counted and all(out == "no_preset_frame" for out in counted):
             step += NO_PRESET_FRAME
@@ -2151,8 +2477,7 @@ def _evaluate_preset_write(
 
     if state == "retryable":
         if (
-            not request_allows_resend
-            or retry_allowed is not True
+            (not refused and (not request_allows_resend or retry_allowed is not True))
             or attempts_used < 1
             or attempts_used >= max_attempts
             or remaining != max_attempts - attempts_used
@@ -2167,6 +2492,8 @@ def _evaluate_preset_write(
             or missing_required_failed
         ):
             return make_fallback()
+        if refused:
+            return make_valid_refusal()
         step = NEXT_STEPS["retryable"].format(
             write_id=write_id, max=max_attempts, remaining=remaining
         )
@@ -2176,9 +2503,8 @@ def _evaluate_preset_write(
 
     # state == "not_sent"
     if (
-        not request_allows_resend
+        (not refused and (not request_allows_resend or retry_allowed is not True))
         or eff_recovery
-        or retry_allowed is not True
         or attempts_used != 0
         or remaining != max_attempts
         or (rec_outcome is not None and rec_outcome != "refused")
@@ -2187,6 +2513,8 @@ def _evaluate_preset_write(
         or missing_required_failed
     ):
         return make_fallback()
+    if refused:
+        return make_valid_refusal()
     return make_valid(NEXT_STEPS["not_sent"], True)
 
 
@@ -2331,12 +2659,6 @@ def preset_write_diagnostic(
         fix = policy.next_step
         if policy.saved_cleanup_failed:
             fix = _SAVED_CLEANUP_FAILED_FIX
-        elif refused and policy.valid and policy.state == "saved":
-            fix = (
-                "Nothing was sent. A save event was already observed (not a "
-                "readback); inspect `machine_preset_writes` and do not replay the "
-                "write without explicit user direction and `acknowledge_incomplete`."
-            )
         elif policy.valid and not policy.retry_allowed and policy.recovery_required:
             fix = _SAFE_PRESET_DISCONNECT_RECOVERY
 
@@ -2359,9 +2681,11 @@ def preset_write_diagnostic(
         location["kind"] = "slot"
         location["slot"] = slot
 
+    write_id: str | None = None
     outcome: str | None = None
     state: str | None = None
     retry_allowed: bool | None = None
+    max_attempts_val: int | None = None
     local_next_step: str | None = None
     payload_outcome = (
         payload["outcome"]
@@ -2379,7 +2703,8 @@ def preset_write_diagnostic(
 
     if isinstance(source, Mapping):
         if isinstance(source.get("write_id"), str) and source["write_id"].strip():
-            summary_bits.append(f"write_id={source['write_id']}")
+            write_id = source["write_id"].strip()
+            summary_bits.append(f"write_id={write_id}")
         if isinstance(source.get("state"), str) and source["state"].strip():
             state = source["state"]
             summary_bits.append(f"state={state}")
@@ -2390,11 +2715,12 @@ def preset_write_diagnostic(
             type(source.get("attempts_used")) is int
             and type(source.get("max_attempts")) is int
         ):
+            max_attempts_val = source["max_attempts"]
             summary_bits.append(
-                f"attempts={source['attempts_used']}/{source['max_attempts']}"
+                f"attempts={source['attempts_used']}/{max_attempts_val}"
             )
         if type(source.get("retry_allowed")) is bool:
-            retry_allowed = source["retry_allowed"]
+            retry_allowed = False if refused else source["retry_allowed"]
             summary_bits.append(f"retry_allowed={str(retry_allowed).lower()}")
         if isinstance(source.get("next_step"), str) and source["next_step"].strip():
             local_next_step = source["next_step"]
@@ -2406,15 +2732,50 @@ def preset_write_diagnostic(
     if recovery_required is True:
         summary_bits.append("recovery_required=true")
 
-    local_fix = _preset_write_fix(
-        refused=refused,
-        outcome=outcome,
-        state=state,
-        retry_allowed=retry_allowed,
-        recovery_required=recovery_required,
-        saved_observed=saved_observed,
-        local_next_step=local_next_step,
-    )
+    if refused:
+        src_preset = (
+            _normalize_preset(source.get("preset"))
+            if isinstance(source, Mapping)
+            else None
+        )
+        req_preset = context.requested_preset if context is not None else None
+        req_cmd = context.requested_command if context is not None else None
+        diff_contents = (
+            req_preset is not None
+            and src_preset is not None
+            and slot == req_preset[0]
+            and src_preset != req_preset
+        ) or ("different contents" in cause.lower())
+        is_batch = req_cmd == "write_presets" or (
+            "batch would overwrite" in cause.lower()
+        )
+        saved_cleanup = outcome == "saved_cleanup_failed" or (
+            recovery_required is True
+            and (outcome in _SAVED_OUTCOMES or state == "saved" or saved_observed)
+        )
+        local_fix: str | None = _refusal_next_step(
+            valid=isinstance(source, Mapping)
+            and (write_id is not None or state is not None),
+            conflict=False,
+            saved_cleanup_failed=saved_cleanup,
+            recovery_required=recovery_required is True,
+            slot=slot,
+            write_id=write_id,
+            state=state,
+            max_attempts=max_attempts_val,
+            different_contents=diff_contents,
+            batch_refused=is_batch,
+        )
+    else:
+        local_fix = _preset_write_fix(
+            refused=False,
+            outcome=outcome,
+            state=state,
+            retry_allowed=retry_allowed,
+            recovery_required=recovery_required,
+            saved_observed=saved_observed,
+            local_next_step=local_next_step,
+        )
     resolved_cause = cause
     if (
         not refused
@@ -2683,6 +3044,13 @@ def _rebuild_remote_diagnostic(
             policy,
         )
 
+    if diag_code == "XB_INTERNAL_ERROR" or error_code == "internal_error":
+        diagnostic = build_diagnostic(
+            "XB_INTERNAL_ERROR",
+            cause=CATALOG["XB_INTERNAL_ERROR"].default_cause,
+        )
+        return attach_local_context(diagnostic, context), None
+
     location: dict[str, Any] = {}
     ctx_payload: dict[str, Any] = {}
     if isinstance(details, Mapping):
@@ -2695,17 +3063,20 @@ def _rebuild_remote_diagnostic(
             ctx_payload["summary"] = f"http_status={http_status}"
         protocol = details.get("protocol")
         if isinstance(protocol, Mapping):
+            proto_bits: list[str] = []
             pending = protocol.get("pending_command")
             if type(pending) is int:
-                location["kind"] = "command"
-                location["command"] = f"protocol:{pending}"
-            proto_bits = [
-                f"{k}={v}"
-                for k, v in protocol.items()
-                if isinstance(k, str)
-                and not _is_sensitive_key(k)
-                and type(v) in (int, float, bool)
-            ][:4]
+                proto_bits.append(f"protocol_command={pending}")
+            for k, v in protocol.items():
+                if len(proto_bits) >= 4:
+                    break
+                if (
+                    isinstance(k, str)
+                    and k != "pending_command"
+                    and not _is_sensitive_key(k)
+                    and type(v) in (int, float, bool)
+                ):
+                    proto_bits.append(f"{k}={v}")
             if proto_bits:
                 ctx_payload["summary"] = "; ".join(proto_bits)
         raw_errors = details.get("errors")
@@ -2760,6 +3131,11 @@ def sanitize_remote_error(
     rebuilt, policy = _rebuild_remote_diagnostic(filtered, context=context)
     if "retryable" in filtered:
         filtered["retryable"] = False
+    if (
+        "correlation_id" in filtered
+        and safe_identifier(filtered["correlation_id"]) is None
+    ):
+        filtered.pop("correlation_id")
     details = filtered.get("details")
     if isinstance(details, Mapping):
         has_embedded = any(key in details for key in _PRESET_GUIDANCE_KEYS)
@@ -2786,8 +3162,15 @@ def sanitize_remote_error(
                 filtered["message"] = local_cause
             if not is_preset_diag:
                 rebuilt = dict(rebuilt, cause=local_cause)
-    if "diagnostic" in filtered:
-        filtered["diagnostic"] = rebuilt
+    if (
+        rebuilt["code"] == "XB_INTERNAL_ERROR"
+        or filtered.get("code") == "internal_error"
+    ):
+        if "message" in filtered:
+            filtered["message"] = rebuilt["cause"]
+    elif isinstance(filtered.get("message"), str):
+        filtered["message"] = _redact_text(filtered["message"])
+    filtered["diagnostic"] = rebuilt
     if "next_step" in filtered:
         filtered["next_step"] = rebuilt["fix"]
     return filtered
@@ -2813,15 +3196,14 @@ def sanitize_remote_result(
         ):
             raise ValueError("Remote diagnostic contains unexpected nested types")
         if cleaned.get("valid") is False:
-            if has_diag:
-                raw_errors = cleaned.get("errors")
-                errors = raw_errors if isinstance(raw_errors, list) else []
-                cleaned["diagnostic"] = validation_diagnostic(
-                    errors,
-                    tea=method == "recipe_tea_validate",
-                    context=context,
-                    trusted=False,
-                )
+            raw_errors = cleaned.get("errors")
+            errors = raw_errors if isinstance(raw_errors, list) else []
+            cleaned["diagnostic"] = validation_diagnostic(
+                errors,
+                tea=method == "recipe_tea_validate",
+                context=context,
+                trusted=False,
+            )
         else:
             cleaned.pop("diagnostic", None)
         return cleaned
@@ -2868,20 +3250,19 @@ def sanitize_remote_result(
             ):
                 cleaned["error"] = _untrusted_preset_write_cause(policy, refused=False)
         if is_failed:
-            if has_diag:
-                raw_error = cleaned.get("error")
-                cause = (
-                    raw_error
-                    if isinstance(raw_error, str) and raw_error.strip()
-                    else "Preset write did not finish."
-                )
-                cleaned["diagnostic"] = preset_write_diagnostic(
-                    refused=False,
-                    cause=cause,
-                    context=context,
-                    trusted=False,
-                    policy=policy,
-                )
+            raw_error = cleaned.get("error")
+            cause = (
+                raw_error
+                if isinstance(raw_error, str) and raw_error.strip()
+                else "Preset write did not finish."
+            )
+            cleaned["diagnostic"] = preset_write_diagnostic(
+                refused=False,
+                cause=cause,
+                context=context,
+                trusted=False,
+                policy=policy,
+            )
         else:
             cleaned.pop("diagnostic", None)
         return cleaned
@@ -3140,10 +3521,9 @@ def render_human_diagnostic(
         meta.append(f"Location: {loc_text}")
     if isinstance(ctx, Mapping) and isinstance(ctx.get("summary"), str):
         meta.append(f"Context: {ctx['summary']}")
-    correlation_id = (
-        detail.get("correlation_id") if isinstance(detail, Mapping) else None
-    )
-    if isinstance(correlation_id, str) and correlation_id:
+    raw_corr = detail.get("correlation_id") if isinstance(detail, Mapping) else None
+    correlation_id = safe_identifier(raw_corr)
+    if correlation_id is not None:
         meta.append(f"Correlation ID: {correlation_id}")
     if meta:
         blocks.append("\n".join(meta))

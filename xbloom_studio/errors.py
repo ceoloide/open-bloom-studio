@@ -229,20 +229,16 @@ def error_detail(
         )
     if isinstance(exc, PresetWriteRefused):
         message = str(exc)
-        next_step = (
-            "Nothing was sent. Inspect machine_preset_writes for the slot's write "
-            "ID, outcomes and exact contents; ask the user before acknowledging "
-            "an incomplete write."
+        diag = preset_write_diagnostic(
+            refused=True, cause=message, payload=exc.write, context=context
         )
         return _detail(
             name,
             "conflict",
             message,
-            next_step,
+            diag["fix"],
             {"preset_write": exc.write},
-            diagnostic=preset_write_diagnostic(
-                refused=True, cause=message, payload=exc.write, context=context
-            ),
+            diagnostic=diag,
         )
     if isinstance(exc, UntestedOperationError):
         message = str(exc)
@@ -269,16 +265,19 @@ def error_detail(
             "existing idempotency key to inspect its attempt; never force a new "
             "start."
         )
-        proto_loc: dict[str, Any] = {**(location or {})}
+        summary_bits: list[str] = []
         pending = exc.details.get("pending_command")
         if type(pending) is int:
-            proto_loc.setdefault("kind", "command")
-            proto_loc["command"] = f"protocol:{pending}"
-        summary_bits = [
-            f"{k}={v}"
-            for k, v in exc.details.items()
-            if isinstance(k, str) and isinstance(v, (str, int, float, bool))
-        ][:4]
+            summary_bits.append(f"protocol_command={pending}")
+        for k, v in exc.details.items():
+            if len(summary_bits) >= 4:
+                break
+            if (
+                isinstance(k, str)
+                and k != "pending_command"
+                and isinstance(v, (str, int, float, bool))
+            ):
+                summary_bits.append(f"{k}={v}")
         return _detail(
             name,
             "machine_protocol_error",
@@ -289,7 +288,7 @@ def error_detail(
                 "XB_MACHINE_PROTOCOL_ERROR",
                 cause=message,
                 fix=next_step,
-                location=proto_loc or None,
+                location=location,
                 context={"summary": "; ".join(summary_bits)} if summary_bits else None,
             ),
         )

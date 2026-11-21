@@ -156,7 +156,10 @@ class ErrorContractTests(unittest.TestCase):
 
     def test_remote_envelopes_are_filtered(self):
         remote = RemoteError({"code": "busy", "message": "m", "secret": "x"})
-        self.assertEqual(error_detail(remote), {"code": "busy", "message": "m"})
+        filtered = error_detail(remote)
+        self.assertEqual(set(filtered), {"code", "message", "diagnostic"})
+        self.assertEqual((filtered["code"], filtered["message"]), ("busy", "m"))
+        self.assertEqual(filtered["diagnostic"]["code"], "XB_MACHINE_BUSY")
         self.assertEqual(
             error_detail(RemoteError({"code": "other", "message": "m"}))["code"],
             "internal_error",
