@@ -14,6 +14,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from .provider_exports import credential_key
+
 DOCS_LOCAL_PATH = "docs/diagnostics.md"
 DOCS_BASE_URL = (
     "https://github.com/ceoloide/open-xbloom-studio-tools/blob/main/" + DOCS_LOCAL_PATH
@@ -25,26 +27,43 @@ MAX_EXCERPT_WIDTH = 120
 MAX_SUMMARY_WIDTH = 220
 MAX_SANITISED_TEXT = 512
 
-# Sensitive keys and secret-shaped tokens are redacted from local JSON excerpts.
-_SENSITIVE_LINE = re.compile(
+_EXTRA_SENSITIVE_KEY_EXACT = frozenset(
+    {"passwd", "pwd", "pin", "passphrase", "private", "cert", "certificate"}
+)
+_EXTRA_SENSITIVE_KEY_PARTS = (
+    "passwd",
+    "passphrase",
+    "privatekey",
+    "secretkey",
+    "accesskey",
+    "authkey",
+    "signingkey",
+    "sessionkey",
+    "clientkey",
+    "encryptionkey",
+    "passkey",
+)
+_SAFE_MALFORMED_KEY = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+_SENSITIVE_VALUE = re.compile(
     r"(?i)(?:"
-    r"\"[^\"]*(?:token|secret|password|passwd|api[_-]?key|authorization|"
-    r"cookie|private[_-]?key|credential|bearer|oauth|jwt|firebaseauth|"
-    r"signature)[^\"]*\"\s*:"
-    r"|-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"
+    r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"
     r"|\b(?:gh[opsur]_[A-Za-z0-9]{16,}|github_pat_\w{20,})"
     r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
     r"|\bxox[abposr]-[A-Za-z0-9-]{10,}"
     r"|\bsk-[A-Za-z0-9_-]{20,}"
     r"|\bpypi-AgEI[A-Za-z0-9_-]{20,}"
     r"|\bAIza[0-9A-Za-z_-]{20,}"
+    r"|\bbearer\s+[A-Za-z0-9._~+/-]{8,}"
+    r"|\bbasic\s+[A-Za-z0-9+/=]{8,}"
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}"
+    r"|https?://[^/\s@]+:[^/\s@]+@"
     r")"
 )
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _JSON_TOKEN = re.compile(
     r"""
     (?P<ws>[ \t\r\n]+)
-    |(?P<string>"(?:\\.|[^"\\])*")
+    |(?P<string>"(?:\\.|[^"\\\x00-\x1f])*")
     |(?P<punct>[{}\[\]:,])
     |(?P<atom>true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)
     """,
@@ -72,6 +91,34 @@ EXCERPT_LINE_KEYS = frozenset({"line", "text", "highlight", "column"})
 DIAGNOSTIC_KEYS = frozenset(
     {"code", "cause", "location", "fix", "docs_url", "repair_guide", "context"}
 )
+_LOCAL_ONLY_DIAGNOSTIC_CODES = frozenset(
+    {
+        "XB_INPUT_READ_FAILED",
+        "XB_MCP_UNKNOWN_TOOL",
+        "XB_MCP_OUTPUT_CONTRACT",
+        "XB_OPERATION_FAILED",
+    }
+)
+_VALID_SLOTS = frozenset({"A", "B", "C"})
+_SAVED_OUTCOMES = frozenset(
+    {"saved", "saved_cleanup_failed", "saved_interrupted", "saved_late"}
+)
+
+
+def _is_sensitive_key(key: str) -> bool:
+    if credential_key(key):
+        return True
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return normalized in _EXTRA_SENSITIVE_KEY_EXACT or any(
+        part in normalized for part in _EXTRA_SENSITIVE_KEY_PARTS
+    )
+
+
+def _is_sensitive_pointer(pointer: str | None) -> bool:
+    if not isinstance(pointer, str):
+        return False
+    segments = _pointer_segments(pointer)
+    return segments is not None and any(_is_sensitive_key(seg) for seg in segments)
 
 
 class InputFileReadError(ValueError):
@@ -101,6 +148,7 @@ class DiagnosticContext:
     pointer: str | None = None
     source_path: str | None = None
     source_text: str | None = None
+    source_kind: str | None = None
     allow_excerpt: bool = False
 
 
@@ -482,6 +530,21 @@ SPECS: tuple[DiagnosticSpec, ...] = (
         skill="skills/xbloom-studio-operate/SKILL.md#after-any-uncertainty",
     ),
     DiagnosticSpec(
+        code="XB_OPERATION_FAILED",
+        error_code="operation_failed",
+        title="Watched machine operation did not complete",
+        default_cause=(
+            "The watched machine operation ended without observed completion."
+        ),
+        default_fix=(
+            "Inspect read-only `history_get` (`xbloom-studio history get ID`), "
+            "`history_events` (`xbloom-studio history events ID`), `machine_state` "
+            "(`xbloom-studio machine state`), and the physical machine. Never "
+            "automatically replay a start with a new idempotency key."
+        ),
+        skill="skills/xbloom-studio-operate/SKILL.md#after-any-uncertainty",
+    ),
+    DiagnosticSpec(
         code="XB_INTERNAL_ERROR",
         error_code="internal_error",
         title="Unexpected internal error",
@@ -532,30 +595,193 @@ def _truncate_line(text: str, limit: int) -> str:
     return cleaned[: limit - 3] + "..."
 
 
-def _sanitize_excerpt_line(
-    raw_line: str, column: int | None = None
-) -> tuple[str, int | None, bool]:
-    """Return bounded, redacted display text and adjusted 1-based column."""
-    expanded = _CONTROL_CHARS.sub(" ", raw_line.rstrip("\r\n").replace("\t", "  "))
-    if _SENSITIVE_LINE.search(expanded):
-        return "<redacted>", None, True
-    if len(expanded) <= MAX_EXCERPT_WIDTH:
+def _window_line(text: str, column: int | None) -> tuple[str, int | None]:
+    if len(text) <= MAX_EXCERPT_WIDTH:
         safe_col = (
-            column if column is not None and 1 <= column <= len(expanded) + 1 else None
+            column if column is not None and 1 <= column <= len(text) + 1 else None
         )
-        return expanded, safe_col, False
+        return text, safe_col
     if column is None:
-        return expanded[: MAX_EXCERPT_WIDTH - 3] + "...", None, False
-    # Center a narrow window around the syntax column on long single-line JSON.
-    zero_col = max(0, min(column - 1, len(expanded)))
+        return text[: MAX_EXCERPT_WIDTH - 3] + "...", None
+    zero_col = max(0, min(column - 1, len(text)))
     half = (MAX_EXCERPT_WIDTH - 6) // 2
     start = max(0, zero_col - half)
-    end = min(len(expanded), start + MAX_EXCERPT_WIDTH - 6)
+    end = min(len(text), start + MAX_EXCERPT_WIDTH - 6)
     prefix = "..." if start > 0 else ""
-    suffix = "..." if end < len(expanded) else ""
-    snippet = prefix + expanded[start:end] + suffix
+    suffix = "..." if end < len(text) else ""
+    snippet = prefix + text[start:end] + suffix
     adjusted = len(prefix) + (zero_col - start) + 1
-    return snippet, adjusted, False
+    return snippet, adjusted
+
+
+def _tokenize_json(text: str) -> list[tuple[str, str, int, int]] | None:
+    tokens: list[tuple[str, str, int, int]] = []
+    pos = 0
+    for match in _JSON_TOKEN.finditer(text):
+        if match.start() != pos:
+            return None
+        pos = match.end()
+        kind = match.lastgroup
+        if kind and kind != "ws":
+            tokens.append((kind, match.group(), match.start(), match.end()))
+    if pos != len(text) or not tokens:
+        return None
+    return tokens
+
+
+def _parse_json_structure(
+    tokens: Sequence[tuple[str, str, int, int]],
+    *,
+    target_segments: list[str] | None = None,
+) -> tuple[int | None, list[tuple[int, int]], set[int]] | None:
+    """Validate JSON token structure, locate an optional pointer, and mark secrets."""
+    index = 0
+    found: int | None = None
+    sensitive_spans: list[tuple[int, int]] = []
+    key_indices: set[int] = set()
+
+    def parse_value(path: list[str], depth: int) -> tuple[bool, int]:
+        nonlocal index, found
+        if depth > MAX_JSON_LOCATE_DEPTH or index >= len(tokens):
+            return False, 0
+        kind, raw, start, end = tokens[index]
+        if target_segments is not None and path == target_segments:
+            found = start
+        if kind == "string":
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                return False, 0
+            if isinstance(decoded, str) and _SENSITIVE_VALUE.search(decoded):
+                sensitive_spans.append((start, end))
+            index += 1
+            return True, end
+        if kind == "atom":
+            index += 1
+            return True, end
+        if kind == "punct" and raw == "{":
+            index += 1
+            if index < len(tokens) and tokens[index][1] == "}":
+                close_end = tokens[index][3]
+                index += 1
+                return True, close_end
+            while index < len(tokens):
+                if tokens[index][0] != "string":
+                    return False, 0
+                key_idx = index
+                _, key_raw, key_start, _ = tokens[index]
+                try:
+                    key = json.loads(key_raw)
+                except json.JSONDecodeError:
+                    return False, 0
+                if not isinstance(key, str):
+                    return False, 0
+                key_indices.add(key_idx)
+                key_sensitive = (
+                    _is_sensitive_key(key)
+                    or bool(_SENSITIVE_VALUE.search(key))
+                    or len(key) > 64
+                )
+                index += 1
+                if index >= len(tokens) or tokens[index][1] != ":":
+                    return False, 0
+                index += 1
+                ok, val_end = parse_value([*path, key], depth + 1)
+                if not ok:
+                    return False, 0
+                if key_sensitive:
+                    sensitive_spans.append((key_start, val_end))
+                if index >= len(tokens):
+                    return False, 0
+                sep = tokens[index][1]
+                sep_end = tokens[index][3]
+                index += 1
+                if sep == "}":
+                    return True, sep_end
+                if sep != ",":
+                    return False, 0
+            return False, 0
+        if kind == "punct" and raw == "[":
+            index += 1
+            if index < len(tokens) and tokens[index][1] == "]":
+                close_end = tokens[index][3]
+                index += 1
+                return True, close_end
+            item = 0
+            while index < len(tokens):
+                ok, _ = parse_value([*path, str(item)], depth + 1)
+                if not ok:
+                    return False, 0
+                item += 1
+                if index >= len(tokens):
+                    return False, 0
+                sep = tokens[index][1]
+                sep_end = tokens[index][3]
+                index += 1
+                if sep == "]":
+                    return True, sep_end
+                if sep != ",":
+                    return False, 0
+            return False, 0
+        return False, 0
+
+    ok, _ = parse_value([], 0)
+    if not ok or index != len(tokens):
+        return None
+    return found, sensitive_spans, key_indices
+
+
+def _reconstruct_excerpt_line(
+    raw_line: str,
+    line_start: int,
+    line_tokens: Sequence[tuple[int, str, str, int, int]],
+    *,
+    keep_string_indices: set[int],
+    sensitive_spans: Sequence[tuple[int, int]],
+    target_column: int | None,
+) -> tuple[str, int | None]:
+    line_text = raw_line.rstrip("\r\n")
+    line_end = line_start + len(line_text)
+    for s_start, s_end in sensitive_spans:
+        if s_start < line_end and s_end > line_start:
+            return "<redacted>", None
+
+    target_offset = (
+        line_start + (target_column - 1) if target_column is not None else None
+    )
+    out: list[str] = []
+    out_len = 0
+    cursor = line_start
+    adjusted_col: int | None = None
+
+    def emit_plain(segment: str, seg_start: int) -> None:
+        nonlocal out_len, adjusted_col
+        for idx, ch in enumerate(segment):
+            if target_offset is not None and seg_start + idx == target_offset:
+                adjusted_col = out_len + 1
+            rep = "  " if ch == "\t" else _CONTROL_CHARS.sub(" ", ch)
+            out.append(rep)
+            out_len += len(rep)
+
+    for tok_idx, kind, raw, tok_start, tok_end in line_tokens:
+        if tok_start > cursor:
+            emit_plain(line_text[cursor - line_start : tok_start - line_start], cursor)
+        if kind == "string" and tok_idx not in keep_string_indices:
+            if target_offset is not None and tok_start <= target_offset < tok_end:
+                adjusted_col = out_len + 1 if target_offset == tok_start else None
+            replacement = '"<redacted>"'
+            out.append(replacement)
+            out_len += len(replacement)
+        else:
+            emit_plain(raw, tok_start)
+        cursor = tok_end
+
+    if cursor < line_end:
+        emit_plain(line_text[cursor - line_start :], cursor)
+    if target_offset is not None and target_offset >= line_end and adjusted_col is None:
+        adjusted_col = out_len + 1
+
+    return _window_line("".join(out), adjusted_col)
 
 
 def extract_json_excerpt(
@@ -565,22 +791,76 @@ def extract_json_excerpt(
     *,
     radius: int = 1,
 ) -> list[dict[str, Any]] | None:
-    """Return a minimal bounded source excerpt (1-3 lines) for a local JSON file."""
+    """Return a minimal fail-closed structural/redacted excerpt for local JSON."""
     if not text or line < 1 or len(text.encode("utf-8")) > MAX_JSON_LOCATE_BYTES:
         return None
-    lines = text.splitlines()
-    if line > len(lines):
+    raw_lines = text.splitlines(keepends=True)
+    if line > len(raw_lines):
         return None
-    target_raw = lines[line - 1]
+    target_raw = raw_lines[line - 1].rstrip("\r\n")
     if column is None and len(target_raw) > 200:
         return None
+
+    # Fail closed if the source cannot be cleanly tokenized as JSON tokens.
+    tokens = _tokenize_json(text)
+    if tokens is None:
+        return None
+
+    parsed = _parse_json_structure(tokens)
+    if parsed is not None:
+        _, sensitive_spans, keep_string_indices = parsed
+    else:
+        # Malformed JSON: decode every string token and omit the excerpt
+        # completely if any sensitive key or secret-shaped token exists anywhere.
+        decoded_strings: dict[int, str] = {}
+        for idx, (kind, raw, _, _) in enumerate(tokens):
+            if kind != "string":
+                continue
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(decoded, str):
+                return None
+            if _is_sensitive_key(decoded) or _SENSITIVE_VALUE.search(decoded):
+                return None
+            decoded_strings[idx] = decoded
+        sensitive_spans = []
+        keep_string_indices = {
+            idx
+            for idx, decoded in decoded_strings.items()
+            if idx > 0
+            and tokens[idx - 1][1] in ("{", ",")
+            and idx + 1 < len(tokens)
+            and tokens[idx + 1][1] == ":"
+            and _SAFE_MALFORMED_KEY.fullmatch(decoded) is not None
+        }
+
+    line_offsets: list[int] = []
+    offset = 0
+    for raw_line in raw_lines:
+        line_offsets.append(offset)
+        offset += len(raw_line)
+
     start = max(1, line - radius)
-    end = min(len(lines), line + radius)
+    end = min(len(raw_lines), line + radius)
     excerpt: list[dict[str, Any]] = []
     for number in range(start, end + 1):
         is_target = number == line
-        cleaned, col, _ = _sanitize_excerpt_line(
-            lines[number - 1], column if is_target else None
+        l_start = line_offsets[number - 1]
+        l_end = l_start + len(raw_lines[number - 1].rstrip("\r\n"))
+        l_tokens = [
+            (idx, kind, raw, t_start, t_end)
+            for idx, (kind, raw, t_start, t_end) in enumerate(tokens)
+            if t_start >= l_start and t_end <= l_end
+        ]
+        cleaned, col = _reconstruct_excerpt_line(
+            raw_lines[number - 1],
+            l_start,
+            l_tokens,
+            keep_string_indices=keep_string_indices,
+            sensitive_spans=sensitive_spans,
+            target_column=column if is_target else None,
         )
         entry: dict[str, Any] = {
             "line": number,
@@ -612,94 +892,27 @@ def locate_json_pointer_line(text: str, pointer: str) -> tuple[int, int] | None:
         or len(text.encode("utf-8")) > MAX_JSON_LOCATE_BYTES
     ):
         return None
-    tokens: list[tuple[str, str, int]] = []
-    pos = 0
-    for match in _JSON_TOKEN.finditer(text):
-        if match.start() != pos:
-            return None
-        pos = match.end()
-        kind = match.lastgroup
-        if kind and kind != "ws":
-            tokens.append((kind, match.group(), match.start()))
-    if pos != len(text) or not tokens:
+    tokens = _tokenize_json(text)
+    if tokens is None:
         return None
-
-    def offset_to_line_col(offset: int) -> tuple[int, int]:
-        line = text.count("\n", 0, offset) + 1
-        last_nl = text.rfind("\n", 0, offset)
-        return line, offset - last_nl
-
-    index = 0
-    found: int | None = None
-
-    def parse_value(path: list[str], depth: int) -> bool:
-        nonlocal index, found
-        if depth > MAX_JSON_LOCATE_DEPTH or index >= len(tokens):
-            return False
-        kind, raw, start = tokens[index]
-        if path == segments:
-            found = start
-        if kind == "string" or kind == "atom":
-            index += 1
-            return True
-        if kind == "punct" and raw == "{":
-            index += 1
-            if index < len(tokens) and tokens[index][1] == "}":
-                index += 1
-                return True
-            while index < len(tokens):
-                if tokens[index][0] != "string":
-                    return False
-                try:
-                    key = json.loads(tokens[index][1])
-                except json.JSONDecodeError:
-                    return False
-                index += 1
-                if index >= len(tokens) or tokens[index][1] != ":":
-                    return False
-                index += 1
-                if not parse_value([*path, key], depth + 1):
-                    return False
-                if index >= len(tokens):
-                    return False
-                sep = tokens[index][1]
-                index += 1
-                if sep == "}":
-                    return True
-                if sep != ",":
-                    return False
-            return False
-        if kind == "punct" and raw == "[":
-            index += 1
-            if index < len(tokens) and tokens[index][1] == "]":
-                index += 1
-                return True
-            item = 0
-            while index < len(tokens):
-                if not parse_value([*path, str(item)], depth + 1):
-                    return False
-                item += 1
-                if index >= len(tokens):
-                    return False
-                sep = tokens[index][1]
-                index += 1
-                if sep == "]":
-                    return True
-                if sep != ",":
-                    return False
-            return False
-        return False
-
-    if not parse_value([], 0) or index != len(tokens) or found is None:
+    parsed = _parse_json_structure(tokens, target_segments=segments)
+    if parsed is None or parsed[0] is None:
         return None
-    return offset_to_line_col(found)
+    found = parsed[0]
+    line = text.count("\n", 0, found) + 1
+    last_nl = text.rfind("\n", 0, found)
+    return line, found - last_nl
 
 
 def _format_expected(expected: Any) -> str | None:
     if not isinstance(expected, Mapping):
         return None
     parts: list[str] = []
-    if "enum" in expected and isinstance(expected["enum"], Sequence):
+    if (
+        "enum" in expected
+        and isinstance(expected["enum"], Sequence)
+        and not isinstance(expected["enum"], (str, bytes))
+    ):
         values = ", ".join(str(v) for v in expected["enum"][:8])
         if len(expected["enum"]) > 8:
             values += ", ..."
@@ -719,12 +932,18 @@ def _format_expected(expected: Any) -> str | None:
         parts.append(f"{expected['min_items']}..{expected['max_items']} items")
     elif "minItems" in expected and "maxItems" in expected:
         parts.append(f"{expected['minItems']}..{expected['maxItems']} items")
-    elif "allowed_fields" in expected and isinstance(
-        expected["allowed_fields"], Sequence
+    elif (
+        "allowed_fields" in expected
+        and isinstance(expected["allowed_fields"], Sequence)
+        and not isinstance(expected["allowed_fields"], (str, bytes))
     ):
         fields = ", ".join(str(v) for v in expected["allowed_fields"][:8])
         parts.append(f"fields [{fields}]")
-    elif "properties" in expected and isinstance(expected["properties"], Sequence):
+    elif (
+        "properties" in expected
+        and isinstance(expected["properties"], Sequence)
+        and not isinstance(expected["properties"], (str, bytes))
+    ):
         fields = ", ".join(str(v) for v in expected["properties"][:8])
         parts.append(f"properties [{fields}]")
     elif "total_ml" in expected:
@@ -737,23 +956,36 @@ def _format_expected(expected: Any) -> str | None:
 
 
 def _summarize_validation_issue(
-    issues: Sequence[Mapping[str, Any]],
+    issues: Sequence[Any],
 ) -> tuple[str | None, str | None]:
-    if not issues:
+    valid_issues = [item for item in issues if isinstance(item, Mapping)]
+    if not valid_issues:
         return None, None
-    first = issues[0]
+    first = valid_issues[0]
     pointer = first.get("path")
     pointer_str = pointer if isinstance(pointer, str) else None
     bits: list[str] = []
     if "value" in first:
         val = first["value"]
-        rendered = _truncate(repr(val) if isinstance(val, str) else str(val), 48)
-        bits.append(f"got {rendered}")
+        if _is_sensitive_pointer(pointer_str):
+            bits.append("got <redacted>")
+        elif first.get("code") == "missing_field" and val == "<missing>":
+            bits.append("missing required field")
+        elif type(val) is bool:
+            bits.append(f"got {'true' if val else 'false'}")
+        elif type(val) in (int, float):
+            bits.append(f"got {val}")
+        elif val is None:
+            bits.append("got null")
+        elif isinstance(val, str):
+            bits.append("got <string>")
+        else:
+            bits.append(f"got <{type(val).__name__}>")
     expected = _format_expected(first.get("expected") or first.get("allowed"))
     if expected:
         bits.append(f"expected {expected}")
-    if len(issues) > 1:
-        bits.append(f"1 of {len(issues)} errors")
+    if len(valid_issues) > 1:
+        bits.append(f"1 of {len(valid_issues)} errors")
     summary = _truncate("; ".join(bits), MAX_SUMMARY_WIDTH) if bits else None
     return pointer_str, summary
 
@@ -833,69 +1065,164 @@ def _clean_context(context: Mapping[str, Any] | None) -> dict[str, Any] | None:
     return cleaned or None
 
 
-def sanitize_diagnostic(raw: Any) -> dict[str, Any] | None:
-    """Validate and sanitize a diagnostic object received from a remote peer."""
+def has_valid_diagnostic_types(raw: Any) -> bool:
+    """Strictly check nested field types of a candidate diagnostic mapping."""
     if not isinstance(raw, Mapping):
+        return False
+    if "code" not in raw or type(raw["code"]) is not str:
+        return False
+    for text_key in ("cause", "fix", "docs_url"):
+        if text_key in raw and type(raw[text_key]) is not str:
+            return False
+    if "repair_guide" in raw:
+        guide = raw["repair_guide"]
+        if not isinstance(guide, Mapping):
+            return False
+        for gk, gv in guide.items():
+            if type(gk) is not str or type(gv) is not str:
+                return False
+    if "location" in raw and raw["location"] is not None:
+        loc = raw["location"]
+        if not isinstance(loc, Mapping):
+            return False
+        for lk, lv in loc.items():
+            if type(lk) is not str:
+                return False
+            if lk not in LOCATION_KEYS or lv is None:
+                continue
+            if lk in ("line", "column"):
+                if type(lv) is not int or lv < 1:
+                    return False
+            elif type(lv) is not str:
+                return False
+    if "context" in raw and raw["context"] is not None:
+        ctx = raw["context"]
+        if not isinstance(ctx, Mapping):
+            return False
+        if (
+            "summary" in ctx
+            and ctx["summary"] is not None
+            and type(ctx["summary"]) is not str
+        ):
+            return False
+        if "excerpt" in ctx and ctx["excerpt"] is not None:
+            excerpt = ctx["excerpt"]
+            if not isinstance(excerpt, list):
+                return False
+            for item in excerpt:
+                if (
+                    not isinstance(item, Mapping)
+                    or type(item.get("line")) is not int
+                    or item["line"] < 1
+                    or type(item.get("text")) is not str
+                    or type(item.get("highlight")) is not bool
+                ):
+                    return False
+                if (
+                    "column" in item
+                    and item["column"] is not None
+                    and (type(item["column"]) is not int or item["column"] < 1)
+                ):
+                    return False
+    return True
+
+
+def _valid_slot_value(value: Any) -> str | None:
+    if type(value) is not str:
         return None
-    code = raw.get("code")
-    if not isinstance(code, str) or code not in CATALOG:
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if parts and all(part in _VALID_SLOTS for part in parts):
+        return ",".join(parts)
+    return None
+
+
+def _valid_pointer_value(value: Any) -> str | None:
+    if type(value) is not str:
+        return None
+    if value == "" or value.startswith("/"):
+        return _truncate(value, MAX_SANITISED_TEXT)
+    return None
+
+
+def sanitize_diagnostic(
+    raw: Any,
+    *,
+    enclosing_error_code: str | None = None,
+    context: DiagnosticContext | None = None,
+) -> dict[str, Any] | None:
+    """Validate and rebuild a diagnostic received from an untrusted remote peer.
+
+    Remote peers may never inject fixes, docs/repair URLs, local paths,
+    excerpts, or fabricated command/method/tool/parameter routes.
+    """
+    if not has_valid_diagnostic_types(raw):
+        return None
+    code = raw["code"]
+    if code not in CATALOG or code in _LOCAL_ONLY_DIAGNOSTIC_CODES:
         return None
     spec = CATALOG[code]
+    if enclosing_error_code is not None and spec.error_code != enclosing_error_code:
+        return None
     cause = raw.get("cause")
-    fix = raw.get("fix")
-    # Never trust arbitrary remote URLs or local paths: always derive canonical
-    # docs and repair guide links from the verified catalog entry.
+    # Derive fix, docs_url, and repair_guide strictly from the local catalog.
     result: dict[str, Any] = {
         "code": spec.code,
         "cause": _truncate(
             cause if isinstance(cause, str) and cause.strip() else spec.default_cause,
             MAX_SANITISED_TEXT,
         ),
-        "fix": _truncate(
-            fix if isinstance(fix, str) and fix.strip() else spec.default_fix,
-            MAX_SANITISED_TEXT,
-        ),
+        "fix": spec.default_fix,
         "docs_url": spec.docs_url,
         "repair_guide": spec.repair_guide(),
     }
-    clean_loc = _clean_location(
-        raw.get("location") if isinstance(raw.get("location"), Mapping) else None
-    )
-    if clean_loc:
-        # Remote peers must never inject local filesystem paths.
-        clean_loc.pop("path", None)
-        if clean_loc:
-            result["location"] = clean_loc
-    clean_ctx = _clean_context(
-        raw.get("context") if isinstance(raw.get("context"), Mapping) else None
-    )
-    if clean_ctx:
-        # Excerpts are strictly local-file CLI artifacts, never remote payloads.
-        clean_ctx.pop("excerpt", None)
-        if clean_ctx:
-            result["context"] = clean_ctx
-    return result
+    raw_loc = raw.get("location")
+    if isinstance(raw_loc, Mapping):
+        safe_loc: dict[str, Any] = {}
+        pointer = _valid_pointer_value(raw_loc.get("pointer"))
+        if pointer is not None:
+            safe_loc["kind"] = "json_pointer"
+            safe_loc["pointer"] = pointer
+        slot = _valid_slot_value(raw_loc.get("slot"))
+        if slot is not None:
+            safe_loc.setdefault("kind", "slot")
+            safe_loc["slot"] = slot
+        op_id = raw_loc.get("operation_id")
+        if isinstance(op_id, str) and op_id.strip():
+            safe_loc["operation_id"] = _truncate(op_id, MAX_SANITISED_TEXT)
+        if spec.code == "XB_JSON_SYNTAX":
+            line = raw_loc.get("line")
+            col = raw_loc.get("column")
+            if type(line) is int and line >= 1:
+                safe_loc.setdefault("kind", "json_parse")
+                safe_loc["line"] = line
+                if type(col) is int and col >= 1:
+                    safe_loc["column"] = col
+        if safe_loc:
+            result["location"] = safe_loc
+    return attach_local_context(result, context)
 
 
 def validation_diagnostic(
-    errors: Sequence[Mapping[str, Any]],
+    errors: Sequence[Any],
     *,
     command_validation: bool = False,
     tea: bool = False,
     context: DiagnosticContext | None = None,
+    trusted: bool = True,
 ) -> dict[str, Any]:
     """Build a canonical diagnostic for recipe or machine-command validation."""
     code = "XB_COMMAND_VALIDATION" if command_validation else "XB_RECIPE_VALIDATION"
-    pointer, summary = _summarize_validation_issue(errors)
+    valid_errors = [item for item in errors if isinstance(item, Mapping)]
+    pointer, summary = _summarize_validation_issue(valid_errors)
     cause = None
     fix = None
-    if errors:
-        first = errors[0]
+    if valid_errors:
+        first = valid_errors[0]
         label = pointer or "/"
         msg = first.get("message")
         if isinstance(msg, str) and msg.strip():
             cause = f"{label}: {msg}"
-        if tea and isinstance(first.get("repair_hint"), str):
+        if trusted and tea and isinstance(first.get("repair_hint"), str):
             fix = first["repair_hint"]
     location: dict[str, Any] = {}
     if pointer is not None:
@@ -923,13 +1250,62 @@ def validation_diagnostic(
     return diagnostic
 
 
+def _preset_write_fix(
+    *,
+    refused: bool,
+    outcome: str | None,
+    state: str | None,
+    retry_allowed: bool | None,
+    recovery_required: bool | None,
+    saved_observed: bool,
+    local_next_step: str | None,
+    trusted: bool,
+) -> str | None:
+    saved = outcome in _SAVED_OUTCOMES or state == "saved" or saved_observed
+    if not refused and (
+        outcome == "saved_cleanup_failed" or (saved and recovery_required is True)
+    ):
+        return (
+            "A save event was observed (not a readback); do not replay this preset "
+            "write. Because post-save cleanup failed and session recovery is "
+            "required, call `machine_disconnect` and inspect `machine_state`, "
+            "`machine_preset_writes`, and the physical machine before any further "
+            "control."
+        )
+    if not refused and recovery_required is True:
+        return (
+            "Session recovery is required: call `machine_disconnect` and inspect "
+            "`machine_state`, `machine_preset_writes`, backup/progress, and the "
+            "physical machine before any further control. Never roll back "
+            "automatically; repeat only an identical single-slot write when "
+            "`retry_allowed` is true."
+        )
+    if not refused and saved:
+        return (
+            "A save event was observed (not a readback); do not replay this preset "
+            "write. Inspect `machine_preset_writes` and `machine_state` before any "
+            "further control."
+        )
+    if refused and state == "saved":
+        return (
+            "Nothing was sent. A save event was already observed (not a readback); "
+            "inspect `machine_preset_writes` and do not replay the write without "
+            "explicit user direction and `acknowledge_incomplete`."
+        )
+    if trusted and local_next_step:
+        return local_next_step
+    return None
+
+
 def preset_write_diagnostic(
     *,
     refused: bool,
     cause: str,
     payload: Mapping[str, Any] | None = None,
     attempt: Mapping[str, Any] | None = None,
+    recovery_required: bool | None = None,
     context: DiagnosticContext | None = None,
+    trusted: bool = True,
 ) -> dict[str, Any]:
     """Build a diagnostic for incomplete or policy-refused preset writes."""
     code = "XB_PRESET_WRITE_REFUSED" if refused else "XB_PRESET_WRITE_INCOMPLETE"
@@ -945,13 +1321,26 @@ def preset_write_diagnostic(
             location["command"] = context.command
         if context.method:
             location["method"] = context.method
+        if context.tool:
+            location["tool"] = context.tool
+
+    outcome: str | None = None
+    state: str | None = None
+    retry_allowed: bool | None = None
+    local_next_step: str | None = None
+    saved_observed = bool(
+        isinstance(payload, Mapping) and payload.get("saved_observed") is True
+    )
+
     if isinstance(source, Mapping):
-        if isinstance(source.get("write_id"), str):
+        if isinstance(source.get("write_id"), str) and source["write_id"].strip():
             summary_bits.append(f"write_id={source['write_id']}")
-        if isinstance(source.get("state"), str):
-            summary_bits.append(f"state={source['state']}")
-        if isinstance(source.get("outcome"), str):
-            summary_bits.append(f"outcome={source['outcome']}")
+        if isinstance(source.get("state"), str) and source["state"].strip():
+            state = source["state"]
+            summary_bits.append(f"state={state}")
+        if isinstance(source.get("outcome"), str) and source["outcome"].strip():
+            outcome = source["outcome"]
+            summary_bits.append(f"outcome={outcome}")
         if (
             type(source.get("attempts_used")) is int
             and type(source.get("max_attempts")) is int
@@ -960,13 +1349,47 @@ def preset_write_diagnostic(
                 f"attempts={source['attempts_used']}/{source['max_attempts']}"
             )
         if type(source.get("retry_allowed")) is bool:
-            summary_bits.append(f"retry_allowed={str(source['retry_allowed']).lower()}")
-    fix = None
-    if isinstance(source, Mapping) and isinstance(source.get("next_step"), str):
-        fix = source["next_step"]
+            retry_allowed = source["retry_allowed"]
+            summary_bits.append(f"retry_allowed={str(retry_allowed).lower()}")
+        if isinstance(source.get("next_step"), str) and source["next_step"].strip():
+            local_next_step = source["next_step"]
+    if outcome is None and isinstance(payload, Mapping):
+        raw_out = payload.get("outcome")
+        if isinstance(raw_out, str) and raw_out.strip():
+            outcome = raw_out
+            summary_bits.append(f"outcome={outcome}")
+    if recovery_required is True:
+        summary_bits.append("recovery_required=true")
+
+    fix = _preset_write_fix(
+        refused=refused,
+        outcome=outcome,
+        state=state,
+        retry_allowed=retry_allowed,
+        recovery_required=recovery_required,
+        saved_observed=saved_observed,
+        local_next_step=local_next_step,
+        trusted=trusted,
+    )
+    resolved_cause = cause
+    if (
+        not refused
+        and (
+            outcome == "saved_cleanup_failed"
+            or (
+                recovery_required is True
+                and (outcome in _SAVED_OUTCOMES or state == "saved" or saved_observed)
+            )
+        )
+        and "save" not in cause.lower()
+    ):
+        resolved_cause = (
+            f"{cause} (save event observed, but post-save cleanup failed; "
+            "session recovery required)"
+        )
     return build_diagnostic(
         code,
-        cause=cause,
+        cause=resolved_cause,
         fix=fix,
         location=location or None,
         context={"summary": "; ".join(summary_bits)} if summary_bits else None,
@@ -976,17 +1399,55 @@ def preset_write_diagnostic(
 def _extract_preset_slot(data: Mapping[str, Any] | None) -> str | None:
     if not isinstance(data, Mapping):
         return None
-    slot = data.get("slot")
-    if isinstance(slot, str):
+    slot = _valid_slot_value(data.get("slot"))
+    if slot:
         return slot
     preset = data.get("preset")
     if isinstance(preset, Mapping):
-        preset_slot = preset.get("slot")
-        if isinstance(preset_slot, str):
+        preset_slot = _valid_slot_value(preset.get("slot"))
+        if preset_slot:
             return preset_slot
     slots = data.get("requested_slots")
-    if isinstance(slots, list) and slots and all(isinstance(s, str) for s in slots):
+    if isinstance(slots, list) and slots and all(s in _VALID_SLOTS for s in slots):
         return ",".join(slots)
+    return None
+
+
+def _map_pointer_to_source(
+    diag_code: str, pointer: str, context: DiagnosticContext
+) -> str | None:
+    """Map a validation pointer to an exact pointer inside a local CLI JSON file."""
+    if not context.allow_excerpt or not context.source_path or not context.source_text:
+        return None
+    if context.source_kind == "recipe_document":
+        return pointer if diag_code == "XB_RECIPE_VALIDATION" else None
+    if context.source_kind == "command_params":
+        if diag_code != "XB_COMMAND_VALIDATION":
+            return None
+        if pointer == "/params":
+            return ""
+        if pointer.startswith("/params/"):
+            return pointer.removeprefix("/params")
+        return None
+    if context.source_kind == "method_params":
+        if diag_code == "XB_COMMAND_VALIDATION" and context.method == "machine_command":
+            return pointer
+        if diag_code == "XB_RECIPE_VALIDATION":
+            if context.method in (
+                "recipe_validate",
+                "recipe_tea_validate",
+                "recipe_preview",
+                "recipe_create",
+                "recipe_update",
+            ):
+                return "/document" if pointer == "" else "/document" + pointer
+            if context.method in ("operation_start", "recipe_upload"):
+                return (
+                    "/request/document"
+                    if pointer == ""
+                    else "/request/document" + pointer
+                )
+        return None
     return None
 
 
@@ -995,21 +1456,18 @@ def _apply_local_pointer_excerpt(
     context: DiagnosticContext,
     pointer: str | None,
 ) -> None:
-    if not context.allow_excerpt or not context.source_path:
+    if pointer is None:
         return
-    location = diagnostic.setdefault("location", {"kind": "json_pointer"})
-    location.setdefault("path", context.source_path)
-    if pointer is None or not context.source_text:
+    lookup_pointer = _map_pointer_to_source(diagnostic["code"], pointer, context)
+    if lookup_pointer is None:
         return
-    # Command validation prefixes pointers with "/params"; strip when locating
-    # inside a CLI --params JSON file whose root is the params object itself.
-    lookup_pointer = pointer
-    if context.parameter == "params" and pointer.startswith("/params"):
-        lookup_pointer = pointer.removeprefix("/params")
+    assert context.source_text is not None and context.source_path is not None
     located = locate_json_pointer_line(context.source_text, lookup_pointer)
     if located is None:
         return
     line, col = located
+    location = diagnostic.setdefault("location", {"kind": "json_pointer"})
+    location["path"] = context.source_path
     location["line"] = line
     location["column"] = col
     excerpt = extract_json_excerpt(context.source_text, line, col)
@@ -1020,7 +1478,7 @@ def _apply_local_pointer_excerpt(
 def attach_local_context(
     diagnostic: dict[str, Any], context: DiagnosticContext | None
 ) -> dict[str, Any]:
-    """Enrich an existing diagnostic with truthful local CLI command/file context."""
+    """Enrich an existing diagnostic with truthful local CLI/RPC/MCP context."""
     if context is None:
         return diagnostic
     enriched = dict(diagnostic)
@@ -1029,10 +1487,17 @@ def attach_local_context(
         location["command"] = context.command
     if context.method and "method" not in location:
         location["method"] = context.method
+    if context.tool and "tool" not in location:
+        location["tool"] = context.tool
     if context.parameter and "parameter" not in location and "pointer" not in location:
         location["parameter"] = context.parameter
     if location and "kind" not in location:
-        location["kind"] = "command" if "command" in location else "method"
+        if "command" in location:
+            location["kind"] = "command"
+        elif "tool" in location:
+            location["kind"] = "tool"
+        else:
+            location["kind"] = "method"
     if location:
         enriched["location"] = location
     pointer = location.get("pointer")
@@ -1051,77 +1516,272 @@ def attach_local_context(
     return enriched
 
 
-def diagnostic_from_detail(
-    detail: Mapping[str, Any], context: DiagnosticContext | None = None
-) -> dict[str, Any]:
-    """Return a canonical diagnostic for any error envelope, including older peers."""
-    existing = detail.get("diagnostic")
-    if isinstance(existing, Mapping):
-        sanitized = sanitize_diagnostic(existing)
-        if sanitized is not None:
-            # Remote envelopes were already stripped by sanitize_diagnostic in
-            # error_detail; preserve already-validated local file path/excerpt.
-            if isinstance(existing.get("location"), Mapping):
-                raw_path = existing["location"].get("path")
-                if isinstance(raw_path, str) and raw_path.strip():
-                    sanitized.setdefault("location", {})["path"] = _truncate(
-                        raw_path, MAX_SANITISED_TEXT
-                    )
-            if isinstance(existing.get("context"), Mapping):
-                clean_ctx = _clean_context(existing["context"])
-                if clean_ctx and "excerpt" in clean_ctx:
-                    sanitized.setdefault("context", {})["excerpt"] = clean_ctx[
-                        "excerpt"
-                    ]
-            return attach_local_context(sanitized, context)
+def _local_fix_for_remote(
+    diag_code: str, details: Mapping[str, Any] | None
+) -> str | None:
+    if (
+        diag_code == "XB_RESPONSE_TOO_LARGE"
+        and isinstance(details, Mapping)
+        and isinstance(details.get("operation_id"), str)
+        and details["operation_id"].strip()
+    ):
+        return (
+            "The operation was accepted. Inspect history_get using operation_id "
+            "or replay the same idempotency key to retrieve it. Never start "
+            "again with a new key."
+        )
+    return None
 
-    error_code = str(detail.get("code") or "internal_error")
-    message = str(detail.get("message") or "")
-    details = detail.get("details")
-    diag_code = _infer_code(error_code, message, details)
-    next_step = detail.get("next_step")
-    location: dict[str, Any] = {}
-    ctx_payload: dict[str, Any] = {}
+
+def rebuild_remote_diagnostic(
+    detail: Mapping[str, Any],
+    *,
+    context: DiagnosticContext | None = None,
+) -> dict[str, Any]:
+    """Rebuild a trusted diagnostic from an enclosing validated remote envelope."""
+    raw_code = detail.get("code")
+    error_code = raw_code if type(raw_code) is str else "internal_error"
+    raw_message = detail.get("message")
+    message = raw_message if isinstance(raw_message, str) else ""
+    raw_details = detail.get("details")
+    details = raw_details if isinstance(raw_details, Mapping) else None
+
+    diag_code = _infer_code(error_code, message, details, context=context)
+    raw_diag = detail.get("diagnostic")
+    if has_valid_diagnostic_types(raw_diag):
+        assert isinstance(raw_diag, Mapping)
+        candidate = raw_diag["code"]
+        if (
+            candidate in CATALOG
+            and candidate not in _LOCAL_ONLY_DIAGNOSTIC_CODES
+            and CATALOG[candidate].error_code == error_code
+        ):
+            # Keep route-consistent sub-classification only.
+            if error_code == "validation_error":
+                if context is not None and context.method == "machine_command":
+                    diag_code = "XB_COMMAND_VALIDATION"
+                elif context is not None and context.method in (
+                    "recipe_validate",
+                    "recipe_tea_validate",
+                    "recipe_preview",
+                    "recipe_create",
+                    "recipe_update",
+                ):
+                    diag_code = "XB_RECIPE_VALIDATION"
+                else:
+                    diag_code = candidate
+            elif candidate == "XB_PRESET_WRITE_REFUSED":
+                if (isinstance(details, Mapping) and "preset_write" in details) or (
+                    context is not None and context.method == "machine_command"
+                ):
+                    diag_code = candidate
+            else:
+                diag_code = candidate
 
     if isinstance(details, Mapping):
         validation = details.get("validation")
-        if isinstance(validation, Mapping) and isinstance(
-            validation.get("errors"), list
+        if (
+            error_code == "validation_error"
+            and isinstance(validation, Mapping)
+            and isinstance(validation.get("errors"), list)
         ):
             return validation_diagnostic(
                 validation["errors"],
                 command_validation=diag_code == "XB_COMMAND_VALIDATION",
                 context=context,
+                trusted=False,
             )
-        if isinstance(details.get("preset_write"), Mapping):
+        if error_code in ("conflict", "preset_write_incomplete") and isinstance(
+            details.get("preset_write"), Mapping
+        ):
             return preset_write_diagnostic(
                 refused=diag_code == "XB_PRESET_WRITE_REFUSED",
                 cause=message or CATALOG[diag_code].default_cause,
                 payload=details["preset_write"],
                 context=context,
+                trusted=False,
             )
-        if isinstance(details.get("operation_id"), str):
+
+    location: dict[str, Any] = {}
+    ctx_payload: dict[str, Any] = {}
+    if isinstance(details, Mapping):
+        op_id = details.get("operation_id")
+        if isinstance(op_id, str) and op_id.strip():
             location["kind"] = "method"
-            location["operation_id"] = details["operation_id"]
-        if isinstance(details.get("errors"), list) and details["errors"]:
-            first = details["errors"][0]
-            if isinstance(first, Mapping) and isinstance(first.get("path"), str):
-                location["kind"] = "json_pointer"
-                location["pointer"] = first["path"]
-                if isinstance(first.get("message"), str):
-                    ctx_payload["summary"] = first["message"]
+            location["operation_id"] = op_id
+        http_status = details.get("http_status")
+        if type(http_status) is int:
+            ctx_payload["summary"] = f"http_status={http_status}"
+        protocol = details.get("protocol")
+        if isinstance(protocol, Mapping):
+            pending = protocol.get("pending_command")
+            if type(pending) is int:
+                location["kind"] = "command"
+                location["command"] = f"protocol:{pending}"
+            proto_bits = [
+                f"{k}={v}"
+                for k, v in protocol.items()
+                if isinstance(k, str)
+                and not _is_sensitive_key(k)
+                and type(v) in (int, float, bool)
+            ][:4]
+            if proto_bits:
+                ctx_payload["summary"] = "; ".join(proto_bits)
+        raw_errors = details.get("errors")
+        if isinstance(raw_errors, list):
+            first_err = next(
+                (item for item in raw_errors if isinstance(item, Mapping)), None
+            )
+            if first_err is not None:
+                ptr = _valid_pointer_value(first_err.get("path"))
+                if ptr is not None:
+                    location["kind"] = "json_pointer"
+                    location["pointer"] = ptr
+                    if isinstance(first_err.get("message"), str):
+                        ctx_payload["summary"] = first_err["message"]
+
+    if diag_code == "XB_JSON_SYNTAX" and has_valid_diagnostic_types(raw_diag):
+        assert isinstance(raw_diag, Mapping)
+        raw_loc = raw_diag.get("location")
+        if isinstance(raw_loc, Mapping) and type(raw_loc.get("line")) is int:
+            location.setdefault("kind", "json_parse")
+            location["line"] = raw_loc["line"]
+            if type(raw_loc.get("column")) is int:
+                location["column"] = raw_loc["column"]
 
     diagnostic = build_diagnostic(
         diag_code,
         cause=message or None,
-        fix=next_step if isinstance(next_step, str) and next_step.strip() else None,
+        fix=_local_fix_for_remote(diag_code, details),
         location=location or None,
         context=ctx_payload or None,
     )
     return attach_local_context(diagnostic, context)
 
 
-def _infer_code(error_code: str, message: str, details: Any) -> str:
+def sanitize_remote_result(
+    method: str,
+    data: Any,
+    *,
+    context: DiagnosticContext | None = None,
+    strict: bool = False,
+) -> Any:
+    """Sanitize and rebuild diagnostics on remote validation or command results."""
+    if not isinstance(data, Mapping):
+        return data
+    if method in ("recipe_validate", "recipe_tea_validate"):
+        cleaned = dict(data)
+        has_diag = "diagnostic" in cleaned and cleaned["diagnostic"] is not None
+        if (
+            has_diag
+            and strict
+            and not has_valid_diagnostic_types(cleaned["diagnostic"])
+        ):
+            raise ValueError("Remote diagnostic contains unexpected nested types")
+        if cleaned.get("valid") is False:
+            if has_diag:
+                raw_errors = cleaned.get("errors")
+                errors = raw_errors if isinstance(raw_errors, list) else []
+                cleaned["diagnostic"] = validation_diagnostic(
+                    errors,
+                    tea=method == "recipe_tea_validate",
+                    context=context,
+                    trusted=False,
+                )
+        else:
+            cleaned.pop("diagnostic", None)
+        return cleaned
+    if method == "machine_command":
+        cleaned = dict(data)
+        has_diag = "diagnostic" in cleaned and cleaned["diagnostic"] is not None
+        if (
+            has_diag
+            and strict
+            and not has_valid_diagnostic_types(cleaned["diagnostic"])
+        ):
+            raise ValueError("Remote diagnostic contains unexpected nested types")
+        if cleaned.get("status") == "failed":
+            if has_diag:
+                payload = (
+                    cleaned.get("details")
+                    if isinstance(cleaned.get("details"), Mapping)
+                    else None
+                )
+                attempt = (
+                    cleaned.get("attempt")
+                    if isinstance(cleaned.get("attempt"), Mapping)
+                    else None
+                )
+                rec_req = (
+                    cleaned.get("recovery_required")
+                    if type(cleaned.get("recovery_required")) is bool
+                    else None
+                )
+                raw_error = cleaned.get("error")
+                cause = (
+                    raw_error
+                    if isinstance(raw_error, str) and raw_error.strip()
+                    else "Preset write did not finish."
+                )
+                cleaned["diagnostic"] = preset_write_diagnostic(
+                    refused=False,
+                    cause=cause,
+                    payload=payload,
+                    attempt=attempt,
+                    recovery_required=rec_req,
+                    context=context,
+                    trusted=False,
+                )
+        else:
+            cleaned.pop("diagnostic", None)
+        return cleaned
+    return data
+
+
+def diagnostic_from_detail(
+    detail: Mapping[str, Any],
+    context: DiagnosticContext | None = None,
+    *,
+    trusted_local: bool = False,
+) -> dict[str, Any]:
+    """Return a canonical diagnostic for any error envelope, including older peers."""
+    if not isinstance(detail, Mapping):
+        return attach_local_context(build_diagnostic("XB_INTERNAL_ERROR"), context)
+    if trusted_local:
+        existing = detail.get("diagnostic")
+        if has_valid_diagnostic_types(existing):
+            assert isinstance(existing, Mapping)
+            code = existing["code"]
+            if code in CATALOG:
+                spec = CATALOG[code]
+                cause = existing.get("cause")
+                fix = existing.get("fix")
+                rebuilt = build_diagnostic(
+                    code,
+                    cause=cause
+                    if isinstance(cause, str) and cause.strip()
+                    else spec.default_cause,
+                    fix=fix
+                    if isinstance(fix, str) and fix.strip()
+                    else spec.default_fix,
+                    location=existing.get("location")
+                    if isinstance(existing.get("location"), Mapping)
+                    else None,
+                    context=existing.get("context")
+                    if isinstance(existing.get("context"), Mapping)
+                    else None,
+                )
+                return attach_local_context(rebuilt, context)
+    return rebuild_remote_diagnostic(detail, context=context)
+
+
+def _infer_code(
+    error_code: str,
+    message: str,
+    details: Any,
+    *,
+    context: DiagnosticContext | None = None,
+) -> str:
     if error_code == "not_found":
         if "Recipe" in message:
             return "XB_RECIPE_NOT_FOUND"
@@ -1130,16 +1790,26 @@ def _infer_code(error_code: str, message: str, details: Any) -> str:
         if "Import" in message:
             return "XB_IMPORT_NOT_FOUND"
         return "XB_NOT_FOUND"
-    if error_code == "validation_error" and isinstance(details, Mapping):
-        validation = details.get("validation")
-        if isinstance(validation, Mapping) and isinstance(
-            validation.get("errors"), list
-        ):
-            errors = validation["errors"]
-            if errors and isinstance(errors[0], Mapping):
-                path = errors[0].get("path")
-                if isinstance(path, str) and path.startswith("/params"):
-                    return "XB_COMMAND_VALIDATION"
+    if error_code == "validation_error":
+        if context is not None and context.method == "machine_command":
+            return "XB_COMMAND_VALIDATION"
+        if isinstance(details, Mapping):
+            validation = details.get("validation")
+            if isinstance(validation, Mapping) and isinstance(
+                validation.get("errors"), list
+            ):
+                first = next(
+                    (
+                        item
+                        for item in validation["errors"]
+                        if isinstance(item, Mapping)
+                    ),
+                    None,
+                )
+                if first is not None:
+                    path = first.get("path")
+                    if isinstance(path, str) and path.startswith("/params"):
+                        return "XB_COMMAND_VALIDATION"
         return "XB_RECIPE_VALIDATION"
     if error_code == "conflict" and isinstance(details, Mapping):
         if "preset_write" in details:
@@ -1215,10 +1885,15 @@ def _render_excerpt(excerpt: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def render_human_diagnostic(
-    detail: Mapping[str, Any], *, context: DiagnosticContext | None = None
+    detail: Mapping[str, Any],
+    *,
+    context: DiagnosticContext | None = None,
+    trusted_local: bool = False,
 ) -> str:
     """Format a plain-text Solid-inspired diagnostic block for human stderr."""
-    diagnostic = diagnostic_from_detail(detail, context=context)
+    diagnostic = diagnostic_from_detail(
+        detail, context=context, trusted_local=trusted_local
+    )
     code = diagnostic["code"]
     cause = diagnostic["cause"]
     fix = diagnostic["fix"]
@@ -1238,15 +1913,18 @@ def render_human_diagnostic(
         meta.append(f"Location: {loc_text}")
     if isinstance(ctx, Mapping) and isinstance(ctx.get("summary"), str):
         meta.append(f"Context: {ctx['summary']}")
-    correlation_id = detail.get("correlation_id")
+    correlation_id = (
+        detail.get("correlation_id") if isinstance(detail, Mapping) else None
+    )
     if isinstance(correlation_id, str) and correlation_id:
         meta.append(f"Correlation ID: {correlation_id}")
     if meta:
         blocks.append("\n".join(meta))
 
-    guide_line = f"{guide['local']} - {guide['url']}"
+    guide_line = f"{guide['url']} (repo checkout: {guide['local']}"
     if "skill" in guide:
-        guide_line += f" (skill: {guide['skill']})"
+        guide_line += f"; skill: {guide['skill']}"
+    guide_line += ")"
 
     blocks.append(
         "\n".join(

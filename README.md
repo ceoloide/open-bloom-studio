@@ -200,11 +200,13 @@ Errors from the CLI, daemon RPC, SSH relay and MCP server keep their stable
 machine `error.code` and exit status `2`, and include a structured
 `error.diagnostic` object with a stable code (such as `XB_RECIPE_NOT_FOUND` or
 `XB_RECIPE_VALIDATION`), plain cause, truthful location, concrete fix,
-documentation link and agent repair guide. On an interactive terminal,
-`xbloom-studio` prints a plain-text diagnostic block on `stderr` (with a minimal
-redacted excerpt for local JSON files when safe); non-TTY callers keep JSON on
-`stderr`. Override the stderr format explicitly with `--error-format human` or
-`--error-format json`, for example
+canonical documentation URL and agent repair guide (with repository
+checkout-relative paths clearly labeled alongside canonical URLs). On an
+interactive terminal, `xbloom-studio` prints a plain-text diagnostic block on
+`stderr` (with a minimal fail-closed redacted excerpt for local JSON files when
+safe); non-TTY callers keep JSON on `stderr`. Override the stderr format
+explicitly with the global option `--error-format human` or
+`--error-format json` before the subcommand, for example
 `xbloom-studio --error-format human recipe get missing-id`. See
 [docs/diagnostics.md](docs/diagnostics.md) for the complete per-code catalog
 and agent repair guides.

@@ -418,6 +418,7 @@ class MachineCommandAPI:
                             refused=False,
                             cause=str(exc),
                             payload=exc.result,
+                            recovery_required=session._uncertain,
                         ),
                     }
                 except BaseException as exc:
@@ -702,6 +703,7 @@ class MachineCommandAPI:
                 cause=str(result.get("error") or "Preset write did not finish."),
                 payload=result.get("details"),
                 attempt=result["attempt"],
+                recovery_required=result.get("recovery_required"),
             )
         return result
 

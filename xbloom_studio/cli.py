@@ -15,24 +15,30 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import signal
 import sys
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
+from .command_schema import CommandValidationError
 from .connector import Connector, normalize_identity
 from .diagnostics import (
     DiagnosticContext,
     InputFileReadError,
     LocalJsonSyntaxError,
+    build_diagnostic,
+    preset_write_diagnostic,
     render_human_diagnostic,
 )
 from .errors import error_detail
 from .facade import PURE_METHODS, Application, bind_parameters
 from .grind_profiles import grind_profile
 from .provider_exports import load_export
+from .recipe_validation import RecipeValidationError
 from .rpc import LocalServer, call, default_socket, socket_path_exists
+from .rpc_types import RemoteError
 from .serialization import dumps
 from .storage import ConflictError, Store
 from .tea_guidance import FAMILIES
@@ -67,8 +73,56 @@ SIMULATOR_OPTIONS = {"settle": 0, "subscription_settle": 0, "transition_delay": 
 Invoke = Callable[..., Awaitable[Any]]
 
 
-def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+_GLOBAL_VALUE_OPTIONS = frozenset(
+    {
+        "--db",
+        "--socket",
+        "--ssh",
+        "--ssh-config",
+        "--device",
+        "--connector",
+        "--error-format",
+    }
+)
+_GLOBAL_FLAG_OPTIONS = frozenset({"--direct"})
+_GLOBAL_OPTIONS = _GLOBAL_VALUE_OPTIONS | _GLOBAL_FLAG_OPTIONS
+_ERROR_FORMATS = frozenset({"auto", "json", "human"})
+
+_ARGPARSE_REQUIRED = re.compile(r"^the following arguments are required: .+$")
+_ARGPARSE_EXPECTED = re.compile(
+    r"^argument (--?[A-Za-z0-9_-]+(?:/--?[A-Za-z0-9_-]+)*): expected .+$"
+)
+_ARGPARSE_INVALID_VALUE = re.compile(
+    r"^argument (--?[A-Za-z0-9_-]+(?:/--?[A-Za-z0-9_-]+)*): "
+    r"invalid ([A-Za-z0-9_]+) value:.*$"
+)
+_ARGPARSE_ARG_CHOICE = re.compile(
+    r"^argument (--?[A-Za-z0-9_-]+(?:/--?[A-Za-z0-9_-]+)*): "
+    r"invalid choice: .* (\((?:choose from .*)\))$"
+)
+_ARGPARSE_POS_CHOICE = re.compile(r"^invalid choice: .* (\((?:choose from .*)\))$")
+
+
+class _CliParseError(ValueError):
+    """Structured CLI argument parse failure intercepted by :func:`main`."""
+
+    def __init__(self, message: str, *, prog: str) -> None:
+        super().__init__(message)
+        self.prog = prog
+
+
+class _DiagnosticArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser variant that hands parse errors to canonical diagnostics."""
+
+    def error(self, message: str) -> NoReturn:
+        raise _CliParseError(message, prog=self.prog)
+
+
+def parser(*, raise_on_error: bool = False) -> argparse.ArgumentParser:
+    parser_cls: type[argparse.ArgumentParser] = (
+        _DiagnosticArgumentParser if raise_on_error else argparse.ArgumentParser
+    )
+    p = parser_cls(
         prog="xbloom-studio",
         description=(
             "xbloom-studio recipes, complete history and owned machine operations"
@@ -342,6 +396,7 @@ class _SourceTracker:
         self.path: str | None = None
         self.text: str | None = None
         self.parameter: str | None = None
+        self.source_kind: str | None = None
         self.allow_excerpt: bool = False
 
     def record(
@@ -350,11 +405,13 @@ class _SourceTracker:
         text: str,
         *,
         parameter: str = "file",
+        source_kind: str | None = None,
         allow_excerpt: bool = True,
     ) -> None:
         self.path = path
         self.text = text
         self.parameter = parameter
+        self.source_kind = source_kind
         self.allow_excerpt = allow_excerpt
 
 
@@ -362,6 +419,144 @@ def _effective_error_format(choice: str) -> str:
     if choice in ("json", "human"):
         return choice
     return "human" if bool(getattr(sys.stderr, "isatty", lambda: False)()) else "json"
+
+
+def _subcommand_tree(p: argparse.ArgumentParser) -> dict[str, set[str]]:
+    tree: dict[str, set[str]] = {}
+    for action in p._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for cmd_name, subparser in action.choices.items():
+                nested: set[str] = set()
+                for sub_action in subparser._actions:
+                    if isinstance(sub_action, argparse._SubParsersAction):
+                        nested.update(sub_action.choices.keys())
+                tree[cmd_name] = nested
+    return tree
+
+
+def _scan_cli_args(
+    args: Sequence[str], p: argparse.ArgumentParser
+) -> tuple[str, str | None, bool]:
+    """Extract global --error-format, known subcommand, and trailing global flag."""
+    tree = _subcommand_tree(p)
+    error_format = "auto"
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            return error_format, None, False
+        if token.startswith("--error-format="):
+            val = token.partition("=")[2]
+            if val in _ERROR_FORMATS:
+                error_format = val
+            index += 1
+            continue
+        if token == "--error-format":
+            if index + 1 < len(args) and not args[index + 1].startswith("-"):
+                if args[index + 1] in _ERROR_FORMATS:
+                    error_format = args[index + 1]
+                index += 2
+            else:
+                index += 1
+            continue
+        if token in _GLOBAL_VALUE_OPTIONS:
+            index += 2 if index + 1 < len(args) else 1
+            continue
+        if any(token.startswith(opt + "=") for opt in _GLOBAL_VALUE_OPTIONS):
+            index += 1
+            continue
+        if token in _GLOBAL_FLAG_OPTIONS:
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        break
+
+    known_cmd: str | None = None
+    if index < len(args) and args[index] in tree:
+        top = args[index]
+        known_cmd = top
+        index += 1
+        if index < len(args) and args[index] in tree[top]:
+            known_cmd = f"{top} {args[index]}"
+            index += 1
+
+    trailing_global = False
+    for token in args[index:]:
+        if token == "--":
+            break
+        if token in _GLOBAL_OPTIONS or any(
+            token.startswith(opt + "=") for opt in _GLOBAL_VALUE_OPTIONS
+        ):
+            trailing_global = True
+            break
+    return error_format, known_cmd, trailing_global
+
+
+def _sanitize_argparse_message(message: str, *, trailing_global: bool) -> str:
+    """Remove raw CLI argument values from argparse error messages."""
+    text = message.strip()
+    if _ARGPARSE_REQUIRED.fullmatch(text):
+        return text
+    if _ARGPARSE_EXPECTED.fullmatch(text):
+        return text
+    invalid_val = _ARGPARSE_INVALID_VALUE.fullmatch(text)
+    if invalid_val:
+        return f"argument {invalid_val.group(1)}: invalid {invalid_val.group(2)} value"
+    arg_choice = _ARGPARSE_ARG_CHOICE.fullmatch(text)
+    if arg_choice:
+        return f"argument {arg_choice.group(1)}: invalid choice {arg_choice.group(2)}"
+    pos_choice = _ARGPARSE_POS_CHOICE.fullmatch(text)
+    if pos_choice:
+        return f"invalid choice {pos_choice.group(1)}"
+    if text.startswith("unrecognized arguments:"):
+        if trailing_global:
+            return (
+                "Unrecognized command-line arguments; global options such as "
+                "--error-format must precede the subcommand."
+            )
+        return "Unrecognized command-line arguments."
+    if "not allowed with argument" in text:
+        return text
+    return "Invalid command-line arguments."
+
+
+def _parse_error_detail(
+    exc: _CliParseError, args: Sequence[str], p: argparse.ArgumentParser
+) -> tuple[str, dict[str, Any], DiagnosticContext | None]:
+    error_format, known_cmd, trailing_global = _scan_cli_args(args, p)
+    if exc.prog.startswith("xbloom-studio "):
+        prog_cmd = exc.prog.removeprefix("xbloom-studio ").strip()
+        if prog_cmd:
+            known_cmd = prog_cmd
+    cause = _sanitize_argparse_message(str(exc), trailing_global=trailing_global)
+    if known_cmd:
+        fix = (
+            f"Run `xbloom-studio {known_cmd} --help` to check required arguments "
+            "and options."
+        )
+    else:
+        fix = (
+            "Run `xbloom-studio --help` to check available subcommands and "
+            "global options."
+        )
+    if trailing_global:
+        fix += " Pass global options such as `--error-format` before the subcommand."
+    ctx = DiagnosticContext(command=known_cmd) if known_cmd else None
+    loc = {"kind": "command", "command": known_cmd} if known_cmd else None
+    detail: dict[str, Any] = {
+        "type": "ArgumentError",
+        "code": "invalid_argument",
+        "message": cause,
+        "details": {},
+        "next_step": fix,
+        "retryable": False,
+        "diagnostic": build_diagnostic(
+            "XB_INVALID_ARGUMENT", cause=cause, fix=fix, location=loc
+        ),
+    }
+    return error_format, detail, ctx
 
 
 def _command_label(a: argparse.Namespace) -> str:
@@ -421,21 +616,55 @@ def _command_parameter(a: argparse.Namespace) -> str | None:
     return None
 
 
+def _is_file_error(exc: BaseException | None, result_code: str | None = None) -> bool:
+    if result_code == "validation_error":
+        return True
+    if isinstance(
+        exc,
+        (
+            LocalJsonSyntaxError,
+            InputFileReadError,
+            RecipeValidationError,
+            CommandValidationError,
+        ),
+    ):
+        return True
+    if (
+        isinstance(exc, RemoteError)
+        and isinstance(exc.detail, dict)
+        and exc.detail.get("code") == "validation_error"
+    ):
+        return True
+    return False
+
+
 def _command_context(
-    a: argparse.Namespace, tracker: _SourceTracker | None = None
+    a: argparse.Namespace,
+    tracker: _SourceTracker | None = None,
+    *,
+    exc: BaseException | None = None,
+    result_code: str | None = None,
 ) -> DiagnosticContext:
+    use_file = (
+        tracker is not None
+        and tracker.path is not None
+        and _is_file_error(exc, result_code)
+    )
     parameter = (
         tracker.parameter
-        if tracker is not None and tracker.parameter is not None
+        if use_file and tracker is not None and tracker.parameter is not None
         else _command_parameter(a)
     )
     return DiagnosticContext(
         command=_command_label(a),
         method=tracker.method if tracker is not None else None,
         parameter=parameter,
-        source_path=tracker.path if tracker is not None else None,
-        source_text=tracker.text if tracker is not None else None,
-        allow_excerpt=tracker.allow_excerpt if tracker is not None else False,
+        source_path=tracker.path if use_file and tracker is not None else None,
+        source_text=tracker.text if use_file and tracker is not None else None,
+        source_kind=tracker.source_kind if use_file and tracker is not None else None,
+        allow_excerpt=tracker.allow_excerpt
+        if use_file and tracker is not None
+        else False,
     )
 
 
@@ -445,20 +674,126 @@ def _emit_human_result_diagnostic(
     code: str,
     fallback_message: str,
     tracker: _SourceTracker | None,
+    *,
+    remote: bool = False,
 ) -> None:
     if _effective_error_format(getattr(a, "error_format", "auto")) != "human":
         return
-    envelope: dict[str, Any] = {
+    context = _command_context(a, tracker, result_code=code)
+    if code == "preset_write_incomplete":
+        raw_details = result.get("details")
+        payload = raw_details if isinstance(raw_details, Mapping) else None
+        raw_attempt = result.get("attempt")
+        attempt = raw_attempt if isinstance(raw_attempt, Mapping) else None
+        rec_req = (
+            result.get("recovery_required")
+            if type(result.get("recovery_required")) is bool
+            else None
+        )
+        cause = (
+            result["error"]
+            if isinstance(result.get("error"), str) and result["error"].strip()
+            else fallback_message
+        )
+        envelope: dict[str, Any] = {
+            "code": code,
+            "message": cause,
+            "details": {"preset_write": payload or {}},
+            "diagnostic": preset_write_diagnostic(
+                refused=False,
+                cause=cause,
+                payload=payload,
+                attempt=attempt,
+                recovery_required=rec_req,
+                context=context,
+                trusted=not remote,
+            ),
+        }
+        print(
+            render_human_diagnostic(envelope, context=context, trusted_local=True),
+            file=sys.stderr,
+        )
+        return
+    envelope = {
         "code": code,
         "message": str(result.get("error") or fallback_message),
-        "details": {"validation": result}
-        if code == "validation_error"
-        else {"preset_write": result.get("details") or {}},
+        "details": {"validation": result},
     }
-    if "diagnostic" in result:
+    if not remote and "diagnostic" in result:
         envelope["diagnostic"] = result["diagnostic"]
     print(
-        render_human_diagnostic(envelope, context=_command_context(a, tracker)),
+        render_human_diagnostic(envelope, context=context, trusted_local=not remote),
+        file=sys.stderr,
+    )
+
+
+def _emit_human_operation_diagnostic(
+    a: argparse.Namespace,
+    result: Mapping[str, Any],
+    tracker: _SourceTracker | None,
+) -> None:
+    if _effective_error_format(getattr(a, "error_format", "auto")) != "human":
+        return
+    status = str(result.get("status") or "unknown")
+    op_id = result.get("id")
+    op_id_str = op_id if isinstance(op_id, str) and op_id.strip() else None
+    context = _command_context(a, tracker)
+    location: dict[str, Any] = {"kind": "command", "command": _command_label(a)}
+    if tracker is not None and tracker.method:
+        location["method"] = tracker.method
+    if op_id_str is not None:
+        location["operation_id"] = op_id_str
+
+    summary_bits = [f"status={status}"]
+    reason: str | None = None
+    outcome = result.get("result")
+    if isinstance(outcome, Mapping):
+        for key in ("reason", "error"):
+            val = outcome.get(key)
+            if isinstance(val, str) and val.strip():
+                reason = val.strip()
+                break
+        cleanup = outcome.get("cleanup_status")
+        if isinstance(cleanup, str) and cleanup.strip():
+            summary_bits.append(f"cleanup_status={cleanup.strip()}")
+        steps = outcome.get("steps")
+        if reason is None and isinstance(steps, list):
+            for step in steps:
+                if isinstance(step, Mapping):
+                    step_err = step.get("error")
+                    if isinstance(step_err, str) and step_err.strip():
+                        reason = step_err.strip()
+                        break
+
+    if status == "unknown":
+        cause = (
+            "Watched operation ended with status 'unknown'; physical effects "
+            "may be uncertain."
+        )
+    else:
+        cause = f"Watched operation ended with status '{status}'."
+    if reason:
+        cause = f"{cause} {reason}"
+
+    if op_id_str is not None:
+        fix = (
+            f"Inspect read-only `xbloom-studio history get {op_id_str}`, "
+            f"`xbloom-studio history events {op_id_str}`, `xbloom-studio machine "
+            "state`, and the physical machine. Never automatically replay a "
+            "start with a new idempotency key."
+        )
+    else:
+        fix = None
+    diag = build_diagnostic(
+        "XB_OPERATION_FAILED",
+        cause=cause,
+        fix=fix,
+        location=location,
+        context={"summary": "; ".join(summary_bits)},
+    )
+    envelope = {"code": "operation_failed", "message": cause, "diagnostic": diag}
+    print(
+        render_human_diagnostic(envelope, context=context, trusted_local=True),
         file=sys.stderr,
     )
 
@@ -468,10 +803,17 @@ def load(
     tracker: _SourceTracker | None = None,
     *,
     parameter: str = "file",
+    source_kind: str | None = None,
     allow_excerpt: bool = True,
 ) -> Any:
     if tracker is not None:
-        tracker.record(str(path), "", parameter=parameter, allow_excerpt=allow_excerpt)
+        tracker.record(
+            str(path),
+            "",
+            parameter=parameter,
+            source_kind=source_kind,
+            allow_excerpt=allow_excerpt,
+        )
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
@@ -480,7 +822,11 @@ def load(
         ) from exc
     if tracker is not None:
         tracker.record(
-            str(path), text, parameter=parameter, allow_excerpt=allow_excerpt
+            str(path),
+            text,
+            parameter=parameter,
+            source_kind=source_kind,
+            allow_excerpt=allow_excerpt,
         )
     try:
         return json.loads(text)
@@ -499,7 +845,12 @@ def _recipe_source(
         return {"kind": "recipe", "reference": a.reference, "revision": a.revision}
     if a.revision is not None:
         raise ValueError("--revision requires a saved recipe reference")
-    return {"kind": "recipe", "document": load(a.file, tracker, parameter="file")}
+    return {
+        "kind": "recipe",
+        "document": load(
+            a.file, tracker, parameter="file", source_kind="recipe_document"
+        ),
+    }
 
 
 def _recipe_route(
@@ -510,16 +861,18 @@ def _recipe_route(
         return "recipe_tea_references", {"family": a.family}
     if action == "tea-validate":
         return "recipe_tea_validate", {
-            "document": load(a.file, tracker),
+            "document": load(a.file, tracker, source_kind="recipe_document"),
             "expected_output_ml": a.expected_output_ml,
         }
     if action in ("preview", "validate"):
-        return "recipe_" + action, {"document": load(a.file, tracker)}
+        return "recipe_" + action, {
+            "document": load(a.file, tracker, source_kind="recipe_document")
+        }
     if action in ("constraints", "templates"):
         return "recipe_" + action, {}
     if action == "examples":
         return "recipe_examples", {
-            "coffee": load(a.file, tracker),
+            "coffee": load(a.file, tracker, source_kind="coffee_input"),
             "water_ml": a.water_ml,
             "limit": a.limit,
         }
@@ -528,13 +881,13 @@ def _recipe_route(
         return "recipe_validate", {"document": document}
     if action == "create":
         return "recipe_create", {
-            "document": load(a.file, tracker),
+            "document": load(a.file, tracker, source_kind="recipe_document"),
             "temporary": a.temporary,
         }
     if action == "update":
         return "recipe_update", {
             "reference": a.reference,
-            "document": load(a.file, tracker),
+            "document": load(a.file, tracker, source_kind="recipe_document"),
             "expected_revision": a.expected_revision,
         }
     if action in ("get", "compile"):
@@ -572,7 +925,10 @@ def _recipe_route(
     if action == "search-online":
         return "provider_search", {"query": a.query, "page": a.page}
     limit = {"limit": a.limit} if a.limit is not None else {}
-    return "recipe_match", {"coffee": load(a.file, tracker), **limit}
+    return "recipe_match", {
+        "coffee": load(a.file, tracker, source_kind="coffee_input"),
+        **limit,
+    }
 
 
 def _machine_route(
@@ -581,7 +937,11 @@ def _machine_route(
     if a.action == "command":
         return "machine_command", {
             "command": a.machine_command,
-            "params": load(a.params, tracker, parameter="params") if a.params else {},
+            "params": load(
+                a.params, tracker, parameter="params", source_kind="command_params"
+            )
+            if a.params
+            else {},
             "allow_control": a.allow_control,
             "allow_untested": a.allow_untested,
         }
@@ -630,7 +990,9 @@ def route(
     if a.command == "call":
         return (
             a.method,
-            load(a.params, tracker, parameter="params") if a.params else {},
+            load(a.params, tracker, parameter="params", source_kind="method_params")
+            if a.params
+            else {},
         )
     if a.command == "recipe":
         return _recipe_route(a, tracker)
@@ -884,7 +1246,12 @@ async def _execute(
     if method in ("recipe_validate", "recipe_tea_validate"):
         if not result["valid"]:
             _emit_human_result_diagnostic(
-                a, result, "validation_error", "Recipe validation failed.", tracker
+                a,
+                result,
+                "validation_error",
+                "Recipe validation failed.",
+                tracker,
+                remote=remote,
             )
             return 2
         return 0
@@ -895,6 +1262,7 @@ async def _execute(
             "preset_write_incomplete",
             "Machine command reported failure.",
             tracker,
+            remote=remote,
         )
         return 2
     started = method in ("operation_start", "recipe_start_uploaded")
@@ -916,7 +1284,27 @@ async def _execute(
         if text != last:
             output(result)
             last = text
+    if result["status"] in ("failed", "unknown"):
+        _emit_human_operation_diagnostic(a, result, tracker)
     return 0 if result["status"] == "completed" else 2
+
+
+def _emit_cli_error(
+    error_format: str,
+    detail: Mapping[str, Any],
+    context: DiagnosticContext | None,
+    *,
+    trusted_local: bool,
+) -> None:
+    if _effective_error_format(error_format) == "human":
+        print(
+            render_human_diagnostic(
+                detail, context=context, trusted_local=trusted_local
+            ),
+            file=sys.stderr,
+        )
+    else:
+        print(dumps({"ok": False, "error": detail}), file=sys.stderr)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -925,20 +1313,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .ssh_rpc import main as relay_main
 
         return relay_main(args[1:])
-    parsed = parser().parse_args(args)
+    p = parser(raise_on_error=True)
+    try:
+        parsed = p.parse_args(args)
+    except _CliParseError as exc:
+        error_format, detail, context = _parse_error_detail(exc, args, p)
+        _emit_cli_error(error_format, detail, context, trusted_local=True)
+        return 2
     tracker = _SourceTracker()
     try:
         return asyncio.run(run(parsed, _tracker=tracker))
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
-        context = _command_context(parsed, tracker)
+        context = _command_context(parsed, tracker, exc=exc)
         detail = error_detail(exc, log_unexpected=False, context=context)
-        if _effective_error_format(parsed.error_format) == "human":
-            print(
-                render_human_diagnostic(detail, context=context),
-                file=sys.stderr,
-            )
-        else:
-            print(dumps({"ok": False, "error": detail}), file=sys.stderr)
+        _emit_cli_error(
+            parsed.error_format,
+            detail,
+            context,
+            trusted_local=not isinstance(exc, RemoteError),
+        )
         return 2

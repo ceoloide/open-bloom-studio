@@ -123,7 +123,11 @@ def create_server(  # noqa: C901 - one registration per tool
     except ImportError as exc:
         raise RuntimeError("Install xbloom-studio with the mcp extra") from exc
     from .command_schema import command_schema, validate_command_params
-    from .diagnostics import DiagnosticContext, build_diagnostic
+    from .diagnostics import (
+        DiagnosticContext,
+        build_diagnostic,
+        sanitize_remote_result,
+    )
     from .errors import error_detail
 
     class ContractServer(MCPServer):
@@ -240,6 +244,9 @@ def create_server(  # noqa: C901 - one registration per tool
                 return self.result({"error": error_detail(exc, context=tool_ctx)}, True)
             try:
                 normalized = {"result": value} if isinstance(value, list) else value
+                normalized = sanitize_remote_result(
+                    name, normalized, context=tool_ctx, strict=True
+                )
                 validated = outputs.model_validate(normalized)
                 data = validated.model_dump(mode="json", exclude_unset=True)
                 failed = name == "machine_command" and data.get("status") == "failed"

@@ -490,6 +490,61 @@ Warning = model(
     code=(str, ..., "Stable evidence/compatibility warning code."),
     message=(str, ..., "Evidence limitation or preparation warning."),
 )
+
+
+class DiagnosticRepairGuide(Input):
+    local: str = Field(
+        description=(
+            "Repository checkout-relative path and anchor to the agent repair guide."
+        )
+    )
+    url: str = Field(
+        description="Canonical documentation URL for the agent repair guide."
+    )
+    skill: str | None = Field(
+        None,
+        description="Optional repository checkout-relative skill path and anchor.",
+    )
+
+
+class DiagnosticLocation(Input):
+    kind: str | None = None
+    command: str | None = None
+    method: str | None = None
+    tool: str | None = None
+    parameter: str | None = None
+    pointer: str | None = None
+    path: str | None = None
+    line: int | None = Field(None, ge=1)
+    column: int | None = Field(None, ge=1)
+    slot: str | None = None
+    operation_id: str | None = None
+
+
+class DiagnosticExcerptLine(Input):
+    line: int = Field(ge=1)
+    text: str
+    highlight: bool
+    column: int | None = Field(None, ge=1)
+
+
+class DiagnosticContextInfo(Input):
+    summary: str | None = None
+    excerpt: list[DiagnosticExcerptLine] | None = None
+
+
+class CanonicalDiagnostic(Input):
+    code: str = Field(description="Stable canonical XB_* diagnostic identifier.")
+    cause: str = Field(description="Plain-language cause.")
+    fix: str = Field(description="Concrete, safe next action.")
+    docs_url: str = Field(description="Canonical per-code documentation URL.")
+    repair_guide: DiagnosticRepairGuide = Field(
+        description="Canonical and checkout-relative agent repair links."
+    )
+    location: DiagnosticLocation | None = None
+    context: DiagnosticContextInfo | None = None
+
+
 Validation = model(
     "RecipeValidation",
     valid=(bool, ..., "Whether the document passes all applicable checks."),
@@ -506,7 +561,7 @@ Validation = model(
         "Whether execution compilation is supported; not hardware verification.",
     ),
     diagnostic=(
-        optional(dict[str, Any]),
+        optional(CanonicalDiagnostic),
         None,
         "Canonical diagnostic with stable code, location, fix and documentation "
         "links when validation fails.",
@@ -690,7 +745,7 @@ class CommandOutcome(Output):
         None,
         description="Temporally correlated save event; not stored contents readback.",
     )
-    diagnostic: dict[str, Any] | None = Field(
+    diagnostic: CanonicalDiagnostic | None = Field(
         None,
         description="Canonical diagnostic with stable code, location, fix and "
         "documentation links when a command reports failure.",

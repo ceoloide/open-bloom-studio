@@ -24,7 +24,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from .diagnostics import DiagnosticContext
+from .diagnostics import DiagnosticContext, sanitize_remote_result
 from .errors import error_detail
 from .rpc import call
 from .rpc_types import RemoteError
@@ -199,8 +199,15 @@ async def ssh_call(
                     "operation_lookup/history before any new start"
                 ) from exc
             if not result["ok"]:
-                raise RemoteError(result["error"])
-            return result["data"]
+                raise RemoteError(
+                    error_detail(
+                        RemoteError(result["error"]),
+                        context=DiagnosticContext(method=method),
+                    )
+                )
+            return sanitize_remote_result(
+                method, result["data"], context=DiagnosticContext(method=method)
+            )
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise ConnectionError(
                 "SSH RPC connection closed; inspect operation_lookup/history before "

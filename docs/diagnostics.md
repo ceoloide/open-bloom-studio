@@ -20,9 +20,11 @@ include a canonical `diagnostic` object.
     JSON file line/column (omitted when unknown; never fabricated)
   - `fix` — concrete, safe next action
   - `docs_url` — canonical link to this reference
-  - `repair_guide` — local and remote links to the agent repair section (plus
-    the matching repository skill when applicable)
-  - `context` — optional bounded summary or minimal redacted local JSON excerpt
+  - `repair_guide` — repository checkout-relative (`local`, and optional
+    `skill`) and canonical remote (`url`) links to the agent repair section
+  - `context` — optional bounded summary or minimal fail-closed redacted local
+    JSON excerpt (omitted when malformed source cannot be proven safe; raw
+    rejected strings are never echoed)
 - **Human stderr display:**
   Pass `--error-format human` to render a plain-text Solid-style diagnostic
   block on `stderr` (with a 1-to-3-line minimal source excerpt for local JSON
@@ -66,6 +68,7 @@ include a canonical `diagnostic` object.
 | [`XB_RESPONSE_TOO_LARGE`](#xb_response_too_large) | `response_too_large` | RPC response exceeded transport frame limit | [Agent repair](#xb_response_too_large-agent-repair) |
 | [`XB_MCP_UNKNOWN_TOOL`](#xb_mcp_unknown_tool) | `unknown_tool` | MCP tool not registered in configured groups | [Agent repair](#xb_mcp_unknown_tool-agent-repair) |
 | [`XB_MCP_OUTPUT_CONTRACT`](#xb_mcp_output_contract) | `output_contract_error` | Application returned unexpected output shape | [Agent repair](#xb_mcp_output_contract-agent-repair) |
+| [`XB_OPERATION_FAILED`](#xb_operation_failed) | `operation_failed` | Watched machine operation ended failed or unknown | [Agent repair](#xb_operation_failed-agent-repair) |
 | [`XB_INTERNAL_ERROR`](#xb_internal_error) | `internal_error` | Unexpected internal error with correlation ID | [Agent repair](#xb_internal_error-agent-repair) |
 
 ---
@@ -246,9 +249,10 @@ include a canonical `diagnostic` object.
 
 ### XB_PRESET_WRITE_INCOMPLETE agent repair
 
-1. Preserve every reported detail (`backup`, `details`, `attempt.write_id`, `attempt.outcome`, `attempt.retry_allowed`, `attempt.next_step`).
+1. Preserve every reported detail (`backup`, `details`, `attempt.write_id`, `attempt.outcome`, `attempt.retry_allowed`, `attempt.next_step`, `recovery_required`).
 2. Call `machine_preset_writes` (`xbloom-studio machine preset-writes`) and `machine_state` to inspect journaled evidence.
-3. Follow `attempt.next_step`: repeat only an identical single-slot `write_preset` after `machine_disconnect` when `retry_allowed` is `true` and authorized; never auto-retry a batch `write_presets` or roll back automatically.
+3. When `attempt.outcome` is `saved_cleanup_failed` (or a save event was observed with `recovery_required: true`), recognize that a save event was observed (not a readback) so do **not** replay the preset write; call `machine_disconnect` (`xbloom-studio machine disconnect`) and inspect `machine_state`, `machine_preset_writes`, and the physical machine before any further control.
+4. Otherwise follow `attempt.next_step`: repeat only an identical single-slot `write_preset` after `machine_disconnect` when `retry_allowed` is `true` and authorized; never auto-retry a batch `write_presets` or roll back automatically.
 
 ## XB_MACHINE_BUSY
 
@@ -423,6 +427,19 @@ include a canonical `diagnostic` object.
 1. Preserve `correlation_id` and any `details.operation_id`.
 2. Call read-only `history_get` (if `operation_id` is present), `operation_lookup` with the original idempotency key, and `machine_state`.
 3. Never retry a physical start automatically; report the contract mismatch and correlation ID so the operator can inspect server logs.
+
+## XB_OPERATION_FAILED
+
+- **Machine code:** `operation_failed` (CLI watched-operation terminal diagnostic)
+- **Meaning:** A watched operation (`brew --wait`, `water --wait`, `grind --wait`, `--direct`, or `operation watch`) terminated with status `failed` or `unknown`.
+- **Location:** Invoking CLI command and durable `operation_id`.
+- **Fix:** Inspect read-only `history_get`, `history_events`, `machine_state`, and the physical machine. Never automatically replay a start with a new idempotency key.
+
+### XB_OPERATION_FAILED agent repair
+
+1. Preserve the reported `operation_id` and run read-only `history_get` (`xbloom-studio history get ID`), `history_events` (`xbloom-studio history events ID`), and `machine_state` (`xbloom-studio machine state`).
+2. Check the physical machine before sending any further control command; when status is `unknown` or cleanup failed, physical effects may be uncertain.
+3. Never automatically replay a start or invent a new idempotency key; wait for fresh state and explicit user direction.
 
 ## XB_INTERNAL_ERROR
 

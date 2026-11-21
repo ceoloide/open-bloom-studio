@@ -21,11 +21,10 @@ from .diagnostics import (
     DiagnosticContext,
     InputFileReadError,
     LocalJsonSyntaxError,
-    attach_local_context,
     build_diagnostic,
     extract_json_excerpt,
     preset_write_diagnostic,
-    sanitize_diagnostic,
+    rebuild_remote_diagnostic,
     validation_diagnostic,
 )
 from .machine_controls import PresetWriteError, UntestedOperationError
@@ -144,6 +143,44 @@ def _internal(context: DiagnosticContext | None = None) -> dict[str, Any]:
     }
 
 
+_LOCAL_FIX_REMOTE_CODES = frozenset(
+    {
+        "connection_unavailable",
+        "machine_protocol_error",
+        "preset_write_incomplete",
+        "response_too_large",
+        "internal_error",
+        "busy",
+        "permission_required",
+        "experimental_required",
+    }
+)
+
+
+def _validate_remote_envelope(detail: Any) -> dict[str, Any] | None:
+    if not isinstance(detail, dict):
+        return None
+    code = detail.get("code")
+    if type(code) is not str or code not in CODES:
+        return None
+    filtered: dict[str, Any] = {}
+    for key in FIELDS:
+        if key not in detail:
+            continue
+        value = detail[key]
+        if key in ("type", "code", "message", "next_step", "correlation_id"):
+            if type(value) is not str:
+                return None
+        elif key == "retryable":
+            if type(value) is not bool:
+                return None
+        elif key == "details":
+            if not isinstance(value, dict):
+                return None
+        filtered[key] = value
+    return filtered
+
+
 def error_detail(
     exc: BaseException,
     *,
@@ -156,16 +193,20 @@ def error_detail(
     advice can turn an uncertain machine action into another physical attempt.
     """
     if isinstance(exc, RemoteError):
-        detail = exc.detail
-        if isinstance(detail, dict) and detail.get("code") in CODES:
-            # The serving side already sanitized this envelope; drop unknown keys.
-            filtered = {k: v for k, v in detail.items() if k in FIELDS}
+        filtered = _validate_remote_envelope(exc.detail)
+        if filtered is not None:
+            rebuilt = rebuild_remote_diagnostic(filtered, context=context)
             if "diagnostic" in filtered:
-                sanitized = sanitize_diagnostic(filtered["diagnostic"])
-                if sanitized is None:
-                    filtered.pop("diagnostic", None)
-                else:
-                    filtered["diagnostic"] = attach_local_context(sanitized, context)
+                filtered["diagnostic"] = rebuilt
+            if "next_step" in filtered and (
+                filtered["code"] in _LOCAL_FIX_REMOTE_CODES
+                or (
+                    filtered["code"] == "conflict"
+                    and isinstance(filtered.get("details"), dict)
+                    and "preset_write" in filtered["details"]
+                )
+            ):
+                filtered["next_step"] = rebuilt["fix"]
             return filtered
         return _internal(context)
     name = type(exc).__name__
@@ -177,7 +218,11 @@ def error_detail(
             "preview again."
         )
         raw_errors = exc.report.get("errors", [])
-        validation_errors = raw_errors if isinstance(raw_errors, list) else []
+        validation_errors = (
+            [item for item in raw_errors if isinstance(item, dict)]
+            if isinstance(raw_errors, list)
+            else []
+        )
         return _detail(
             name,
             "validation_error",
@@ -371,7 +416,12 @@ def error_detail(
                 "XB_CONFLICT", cause=message, fix=next_step, location=location
             ),
         )
-    if isinstance(exc, KeyError) and exc.args and exc.args[0] in NOT_FOUND:
+    if (
+        isinstance(exc, KeyError)
+        and exc.args
+        and type(exc.args[0]) is str
+        and exc.args[0] in NOT_FOUND
+    ):
         message = exc.args[0]
         next_step = (
             "Search recipe_list/history_list or retained imports, then use the "

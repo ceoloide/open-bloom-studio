@@ -19,7 +19,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ._cleanup import wait_cleanup
-from .diagnostics import DiagnosticContext, build_diagnostic
+from .diagnostics import (
+    DiagnosticContext,
+    build_diagnostic,
+    sanitize_remote_result,
+)
 from .errors import error_detail
 from .rpc_types import RemoteError, SocketDirectoryError, SocketPathError
 from .rpc_wire import MAX_REQUEST, MAX_RESPONSE, frame
@@ -91,8 +95,15 @@ async def call(
                     "Invalid or incomplete local RPC response"
                 ) from exc
             if not response["ok"]:
-                raise RemoteError(response["error"])
-            return response["data"]
+                raise RemoteError(
+                    error_detail(
+                        RemoteError(response["error"]),
+                        context=DiagnosticContext(method=method),
+                    )
+                )
+            return sanitize_remote_result(
+                method, response["data"], context=DiagnosticContext(method=method)
+            )
         finally:
             writer.close()
             await writer.wait_closed()
