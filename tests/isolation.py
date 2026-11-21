@@ -44,11 +44,12 @@ def install() -> None:
         return
     inherited = os.environ.get(testroot.ROOT)
     if inherited:
-        if not (Path(inherited) / "home").is_dir():
+        candidate = Path(os.path.abspath(inherited))
+        if not (candidate / "home").is_dir():
             raise RuntimeError(
                 f"{testroot.ROOT}={inherited!r} is not a test root; unset it"
             )
-        root = Path(inherited)
+        root = candidate
     else:
         root = testroot.create()
         testroot.apply(os.environ, root)

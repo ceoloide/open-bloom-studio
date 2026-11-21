@@ -13,8 +13,8 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
-import tests  # noqa: F401 - installs the test guards
 from scripts import testroot
 from tests import isolation
 from xbloom_studio import ownership, rpc, storage
@@ -112,6 +112,11 @@ class IsolationTests(unittest.TestCase):
         self.assertFalse(report["owner"])
         self.assertTrue(isolation.root.is_dir())
 
+    def test_child_without_a_module_prints_usage(self):
+        result = run(["-m", "tests.child"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage: python -m tests.child MODULE", result.stderr)
+
     def test_stale_root_variable_fails_loudly(self):
         result = run(["-c", "import tests"], env={testroot.ROOT: "/nonexistent"})
         self.assertNotEqual(result.returncode, 0)
@@ -137,8 +142,10 @@ class IsolationTests(unittest.TestCase):
         mine = pwd.getpwuid(uid)
         self.assertEqual(mine.pw_dir, str(isolation.root / "home"))
         self.assertEqual(mine.pw_name, isolation.account_getpwuid(uid).pw_name)
-        other = next(entry.pw_uid for entry in pwd.getpwall() if entry.pw_uid != uid)
-        self.assertEqual(pwd.getpwuid(other), isolation.account_getpwuid(other))
+        other = uid + 1
+        entry = pwd.struct_passwd(("other", "x", other, other, "", "/srv", "/bin/sh"))
+        with mock.patch.object(isolation, "account_getpwuid", return_value=entry):
+            self.assertIs(pwd.getpwuid(other), entry)
 
 
 class GuardCoverageTests(unittest.TestCase):
@@ -162,7 +169,8 @@ class GuardCoverageTests(unittest.TestCase):
             ]
             with self.subTest(module=path.name):
                 self.assertTrue(
-                    any(name == "tests" or name.startswith("tests.") for name in names)
+                    any(name == "tests" or name.startswith("tests.") for name in names),
+                    f"{path.name} must import tests at module level",
                 )
 
     def test_no_child_runs_the_package_unguarded(self):
@@ -182,8 +190,10 @@ class GuardCoverageTests(unittest.TestCase):
                     for item in items
                 ]
                 if any(
-                    pair == ("-m", PACKAGE)
-                    for pair in zip(values, values[1:], strict=False)
+                    flag == "-m"
+                    and isinstance(module, str)
+                    and (module == PACKAGE or module.startswith(f"{PACKAGE}."))
+                    for flag, module in zip(values, values[1:], strict=False)
                 ):
                     found.append(f"{path.name}:{node.lineno}")
                 if (
