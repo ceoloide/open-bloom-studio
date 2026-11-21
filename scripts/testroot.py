@@ -38,25 +38,35 @@ def usable(path: str, statvfs: StatVFS = os.statvfs) -> bool:
     except OSError:
         return False
     return (
-        not info.f_flag & os.ST_NOEXEC
+        not info.f_flag & getattr(os, "ST_NOEXEC", 0)
         and info.f_bavail * info.f_frsize >= MIN_FREE
         and os.access(path, os.W_OK | os.X_OK)
     )
 
 
-def base(environ: Mapping[str, str], statvfs: StatVFS = os.statvfs) -> str | None:
-    """The directory for new roots; ``None`` means the system default."""
+def bases(
+    environ: Mapping[str, str], statvfs: StatVFS = os.statvfs
+) -> list[str | None]:
+    """Directories to try for new roots, in order; ``None`` is the system default."""
     chosen = environ.get(TMPBASE)
     if chosen:
         if not os.path.isdir(chosen):
             raise RuntimeError(f"{TMPBASE}={chosen!r} is not a directory")
-        return chosen
-    return next((path for path in BASES if usable(path, statvfs)), None)
+        # Before Python 3.12 mkdtemp keeps a relative dir relative, and the
+        # owner's cleanup would then follow a later chdir.
+        return [os.path.abspath(chosen)]
+    return [*(path for path in BASES if usable(path, statvfs)), None]
 
 
 def create(environ: Mapping[str, str], prefix: str = PREFIX) -> Path:
-    """Make a new, empty, private root under the chosen base directory."""
-    return Path(tempfile.mkdtemp(prefix=prefix, dir=base(environ)))
+    """Make a new, empty, private root under the first base that accepts it."""
+    *fallbacks, last = bases(environ)
+    for directory in fallbacks:
+        try:
+            return Path(tempfile.mkdtemp(prefix=prefix, dir=directory))
+        except OSError:
+            pass  # os.access misses sandbox rules, such as Landlock; try the next.
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=last))
 
 
 def environment(root: Path) -> dict[str, str]:

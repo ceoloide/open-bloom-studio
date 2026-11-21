@@ -37,14 +37,14 @@ REPORT = (
 )
 
 
-def run(args, *, env=None, **kwargs):
+def run(args, *, env=None, cwd=REPO, **kwargs):
     environ = {**os.environ, "PYTHONPATH": str(REPO), **(env or {})}
     environ = {key: value for key, value in environ.items() if value is not None}
     return subprocess.run(
         [sys.executable, *args],
         capture_output=True,
         text=True,
-        cwd=REPO,
+        cwd=cwd,
         env=environ,
         timeout=60,
         **kwargs,
@@ -106,6 +106,27 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(report["home"], str(root / "home"))
         self.assertEqual(report["tmp"], str(root / "tmp"))
         self.assertFalse(root.exists())
+
+    def test_relative_base_root_is_removed_after_a_directory_change(self):
+        # The child creates a same-named sentinel after changing directory;
+        # a relative root would make cleanup delete it and leave the real root.
+        code = (
+            "import json, os, tests\n"
+            "from tests import isolation\n"
+            "os.chdir('elsewhere')\n"
+            "os.mkdir(os.path.join('base', isolation.root.name))\n"
+            "print(json.dumps(str(isolation.root)))\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / "base").mkdir()
+            (work / "elsewhere" / "base").mkdir(parents=True)
+            env = {testroot.ROOT: None, testroot.TMPBASE: "base"}
+            result = run(["-c", code], env=env, cwd=work, check=True)
+            root = Path(json.loads(result.stdout))
+            self.assertTrue((work / "elsewhere" / "base" / root.name).is_dir())
+            self.assertEqual(list((work / "base").iterdir()), [])
+            self.assertEqual(root.parent, work / "base")
 
     def test_inheriting_process_neither_owns_nor_removes_the_root(self):
         result = run(["-c", REPORT], check=True)

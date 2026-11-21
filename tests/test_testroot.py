@@ -28,6 +28,12 @@ def statvfs(*, flag=0, free=testroot.MIN_FREE, missing=()):
 
 
 class BaseTests(unittest.TestCase):
+    def setUp(self):
+        # Only the injected statvfs decides; the host's /dev/shm and /tmp do not.
+        access = mock.patch.object(testroot.os, "access", return_value=True)
+        self.access = access.start()
+        self.addCleanup(access.stop)
+
     def test_usable_needs_exec_space_and_access(self):
         self.assertTrue(testroot.usable("/dev/shm", statvfs()))
         cases = {
@@ -38,45 +44,88 @@ class BaseTests(unittest.TestCase):
         for name, probe in cases.items():
             with self.subTest(name):
                 self.assertFalse(testroot.usable("/dev/shm", probe))
-        with mock.patch.object(testroot.os, "access", return_value=False) as access:
-            self.assertFalse(testroot.usable("/dev/shm", statvfs()))
-        access.assert_called_once_with("/dev/shm", os.W_OK | os.X_OK)
+        self.access.reset_mock()
+        self.access.return_value = False
+        self.assertFalse(testroot.usable("/dev/shm", statvfs()))
+        self.access.assert_called_once_with("/dev/shm", os.W_OK | os.X_OK)
 
-    def test_base_takes_the_first_usable_candidate(self):
-        self.assertEqual(testroot.base({}, statvfs()), "/dev/shm")
+    def test_bases_lists_usable_candidates_then_the_default(self):
+        self.assertEqual(testroot.bases({}, statvfs()), ["/dev/shm", "/tmp", None])
         shm_missing = statvfs(missing=("/dev/shm",))
-        self.assertEqual(testroot.base({}, shm_missing), "/tmp")
-        self.assertIsNone(testroot.base({}, statvfs(flag=os.ST_NOEXEC)))
+        self.assertEqual(testroot.bases({}, shm_missing), ["/tmp", None])
+        self.assertEqual(testroot.bases({}, statvfs(flag=os.ST_NOEXEC)), [None])
 
     def test_set_base_variable_wins_and_must_be_a_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             environ = {testroot.TMPBASE: directory}
             rejected = statvfs(missing=(directory,))
-            self.assertEqual(testroot.base(environ, rejected), directory)
+            self.assertEqual(testroot.bases(environ, rejected), [directory])
             with self.assertRaisesRegex(RuntimeError, testroot.TMPBASE):
-                testroot.base({testroot.TMPBASE: f"{directory}/missing"})
-        self.assertEqual(testroot.base({testroot.TMPBASE: ""}, statvfs()), "/dev/shm")
+                testroot.bases({testroot.TMPBASE: f"{directory}/missing"})
+        empty = {testroot.TMPBASE: ""}
+        self.assertEqual(testroot.bases(empty, statvfs()), ["/dev/shm", "/tmp", None])
+
+    def test_relative_base_variable_becomes_absolute(self):
+        with tempfile.TemporaryDirectory() as directory:
+            relative = os.path.relpath(directory)
+            self.assertFalse(os.path.isabs(relative))
+            found = testroot.bases({testroot.TMPBASE: relative})
+        self.assertEqual(found, [directory])
 
 
 class TestRootTests(unittest.TestCase):
     def setUp(self):
-        self.root = testroot.create(os.environ, prefix="xbs-unit-")
-        self.addCleanup(shutil.rmtree, self.root)
+        self.base = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.base)
+        self.environ = {testroot.TMPBASE: self.base}
+        self.root = testroot.create(self.environ, prefix="xbs-unit-")
 
     def test_create_makes_an_empty_private_directory(self):
-        expected = testroot.base(os.environ) or tempfile.gettempdir()
-        self.assertEqual(self.root.parent, Path(expected))
+        self.assertEqual(self.root.parent, Path(self.base))
         self.assertTrue(self.root.name.startswith("xbs-unit-"))
         self.assertEqual(list(self.root.iterdir()), [])
         self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o700)
-        default = testroot.create(os.environ)
-        self.addCleanup(shutil.rmtree, default)
+        default = testroot.create(self.environ)
         self.assertTrue(default.name.startswith(testroot.PREFIX))
 
-    def test_create_uses_the_base_variable(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = testroot.create({testroot.TMPBASE: directory})
-            self.assertEqual(root.parent, Path(directory))
+    def test_create_falls_through_bases_that_refuse_writes(self):
+        refused = Path(self.base, "refused")
+        accepted = Path(self.base, "accepted")
+        accepted.mkdir()
+        original = tempfile.mkdtemp
+        made = []
+
+        def mkdtemp(prefix, dir):
+            made.append(dir)
+            if dir == str(refused):
+                raise PermissionError(dir)
+            return original(prefix=prefix, dir=dir or str(accepted))
+
+        cases = {
+            "next candidate": (
+                [str(refused), str(accepted), None],
+                [str(refused), str(accepted)],
+            ),
+            "system default": ([str(refused), None], [str(refused), None]),
+        }
+        for name, (bases, tried) in cases.items():
+            made.clear()
+            with (
+                self.subTest(name),
+                mock.patch.object(testroot, "bases", return_value=bases),
+                mock.patch.object(testroot.tempfile, "mkdtemp", side_effect=mkdtemp),
+            ):
+                self.assertEqual(testroot.create({}).parent, accepted)
+                self.assertEqual(made, tried)
+
+    def test_explicit_base_that_refuses_writes_raises(self):
+        with (
+            mock.patch.object(
+                testroot.tempfile, "mkdtemp", side_effect=PermissionError("denied")
+            ),
+            self.assertRaises(PermissionError),
+        ):
+            testroot.create(self.environ)
 
     def test_environment_makes_and_names_the_layout(self):
         variables = testroot.environment(self.root)
