@@ -19,6 +19,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ._cleanup import wait_cleanup
+from .diagnostics import (
+    build_diagnostic,
+    request_context,
+    sanitize_remote_result,
+)
 from .errors import error_detail
 from .rpc_types import RemoteError, SocketDirectoryError, SocketPathError
 from .rpc_wire import MAX_REQUEST, MAX_RESPONSE, frame
@@ -89,9 +94,15 @@ async def call(
                 raise ConnectionError(
                     "Invalid or incomplete local RPC response"
                 ) from exc
+            req_ctx = request_context(method, params)
             if not response["ok"]:
-                raise RemoteError(response["error"])
-            return response["data"]
+                raise RemoteError(
+                    error_detail(
+                        RemoteError(response["error"]),
+                        context=req_ctx,
+                    )
+                )
+            return sanitize_remote_result(method, response["data"], context=req_ctx)
         finally:
             writer.close()
             await writer.wait_closed()
@@ -243,7 +254,16 @@ class LocalServer:
                 result = await self.app.call(request["method"], request.get("params"))
                 response = {"ok": True, "data": result}
             except Exception as exc:
-                response = {"ok": False, "error": error_detail(exc)}
+                method = request.get("method")
+                raw_params = request.get("params")
+                context = (
+                    request_context(
+                        method, raw_params if isinstance(raw_params, dict) else None
+                    )
+                    if isinstance(method, str) and method.strip()
+                    else None
+                )
+                response = {"ok": False, "error": error_detail(exc, context=context)}
             encoded = dumps(response).encode() + b"\n"
             if len(encoded) > MAX_RESPONSE:
                 encoded = self._too_large(request, result, response["ok"])
@@ -263,16 +283,22 @@ class LocalServer:
 
     @staticmethod
     def _too_large(request: dict[str, Any], result: Any, ok: bool) -> bytes:
+        method = request.get("method")
+        method_name = method if isinstance(method, str) and method.strip() else None
+        location: dict[str, Any] = (
+            {"kind": "method", "method": method_name} if method_name else {}
+        )
         detail = error_detail(ValueError("Response too large; use cursor pagination"))
         detail["code"] = "response_too_large"
         if (
             ok
-            and request.get("method") in START_METHODS
+            and method_name in START_METHODS
             and isinstance(result, dict)
             and isinstance(result.get("id"), str)
         ):
             # An accepted start must stay identifiable: never invite a new key.
             detail["details"] = {"operation_id": result["id"]}
+            location["operation_id"] = result["id"]
             key = (request.get("params") or {}).get("idempotency_key")
             if isinstance(key, str) and len(key) <= 512:
                 detail["details"]["idempotency_key"] = key
@@ -281,6 +307,12 @@ class LocalServer:
                 "or replay the same idempotency key to retrieve it. Never start "
                 "again with a new key."
             )
+        detail["diagnostic"] = build_diagnostic(
+            "XB_RESPONSE_TOO_LARGE",
+            cause=detail["message"],
+            fix=detail["next_step"],
+            location=location or None,
+        )
         return dumps({"ok": False, "error": detail}).encode() + b"\n"
 
     async def close(self) -> None:

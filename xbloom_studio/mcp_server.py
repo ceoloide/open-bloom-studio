@@ -69,17 +69,25 @@ INSTRUCTIONS = (
 Caller = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
 
-def _error(code: str, message: str, next_step: str, **extra: Any) -> dict[str, Any]:
-    return {
-        "error": {
-            "code": code,
-            "message": message,
-            "details": {},
-            "next_step": next_step,
-            "retryable": False,
-            **extra,
-        }
+def _error(
+    code: str,
+    message: str,
+    next_step: str,
+    *,
+    diagnostic: dict[str, Any] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "code": code,
+        "message": message,
+        "details": {},
+        "next_step": next_step,
+        "retryable": False,
+        **extra,
     }
+    if diagnostic is not None:
+        payload["diagnostic"] = diagnostic
+    return {"error": payload}
 
 
 def create_server(  # noqa: C901 - one registration per tool
@@ -115,6 +123,13 @@ def create_server(  # noqa: C901 - one registration per tool
     except ImportError as exc:
         raise RuntimeError("Install xbloom-studio with the mcp extra") from exc
     from .command_schema import command_schema, validate_command_params
+    from .diagnostics import (
+        DiagnosticContext,
+        build_diagnostic,
+        request_context,
+        safe_identifier,
+        sanitize_remote_result,
+    )
     from .errors import error_detail
 
     class ContractServer(MCPServer):
@@ -158,21 +173,30 @@ def create_server(  # noqa: C901 - one registration per tool
             self, name: str, arguments: dict[str, Any], context: Any = None
         ) -> Any:
             if name not in self.contracts:
+                msg = "Unknown tool in the configured groups."
+                fix = "List the available tools in this server."
                 return self.result(
                     _error(
                         "unknown_tool",
-                        "Unknown tool in the configured groups.",
-                        "List the available tools in this server.",
+                        msg,
+                        fix,
+                        diagnostic=build_diagnostic(
+                            "XB_MCP_UNKNOWN_TOOL",
+                            cause=msg,
+                            location={"kind": "tool", "tool": name[:120]},
+                        ),
                     ),
                     True,
                 )
             fn, inputs, outputs = self.contracts[name]
+            tool_ctx = DiagnosticContext(tool=name, method=name)
             try:
                 values = normalized_input(inputs.model_validate(arguments), arguments)
                 if name == "machine_command":
                     validate_command_params(
                         values["command"], values.get("params") or {}
                     )
+                tool_ctx = request_context(name, values, tool=name)
                 value = await fn(**values)
             except ValidationError as exc:
                 issues = [
@@ -189,18 +213,43 @@ def create_server(  # noqa: C901 - one registration per tool
                         include_input=False, include_context=False, include_url=False
                     )
                 ]
+                msg = "Tool arguments do not match the advertised contract."
+                fix = (
+                    "Correct the named fields using this tool input schema. Do not "
+                    "invent a new start key after uncertainty."
+                )
+                first_loc: dict[str, Any] = {"kind": "tool", "tool": name}
+                ctx_payload: dict[str, Any] | None = None
+                if issues:
+                    first_loc["kind"] = "json_pointer"
+                    first_loc["pointer"] = issues[0]["path"]
+                    summary = issues[0]["message"]
+                    if len(issues) > 1:
+                        summary += f" (1 of {len(issues)} errors)"
+                    ctx_payload = {"summary": summary}
                 failure = _error(
                     "invalid_argument",
-                    "Tool arguments do not match the advertised contract.",
-                    "Correct the named fields using this tool input schema. Do not "
-                    "invent a new start key after uncertainty.",
+                    msg,
+                    fix,
+                    diagnostic=build_diagnostic(
+                        "XB_INVALID_ARGUMENT",
+                        cause=f"{issues[0]['path']}: {issues[0]['message']}"
+                        if issues
+                        else msg,
+                        fix=fix,
+                        location=first_loc,
+                        context=ctx_payload,
+                    ),
                 )
                 failure["error"]["details"] = {"errors": issues}
                 return self.result(failure, True)
             except Exception as exc:
-                return self.result({"error": error_detail(exc)}, True)
+                return self.result({"error": error_detail(exc, context=tool_ctx)}, True)
             try:
                 normalized = {"result": value} if isinstance(value, list) else value
+                normalized = sanitize_remote_result(
+                    name, normalized, context=tool_ctx, strict=True
+                )
                 validated = outputs.model_validate(normalized)
                 data = validated.model_dump(mode="json", exclude_unset=True)
                 failed = name == "machine_command" and data.get("status") == "failed"
@@ -214,21 +263,40 @@ def create_server(  # noqa: C901 - one registration per tool
                 )
                 # The action may already have committed or executed. Never drop
                 # an accepted operation's identity or suggest starting again.
-                failure = _error(
-                    "output_contract_error",
+                msg = (
                     "The application returned an unexpected result shape; effects "
-                    "may already have occurred.",
+                    "may already have occurred."
+                )
+                fix = (
                     "Inspect history_get with the operation ID or machine_state. For "
                     "an accepted start, reuse its existing idempotency key to "
-                    "retrieve that attempt; never force a new start.",
-                    correlation_id=correlation_id,
+                    "retrieve that attempt; never force a new start."
                 )
-                if (
-                    name in ATTEMPTS
+                out_loc: dict[str, Any] = {"kind": "tool", "tool": name}
+                op_id = (
+                    value["id"]
+                    if name in ATTEMPTS
                     and isinstance(value, dict)
                     and isinstance(value.get("id"), str)
-                ):
-                    failure["error"]["details"] = {"operation_id": value["id"]}
+                    else None
+                )
+                safe_op_id = safe_identifier(op_id)
+                if safe_op_id is not None:
+                    out_loc["operation_id"] = safe_op_id
+                failure = _error(
+                    "output_contract_error",
+                    msg,
+                    fix,
+                    diagnostic=build_diagnostic(
+                        "XB_MCP_OUTPUT_CONTRACT",
+                        cause=msg,
+                        fix=fix,
+                        location=out_loc,
+                    ),
+                    correlation_id=correlation_id,
+                )
+                if op_id is not None:
+                    failure["error"]["details"] = {"operation_id": op_id}
                 return self.result(failure, True)
 
     server = ContractServer("xbloom-studio", instructions=INSTRUCTIONS)

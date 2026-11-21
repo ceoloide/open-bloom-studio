@@ -25,6 +25,7 @@ from .command_schema import (
     validate_command_params,
 )
 from .control import IDLE_STATES, NO_WATER_STATE, BusyError, EncodedRecipe, Interaction
+from .diagnostics import preset_write_diagnostic
 from .machine_controls import (
     SLOTS,
     EncodedTeaRecipe,
@@ -413,6 +414,12 @@ class MachineCommandAPI:
                         "type": type(exc).__name__,
                         "details": deepcopy(exc.result),
                         "recovery_required": session._uncertain,
+                        "diagnostic": preset_write_diagnostic(
+                            refused=False,
+                            cause=str(exc),
+                            payload=exc.result,
+                            recovery_required=session._uncertain,
+                        ),
                     }
                 except BaseException as exc:
                     if attempt is not None:
@@ -690,6 +697,14 @@ class MachineCommandAPI:
             "outcome": mine,
             **summary,
         }
+        if result.get("status") == "failed":
+            result["diagnostic"] = preset_write_diagnostic(
+                refused=False,
+                cause=str(result.get("error") or "Preset write did not finish."),
+                payload=result.get("details"),
+                attempt=result["attempt"],
+                recovery_required=result.get("recovery_required"),
+            )
         return result
 
     def _started_committed(self, attempt_id: str) -> bool:

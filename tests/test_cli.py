@@ -689,7 +689,9 @@ class DaemonClientTests(unittest.IsolatedAsyncioTestCase):
                 "machine", "command", "back_home", "--allow-control"
             )
         self.assertEqual(status, 2)
-        self.assertEqual(lines[0]["data"], outcome)
+        data = lines[0]["data"]
+        self.assertEqual({k: v for k, v in data.items() if k != "diagnostic"}, outcome)
+        self.assertEqual(data["diagnostic"]["code"], "XB_PRESET_WRITE_INCOMPLETE")
 
     async def test_waiting_start_follows_the_daemon_operation(self):
         task = asyncio.create_task(

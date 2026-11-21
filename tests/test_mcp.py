@@ -128,7 +128,14 @@ class ContractTests(ToolCase):
             "machine_command", {"command": "back_home", "allow_control": True}
         )
         self.assertTrue(result.is_error)
-        self.assertEqual(result.structured_content, outcome)
+        self.assertEqual(
+            {k: v for k, v in result.structured_content.items() if k != "diagnostic"},
+            outcome,
+        )
+        self.assertEqual(
+            result.structured_content["diagnostic"]["code"],
+            "XB_PRESET_WRITE_INCOMPLETE",
+        )
 
     async def test_preset_write_attempts_are_reported_and_discoverable(self):
         preset = {"slot": "A", "payload_hex": "6e6577", "flags": 4}
