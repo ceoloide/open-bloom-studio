@@ -323,6 +323,20 @@ class OperationStoreTest(StoreTestCase):
         self.assertEqual(sorted(results, key=str), [2, "conflict"])
         self.assertEqual(other.get_recipe(row["id"])["head"], 2)
 
+    def test_store_forces_full_synchronous_writes(self):
+        # Start below FULL so the test fails if the store stops raising it.
+        original = sqlite3.connect
+
+        def connect(path, *args, **kwargs):
+            db = original(path, *args, **kwargs)
+            db.execute("PRAGMA synchronous=NORMAL")
+            return db
+
+        with mock.patch("xbloom_studio.storage.sqlite3.connect", side_effect=connect):
+            store = Store(self.dir / "durable.sqlite3")
+        self.addCleanup(store.close)
+        self.assertEqual(store.db.execute("PRAGMA synchronous").fetchone()[0], 2)
+
     def test_default_path_follows_xdg(self):
         with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(self.dir)}):
             self.assertEqual(

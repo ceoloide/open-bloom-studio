@@ -29,11 +29,11 @@ PROBE = (
     " 'guarded': 'tests' in sys.modules}))\n"
 )
 REPORT = (
-    "import json, os, tests\n"
+    "import json, os, tempfile, tests\n"
     "from tests import isolation\n"
     "print(json.dumps({'root': str(isolation.root), 'owner': isolation.owner,"
     f" 'device': os.environ.get('{testroot.DEVICE}'),"
-    " 'home': os.environ['HOME']}))\n"
+    " 'home': os.environ['HOME'], 'tmp': tempfile.gettempdir()}))\n"
 )
 
 
@@ -64,6 +64,7 @@ class IsolationTests(unittest.TestCase):
             storage.default_db(),
             rpc.default_socket(),
             Path.home(),
+            Path(tempfile.gettempdir()),
         ):
             self.assertTrue(path.is_relative_to(root), path)
         self.assertEqual(ownership.lease_directory().parents[3], root / "home")
@@ -103,6 +104,7 @@ class IsolationTests(unittest.TestCase):
         self.assertIsNone(report["device"])
         self.assertNotEqual(root, isolation.root)
         self.assertEqual(report["home"], str(root / "home"))
+        self.assertEqual(report["tmp"], str(root / "tmp"))
         self.assertFalse(root.exists())
 
     def test_inheriting_process_neither_owns_nor_removes_the_root(self):
@@ -111,6 +113,18 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(report["root"], str(isolation.root))
         self.assertFalse(report["owner"])
         self.assertTrue(isolation.root.is_dir())
+
+    def test_inheriting_process_keeps_the_tmpdir_it_is_given(self):
+        with tempfile.TemporaryDirectory() as other:
+            result = run(["-c", REPORT], env={"TMPDIR": other}, check=True)
+            report = json.loads(result.stdout)
+        self.assertEqual(report["root"], str(isolation.root))
+        self.assertEqual(report["tmp"], other)
+
+    def test_socket_paths_under_the_temp_directory_stay_short(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "run", "daemon.sock")
+        self.assertLess(len(os.fsencode(path)), 100, path)
 
     def test_child_without_a_module_prints_usage(self):
         result = run(["-m", "tests.child"])

@@ -699,7 +699,7 @@ class CliDiagnosticsTests(unittest.TestCase):
 
 class AsyncSurfaceDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.store = Store(self.root / "xbloom-studio.sqlite3")
         self.machine = Machine("00:00:5E:00:53:09", auto_complete=True)
@@ -886,7 +886,7 @@ class SolR1HardeningTests(unittest.IsolatedAsyncioTestCase):
     """Focused negative controls for Sol R1 findings S1-S8."""
 
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.db = self.root / "sol.sqlite3"
         self.sock = self.root / "run" / "daemon.sock"
@@ -1549,7 +1549,7 @@ class SolR2HardeningTests(unittest.IsolatedAsyncioTestCase):
     """Focused negative controls for Sol R2 findings."""
 
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.db = self.root / "sol-r2.sqlite3"
         self.sock = self.root / "run" / "daemon.sock"
@@ -2353,7 +2353,7 @@ class SolR3HardeningTests(unittest.IsolatedAsyncioTestCase):
     """Focused regressions for Sol R3 findings (S2 blocker, S2 should, S6 should)."""
 
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.db = self.root / "sol-r3.sqlite3"
         self.sock = self.root / "run" / "daemon.sock"
@@ -3357,7 +3357,7 @@ class SolR5S2HardeningTests(unittest.IsolatedAsyncioTestCase):
     """Exact red/green probes for Sol R5 S2 across MCP, CLI, RPC, and RemoteError."""
 
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.db = self.root / "sol-r5.sqlite3"
         self.sock = self.root / "run" / "daemon.sock"
@@ -4172,7 +4172,7 @@ class CouncilR1FindingsTests(unittest.IsolatedAsyncioTestCase):
     """Exact focused regression probes for Astra/Fable/Carbon council R1 (C1-C6)."""
 
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.db = self.root / "council-r1.sqlite3"
         self.sock = self.root / "run" / "daemon.sock"
@@ -4819,7 +4819,7 @@ class CouncilR2FindingsTests(unittest.IsolatedAsyncioTestCase):
     """Focused regression probes for council R2 findings (C7-C10 + argparse nit)."""
 
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.db = self.root / "council-r2.sqlite3"
         self.sock = self.root / "run" / "daemon.sock"

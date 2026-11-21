@@ -381,7 +381,7 @@ class PureCommandTests(CliCase):
             self.assertIsNone(cli.parser().parse_args(["machine", "state"]).device)
 
     def test_default_socket_ignores_a_daemon_at_the_former_path(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             former = root / "runtime/open-bloom/bloom.sock"
             former.parent.mkdir(parents=True)
@@ -610,7 +610,7 @@ class ConnectorSpecTests(unittest.TestCase):
 
 class DaemonClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.db = self.root / "xbloom-studio.sqlite3"
         self.store = Store(self.db)

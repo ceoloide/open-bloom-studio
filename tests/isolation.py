@@ -1,9 +1,10 @@
-"""Give every test process tree a private account home, data and runtime root.
+"""Give every test process tree a private home, data, runtime and temp root.
 
 A process that starts without ``XBLOOM_STUDIO_TEST_ROOT`` owns a new root: it
-points ``HOME`` and the XDG directories at it, drops ``XBLOOM_STUDIO_DEVICE``
-and deletes the root when it exits. A process that inherits the variable
-changes no environment and deletes nothing. Both replace ``pwd.getpwuid`` so
+points ``HOME``, the XDG directories, ``TMPDIR`` and ``tempfile`` at it, drops
+``XBLOOM_STUDIO_DEVICE`` and deletes the root when it exits. A process that
+inherits the variable changes no environment, keeps the ``TMPDIR`` it was given
+and deletes nothing. Both replace ``pwd.getpwuid`` so
 the production lease resolver, which reads the account home rather than
 ``HOME``, also lands inside the root.
 """
@@ -14,6 +15,7 @@ import atexit
 import os
 import pwd
 import shutil
+import tempfile
 from pathlib import Path
 
 from scripts import testroot
@@ -51,8 +53,9 @@ def install() -> None:
             )
         root = candidate
     else:
-        root = testroot.create()
+        root = testroot.create(os.environ)
         testroot.apply(os.environ, root)
+        tempfile.tempdir = os.environ["TMPDIR"]
         owner = True
         atexit.register(_remove, root, os.getpid())
     pwd.getpwuid = _getpwuid
