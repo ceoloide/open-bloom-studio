@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import tests  # noqa: F401 - installs the test guards
 from scripts import publication_policy as policy
 
 # Sensitive-looking samples are assembled at runtime so this file passes the

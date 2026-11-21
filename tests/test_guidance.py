@@ -6,6 +6,7 @@ import unittest
 from importlib.resources import files
 from pathlib import Path
 
+import tests  # noqa: F401 - installs the test guards
 from xbloom_studio import (
     check_recipe,
     encode_coffee_recipe,

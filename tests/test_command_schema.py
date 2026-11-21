@@ -1,5 +1,6 @@
 import unittest
 
+import tests  # noqa: F401 - installs the test guards
 from xbloom_studio import Interaction
 from xbloom_studio.command_schema import (
     COMMAND_SCHEMAS,

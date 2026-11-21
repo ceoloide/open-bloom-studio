@@ -1,6 +1,7 @@
 import re
 import unittest
 
+import tests  # noqa: F401 - installs the test guards
 from xbloom_studio import events
 from xbloom_studio.protocol import catalog
 from xbloom_studio.transport import CONTROL_COMMANDS, FUNCTION_2_COMMANDS, STOP_COMMANDS

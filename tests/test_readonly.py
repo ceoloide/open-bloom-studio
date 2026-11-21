@@ -26,6 +26,7 @@ from xbloom_studio.client import bounded, wait_set
 from xbloom_studio.ownership import AddressLease, lease_directory
 from xbloom_studio.transport import BleakTransport
 
+REPO = str(Path(__file__).resolve().parents[1])
 SCALE = reply(20501, struct.pack("<f", 0))
 WATER = reply(40523, struct.pack("<f", 0))
 INFO = reply(40521, identity_block(size=29))
@@ -900,7 +901,7 @@ class LeaseTests(unittest.TestCase):
 
     def test_processes_with_distinct_tmpdirs_share_ownership(self):
         code = (
-            "import sys; from xbloom_studio.ownership import AddressLease; "
+            "import tests, sys; from xbloom_studio.ownership import AddressLease; "
             "AddressLease(sys.argv[1]).acquire()"
         )
         with tempfile.TemporaryDirectory() as other_tmp:
@@ -912,7 +913,7 @@ class LeaseTests(unittest.TestCase):
                     try:
                         outcome = subprocess.run(
                             [sys.executable, "-c", code, key],
-                            env={**os.environ, "TMPDIR": other_tmp},
+                            env={**os.environ, "PYTHONPATH": REPO, "TMPDIR": other_tmp},
                             capture_output=True,
                             text=True,
                         )
@@ -926,12 +927,15 @@ class LeaseTests(unittest.TestCase):
         lease.acquire()
         self.assertTrue(lease.held)
         code = (
-            "from xbloom_studio.ownership import AddressLease; "
+            "import tests; from xbloom_studio.ownership import AddressLease; "
             "AddressLease('process-test').acquire()"
         )
         try:
             result = subprocess.run(
-                [sys.executable, "-c", code], capture_output=True, text=True
+                [sys.executable, "-c", code],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": REPO},
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Another library process", result.stderr)
@@ -941,7 +945,9 @@ class LeaseTests(unittest.TestCase):
         self.assertFalse(lease.held)
         self.assertEqual(
             subprocess.run(
-                [sys.executable, "-c", code], capture_output=True
+                [sys.executable, "-c", code],
+                capture_output=True,
+                env={**os.environ, "PYTHONPATH": REPO},
             ).returncode,
             0,
         )

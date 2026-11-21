@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import tests  # noqa: F401 - installs the test guards
 from xbloom_studio import ssh_rpc
 from xbloom_studio.facade import Application
 from xbloom_studio.rpc import LocalServer, RemoteError

@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError, URLError
 
+import tests  # noqa: F401 - installs the test guards
 from xbloom_studio import encode_coffee_recipe, encode_tea_recipe
 from xbloom_studio.provider_exports import MAX_EXPORT, load_export, read_export
 from xbloom_studio.provider_native import native_document
