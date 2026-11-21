@@ -5706,5 +5706,353 @@ class CouncilR3RedactionTests(unittest.TestCase):
         self.assertNotIn("Spoofed", perm_err["next_step"])
 
 
+class CouncilR4RedactionTests(unittest.TestCase):
+    """Focused regression probes for council R4 C7e (JWT after hyphen & Basic)."""
+
+    def test_c7e_jwt_after_hyphen_and_hyphenated_headers_redact_and_detect(self):
+        jwt_std = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig12345"
+        jwt_hdr_dash = "eyJhbG-ciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig-12345"
+        jwt_two_part = "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        jwt_min_hdr = "eyJ12-345678.eyJ87-654321.sig-999"
+        jwt_upper = "EYJHBGCIOIJIUZI1NIJ9.EYJZDWIIOIIXMJM0NTY3ODKWIN0.SIG12345"
+
+        cases = (
+            ("token_dash_jwt", f"token-{jwt_std}", "token-<redacted>"),
+            (
+                "sb_access_token_dash_jwt",
+                f"sb-access-token-{jwt_std}",
+                "sb-access-token-<redacted>",
+            ),
+            ("double_dash_jwt", f"--{jwt_std}", "--<redacted>"),
+            ("bearer_dash_jwt", f"Bearer-{jwt_std}", "Bearer-<redacted>"),
+            ("bare_jwt", jwt_std, "<redacted>"),
+            ("bare_jwt_hdr_dash", jwt_hdr_dash, "<redacted>"),
+            ("token_dash_jwt_hdr_dash", f"token-{jwt_hdr_dash}", "token-<redacted>"),
+            (
+                "sb_token_min_hdr_dash",
+                f"sb-access-token-{jwt_min_hdr}",
+                "sb-access-token-<redacted>",
+            ),
+            ("two_part_after_hyphen", f"token-{jwt_two_part}", "token-<redacted>"),
+            (
+                "two_part_trailing_period",
+                f"token-{jwt_two_part}.",
+                "token-<redacted>.",
+            ),
+            ("uppercase_after_hyphen", f"token-{jwt_upper}", "token-<redacted>"),
+            ("dot_prefixed_jwt", f"foo.{jwt_std}", "foo.<redacted>"),
+            ("equals_prefixed_jwt", f"token={jwt_std}", "token=<redacted>"),
+            ("adjacent_jwts_hyphen", f"{jwt_std}-{jwt_hdr_dash}", "<redacted>"),
+            (
+                "bearer_space_jwt_preserved",
+                f"Authorization: Bearer {jwt_std}",
+                "Authorization: <redacted>",
+            ),
+        )
+        for label, raw, expected in cases:
+            with self.subTest(case=label):
+                self.assertEqual(diagnostics._redact_text(raw), expected)
+                self.assertTrue(diagnostics._has_sensitive_value(raw))
+                self.assertFalse(diagnostics.is_safe_human_note(raw))
+                local_err = error_detail(ValueError(raw))
+                self.assertEqual(local_err["diagnostic"]["cause"], expected)
+                peer_err = error_detail(
+                    RemoteError(
+                        {
+                            "type": "ProviderError",
+                            "code": "provider_error",
+                            "message": raw,
+                        }
+                    )
+                )
+                self.assertEqual(peer_err["message"], expected)
+                self.assertEqual(peer_err["diagnostic"]["cause"], expected)
+                for forbidden in (
+                    "eyJhbGciOiJIUzI1NiJ9",
+                    "eyJhbG-ciOiJIUzI1NiJ9",
+                    "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                    "sig12345",
+                    "sig-12345",
+                    "eyJ12-345678",
+                    "eyJ87-654321",
+                    "EYJHBGCIOIJIUZI1NIJ9",
+                ):
+                    self.assertNotIn(forbidden, peer_err["message"])
+                    self.assertNotIn(forbidden, peer_err["diagnostic"]["cause"])
+
+        # JSON excerpt redacts hyphen-prefixed JWT values completely.
+        excerpt_doc = f'{{\n  "note": "sb-access-token-{jwt_std}"\n}}\n'
+        excerpt = extract_json_excerpt(excerpt_doc, 2, 12)
+        assert excerpt is not None
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", json.dumps(excerpt))
+        self.assertNotIn("sig12345", json.dumps(excerpt))
+        self.assertIn('"<redacted>"', json.dumps(excerpt))
+
+    def test_c7e_basic_token_boundary_overlap_and_negative_controls(self):
+        jwt_std = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig12345"
+        jwt_hdr_dash = "eyJhbGciOi-JIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig12345"
+        gh_tok = "gh" + "p_" + "1234567890abcdef123456"
+        sk_tok = "s" + "k-" + "1234567890abcdefghijkl"
+        aiza_dash = "AI" + "zaSyAbCdEf-GhIjKlMnOpQrStUvWxYz"
+        aiza_under = "AI" + "zaSyAbCdEf_GhIjKlMnOpQrStUvWxYz"
+        aiza_plain = "AI" + "zaSyAbCdEfGhIjKlMnOpQrStUvWxYz"
+        aws_key = "AK" + "IAIOSFODNN7EXAMPLE"
+
+        overlap_cases = (
+            (
+                "basic_jwt",
+                f"Basic {jwt_std}",
+                "Basic <redacted>",
+                ("eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "sig12345"),
+            ),
+            (
+                "basic_jwt_hdr_dash",
+                f"Basic {jwt_hdr_dash}",
+                "Basic <redacted>",
+                ("eyJhbGciOi", "JIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "sig12345"),
+            ),
+            (
+                "basic_token_eq_jwt",
+                f"Basic token={jwt_std}",
+                "Basic token=<redacted>",
+                ("eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "sig12345"),
+            ),
+            (
+                "basic_prefix_dash_jwt",
+                f"Basic myPrefix123-{jwt_std}",
+                "Basic myPrefix123-<redacted>",
+                ("eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "sig12345"),
+            ),
+            (
+                "basic_token_eq_ghp",
+                f"Basic token={gh_tok}",
+                "Basic token=<redacted>",
+                ("ghp_", "1234567890abcdef123456"),
+            ),
+            (
+                "basic_key_eq_ghp",
+                f"Basic key={gh_tok}",
+                "Basic key=<redacted>",
+                ("ghp_", "1234567890abcdef123456"),
+            ),
+            (
+                "basic_secrets_eq_ghp",
+                f"Basic secrets={gh_tok}",
+                "Basic secrets=<redacted>",
+                ("ghp_", "1234567890abcdef123456"),
+            ),
+            (
+                "basic_token_eq_sk",
+                f"Basic token={sk_tok}",
+                "Basic token=<redacted>",
+                ("1234567890abcdefghijkl",),
+            ),
+            (
+                "basic_token_eq_aiza_plain",
+                f"Basic token={aiza_plain}",
+                "Basic token=<redacted>",
+                ("SyAbCdEfGhIjKlMnOpQrStUvWxYz",),
+            ),
+            (
+                "basic_token_eq_aws",
+                f"Basic token={aws_key}",
+                "Basic token=<redacted>",
+                ("IOSFODNN7EXAMPLE",),
+            ),
+            (
+                "basic_aiza_dash",
+                f"Basic {aiza_dash}",
+                "Basic <redacted>",
+                ("SyAbCdEf", "GhIjKlMnOpQrStUvWxYz"),
+            ),
+            (
+                "basic_aiza_under",
+                f"Basic {aiza_under}",
+                "Basic <redacted>",
+                ("SyAbCdEf", "GhIjKlMnOpQrStUvWxYz"),
+            ),
+            (
+                "sk_prefixed_jwt_merged",
+                f"{'s' + 'k-'}{jwt_std}",
+                "<redacted>",
+                ("eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "sig12345"),
+            ),
+            (
+                "ghp_inside_dot_header_not_skipped",
+                f"token-{gh_tok}.eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                "token-<redacted>.eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                ("1234567890abcdef123456",),
+            ),
+            (
+                "basic_sentence_period_preserved",
+                "Rejected Basic dTpwdw==.",
+                "Rejected <redacted>.",
+                ("dTpwdw==",),
+            ),
+            (
+                "basic_sentence_period_space_preserved",
+                "Rejected Basic dTpwdw==. Retry later",
+                "Rejected <redacted>. Retry later",
+                ("dTpwdw==",),
+            ),
+            (
+                "basic_ellipsis_preserved",
+                "Rejected Basic dTpwdw==...",
+                "Rejected <redacted>...",
+                ("dTpwdw==",),
+            ),
+            (
+                "basic_colon_space_preserved",
+                "Basic dTpwdw==: 401",
+                "<redacted>: 401",
+                ("dTpwdw==",),
+            ),
+        )
+        for label, raw, expected, forbidden in overlap_cases:
+            with self.subTest(case=label):
+                redacted = diagnostics._redact_text(raw)
+                self.assertEqual(redacted, expected)
+                self.assertEqual(diagnostics._redact_text(redacted), expected)
+                self.assertTrue(diagnostics._has_sensitive_value(raw))
+                self.assertFalse(diagnostics.is_safe_human_note(raw))
+                peer_err = error_detail(
+                    RemoteError(
+                        {
+                            "type": "ProviderError",
+                            "code": "provider_error",
+                            "message": raw,
+                        }
+                    )
+                )
+                self.assertEqual(peer_err["message"], expected)
+                self.assertEqual(peer_err["diagnostic"]["cause"], expected)
+                for piece in forbidden:
+                    self.assertNotIn(piece, redacted)
+                    self.assertNotIn(piece, peer_err["message"])
+                    self.assertNotIn(piece, peer_err["diagnostic"]["cause"])
+
+        # Baseline negative controls remain untouched and non-sensitive.
+        for benign in (
+            "basic validation failed",
+            "Basic Validation failed",
+            "Basic Profile1-v2",
+            "Basic RecipeV2.json",
+            "Basic key=value",
+            "Basic token=plainvalue",
+            "Basic https://example.com/docs/guide",
+            f"foo{jwt_std}",
+            f"foo_{jwt_std}",
+            "token-eyJ12-3456.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig",
+            "eyJhbGciOiJIUzI1NiJ9.notjwtpayload.sig",
+            "https://example.com/docs/guide?ref=token-123",
+        ):
+            with self.subTest(benign=benign):
+                self.assertEqual(diagnostics._redact_text(benign), benign)
+                self.assertFalse(diagnostics._has_sensitive_value(benign))
+
+    def test_c7e_scan_cap_boundaries_and_large_pathological_linear_scans(self):
+        jwt_std = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig12345"
+        gh_tok = "gh" + "p_" + "1234567890abcdef123456"
+
+        # Scan-cap (4096) boundary cuts on hyphenated JWT & Basic overlap.
+        for label, payload, forbidden in (
+            (
+                "hyphen_jwt_at_scan_cap",
+                "Bearer " + ("z" * 4070) + f" token-{jwt_std} " + ("x" * 5000),
+                ("eyJhbG", "eyJzdW", "sig12345"),
+            ),
+            (
+                "sb_jwt_at_scan_cap",
+                "Bearer "
+                + ("z" * 4055)
+                + f" sb-access-token-{jwt_std} "
+                + ("x" * 5000),
+                ("eyJhbG", "eyJzdW", "sig12345"),
+            ),
+            (
+                "basic_jwt_at_scan_cap",
+                "Bearer " + ("z" * 4070) + f" Basic {jwt_std} " + ("x" * 5000),
+                ("eyJhbG", "eyJzdW", "sig12345"),
+            ),
+            (
+                "basic_token_ghp_at_scan_cap",
+                "Bearer " + ("z" * 4070) + f" Basic token={gh_tok} " + ("x" * 5000),
+                ("ghp_", "123456"),
+            ),
+        ):
+            with self.subTest(boundary=label):
+                out = diagnostics._truncate(payload, 512)
+                self.assertLessEqual(len(out), 512)
+                self.assertIn("<redacted>", out)
+                for piece in forbidden:
+                    self.assertNotIn(piece, out)
+
+        # Large pathological inputs stay strictly linear without quadratic blowup.
+        no_dot_flood = "eyJaaaaaaaa-" * 20_000
+        self.assertEqual(diagnostics._redact_text(no_dot_flood), no_dot_flood)
+        self.assertFalse(diagnostics._has_sensitive_value(no_dot_flood))
+
+        flood_then_hyphen_jwt = f"{no_dot_flood} token-{jwt_std}"
+        redacted_flood_jwt = diagnostics._redact_text(flood_then_hyphen_jwt)
+        self.assertTrue(redacted_flood_jwt.endswith(" token-<redacted>"))
+        self.assertNotIn("sig12345", redacted_flood_jwt)
+        self.assertTrue(diagnostics._has_sensitive_value(flood_then_hyphen_jwt))
+
+        huge_eyj_prefix_dot = ("eyJaaaaaaaa-" * 20_000) + ".eyJbbbbbbbb.sig"
+        self.assertEqual(diagnostics._redact_text(huge_eyj_prefix_dot), "<redacted>")
+        self.assertTrue(diagnostics._has_sensitive_value(huge_eyj_prefix_dot))
+
+        huge_non_eyj_prefix_dot = ("aaaaaaaaaaa-" * 20_000) + ".eyJbbbbbbbb.sig"
+        self.assertEqual(
+            diagnostics._redact_text(huge_non_eyj_prefix_dot), huge_non_eyj_prefix_dot
+        )
+        self.assertFalse(diagnostics._has_sensitive_value(huge_non_eyj_prefix_dot))
+
+        many_non_jwt_dots = ("a" * 20 + ".eyJbbbbbbbb ") * 5_000
+        self.assertEqual(diagnostics._redact_text(many_non_jwt_dots), many_non_jwt_dots)
+        self.assertFalse(diagnostics._has_sensitive_value(many_non_jwt_dots))
+
+        huge_basic_cont = "Basic " + ("a" * 100_000) + "_tail"
+        self.assertEqual(diagnostics._redact_text(huge_basic_cont), huge_basic_cont)
+        self.assertFalse(diagnostics._has_sensitive_value(huge_basic_cont))
+
+        huge_basic_eq = ("Basic a=b " * 10_000) + f"Basic token={gh_tok}"
+        redacted_basic_eq = diagnostics._redact_text(huge_basic_eq)
+        self.assertTrue(redacted_basic_eq.endswith("Basic token=<redacted>"))
+        self.assertNotIn("1234567890abcdef123456", redacted_basic_eq)
+        self.assertTrue(diagnostics._has_sensitive_value(huge_basic_eq))
+
+        # 32MB peer RemoteError with hyphenated JWT keeps scan bounded and compact.
+        seen_lengths: list[int] = []
+        real_redact = diagnostics._redact_text
+
+        def spy_redact(value: str) -> str:
+            seen_lengths.append(len(value))
+            return real_redact(value)
+
+        huge_peer = f"sb-access-token-{jwt_std} " + (
+            "eyJaaaaaaaa-" * (32 * 1024 * 1024 // 12)
+        )
+        with patch("xbloom_studio.diagnostics._redact_text", side_effect=spy_redact):
+            sanitized = error_detail(
+                RemoteError(
+                    {
+                        "type": "ProviderError",
+                        "code": "provider_error",
+                        "message": huge_peer,
+                    }
+                )
+            )
+        self.assertTrue(seen_lengths)
+        self.assertTrue(
+            all(n <= diagnostics._MAX_TRUNCATE_SCAN for n in seen_lengths),
+            seen_lengths,
+        )
+        self.assertLessEqual(len(sanitized["message"]), diagnostics.MAX_SANITISED_TEXT)
+        self.assertTrue(sanitized["message"].startswith("sb-access-token-<redacted>"))
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", sanitized["message"])
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", sanitized["diagnostic"]["cause"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -61,9 +61,17 @@ _REDACT_VALUE = re.compile(
     r"|\bAIza[0-9A-Za-z_-]{20,}"
     r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"
     r"|\bbasic\s+(?P<basic_tok>[A-Za-z0-9+/=]+)"
-    r"|(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?"
     r"|https?://[^/\s:@]+:[^/\s@]+@"
     r")"
+)
+_JWT_PAYLOAD_DOT = re.compile(r"(?i)\.eyJ[A-Za-z0-9_-]{8,}")
+_JWT_HEADER_PREFIX = re.compile(r"(?i)(?<![A-Za-z0-9_])eyJ")
+_JWT_CHAR_SET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+)
+_BASIC_CONT_CHAR_SET = frozenset("_-~")
+_BASIC_DOT_CONT_CHAR_SET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_~+/=-"
 )
 _TRUNCATED_SECRET_TAIL = re.compile(
     r"(?i)(?:"
@@ -764,28 +772,47 @@ def _is_basic_secret(token: str) -> bool:
     n = len(token)
     if n < 4:
         return False
-    if token.endswith("="):
+    stripped = token
+    if "=" in token:
         stripped = token.rstrip("=")
         pad_len = n - len(stripped)
-        if 1 <= pad_len <= 2 and len(stripped) >= 2 and "=" not in stripped:
-            return True
+        if not (
+            1 <= pad_len <= 2
+            and len(stripped) >= 2
+            and "=" not in stripped
+            and n % 4 == 0
+        ):
+            return False
     if n >= 8 and (
-        not token.isalpha()
-        or not (token.islower() or token.isupper() or token.istitle())
+        not stripped.isalpha()
+        or not (stripped.islower() or stripped.isupper() or stripped.istitle())
     ):
         return True
-    if "=" in token:
-        return False
-    if ("/" in token or "+" in token) and not token.islower() and not token.isupper():
+    if (
+        ("/" in stripped or "+" in stripped)
+        and not stripped.islower()
+        and not stripped.isupper()
+    ):
         return True
     if n % 4 == 1:
         return False
-    padded = token + ("=" * ((4 - n % 4) % 4))
+    padded = token if "=" in token else token + ("=" * ((4 - n % 4) % 4))
     try:
         decoded = base64.b64decode(padded, validate=True)
     except Exception:
         return False
     return b":" in decoded and all(32 <= byte <= 126 for byte in decoded)
+
+
+def _has_basic_token_continuation(text: str, end: int) -> bool:
+    """Return whether a ``Basic`` candidate is only a prefix of a larger token."""
+    length = len(text)
+    if end >= length:
+        return False
+    ch = text[end]
+    if ch in _BASIC_CONT_CHAR_SET:
+        return True
+    return ch == "." and end + 1 < length and text[end + 1] in _BASIC_DOT_CONT_CHAR_SET
 
 
 def _redact_pem(text: str) -> str:
@@ -809,8 +836,8 @@ def _redact_pem(text: str) -> str:
     return "".join(out)
 
 
-def _iter_sensitive_matches(text: str) -> Iterator[re.Match[str]]:
-    """Yield secret matches in ``text`` without consuming adjacent auth labels."""
+def _iter_non_jwt_sensitive_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Yield non-JWT secret spans in ``text`` without consuming adjacent labels."""
     pos = 0
     length = len(text)
     while pos < length:
@@ -818,29 +845,84 @@ def _iter_sensitive_matches(text: str) -> Iterator[re.Match[str]]:
         if match is None:
             return
         basic_tok = match.group("basic_tok")
-        if basic_tok is not None and not _is_basic_secret(basic_tok):
+        if basic_tok is not None and (
+            not _is_basic_secret(basic_tok)
+            or _has_basic_token_continuation(text, match.end())
+        ):
             pos = match.start("basic_tok")
             continue
-        yield match
+        yield match.start(), match.end()
         pos = match.end()
+
+
+def _iter_jwt_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Yield JWT spans in ``text`` in O(n) time, including after ``-``."""
+    if "." not in text:
+        return
+    pos = 0
+    length = len(text)
+    while pos < length:
+        payload = _JWT_PAYLOAD_DOT.search(text, pos)
+        if payload is None:
+            return
+        dot_idx = payload.start()
+        header_start = dot_idx
+        while header_start > 0 and text[header_start - 1] in _JWT_CHAR_SET:
+            header_start -= 1
+        if dot_idx - header_start >= 11:
+            prefix = _JWT_HEADER_PREFIX.search(text, header_start, dot_idx - 8)
+            if prefix is not None:
+                jwt_end = payload.end()
+                if (
+                    jwt_end + 1 < length
+                    and text[jwt_end] == "."
+                    and text[jwt_end + 1] in _JWT_CHAR_SET
+                ):
+                    sig_end = jwt_end + 2
+                    while sig_end < length and text[sig_end] in _JWT_CHAR_SET:
+                        sig_end += 1
+                    jwt_end = sig_end
+                yield prefix.start(), jwt_end
+                pos = jwt_end
+                continue
+        pos = dot_idx + 1
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if len(spans) <= 1:
+        return spans
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            if end > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _has_sensitive_value(text: str) -> bool:
     if "-----" in text and _PEM_BEGIN.search(text):
         return True
-    return next(_iter_sensitive_matches(text), None) is not None
+    return (
+        next(_iter_non_jwt_sensitive_spans(text), None) is not None
+        or next(_iter_jwt_spans(text), None) is not None
+    )
 
 
 def _redact_text(text: str) -> str:
     cleaned = _redact_pem(text)
+    spans = list(_iter_non_jwt_sensitive_spans(cleaned))
+    spans.extend(_iter_jwt_spans(cleaned))
+    if not spans:
+        return cleaned
     out: list[str] = []
     pos = 0
-    for match in _iter_sensitive_matches(cleaned):
-        out.append(cleaned[pos : match.start()])
+    for start, end in _merge_spans(spans):
+        out.append(cleaned[pos:start])
         out.append("<redacted>")
-        pos = match.end()
-    if not out:
-        return cleaned
+        pos = end
     out.append(cleaned[pos:])
     return "".join(out)
 
