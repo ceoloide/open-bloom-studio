@@ -1367,44 +1367,45 @@ def _parse_attempt_outcomes(
     return outcomes
 
 
+def _single_slot(value: Any) -> str | None:
+    return value if type(value) is str and value in _VALID_SLOTS else None
+
+
 def _consistent_single_slot(
-    record: Mapping[str, Any], payload: Mapping[str, Any] | None
+    record: Mapping[str, Any],
+    enclosing_maps: Sequence[Mapping[str, Any]],
 ) -> bool:
     slots: set[str] = set()
-    for candidate in (
-        record.get("slot") if "slot" in record else None,
-        record["preset"].get("slot")
-        if isinstance(record.get("preset"), Mapping)
-        else None,
-        payload.get("slot")
-        if isinstance(payload, Mapping) and "slot" in payload
-        else None,
-    ):
-        if candidate is None:
-            continue
-        valid = _valid_slot_value(candidate)
-        if valid is None or "," in valid:
-            return False
-        slots.add(valid)
-    if "slot" in record and _valid_slot_value(record["slot"]) is None:
-        return False
-    if "preset" in record:
-        preset = record["preset"]
-        if (
-            not isinstance(preset, Mapping)
-            or _valid_slot_value(preset.get("slot")) is None
-        ):
-            return False
-    if isinstance(payload, Mapping) and "slot" in payload:
-        if _valid_slot_value(payload["slot"]) is None:
-            return False
-    return len(slots) <= 1
+    for mapping in (record, *enclosing_maps):
+        if "slot" in mapping:
+            slot = _single_slot(mapping["slot"])
+            if slot is None:
+                return False
+            slots.add(slot)
+        if "requested_slots" in mapping:
+            raw_slots = mapping["requested_slots"]
+            if not isinstance(raw_slots, list) or len(raw_slots) != 1:
+                return False
+            slot = _single_slot(raw_slots[0])
+            if slot is None:
+                return False
+            slots.add(slot)
+        if "preset" in mapping:
+            preset = mapping["preset"]
+            if not isinstance(preset, Mapping):
+                return False
+            slot = _single_slot(preset.get("slot"))
+            if slot is None:
+                return False
+            slots.add(slot)
+    return len(slots) == 1
 
 
 def render_preset_write_next_step(
     record: Mapping[str, Any],
     *,
     payload: Mapping[str, Any] | None = None,
+    enclosing: Mapping[str, Any] | None = None,
     recovery_required: bool | None = None,
 ) -> str:
     """Render preset-write ``next_step`` strictly from local policy and evidence.
@@ -1429,47 +1430,64 @@ def render_preset_write_next_step(
         if recovery_required is True
         else _SAFE_PRESET_READONLY_RECOVERY
     )
+    enclosing_maps = tuple(
+        mapping for mapping in (enclosing, payload) if isinstance(mapping, Mapping)
+    )
     raw_outcome = record.get("outcome")
     outcome_valid = "outcome" not in record or (
         type(raw_outcome) is str and raw_outcome in valid_outcomes
     )
     outcome = raw_outcome if type(raw_outcome) is str and outcome_valid else None
 
-    payload_outcome: str | None = None
-    payload_valid = True
-    saved_observed = False
-    if isinstance(payload, Mapping):
-        if "saved_observed" in payload:
-            if type(payload["saved_observed"]) is bool:
-                saved_observed = payload["saved_observed"]
+    enclosing_valid = True
+    record_saved_observed = False
+    if "saved_observed" in record:
+        if type(record["saved_observed"]) is bool:
+            record_saved_observed = record["saved_observed"]
+        else:
+            enclosing_valid = False
+
+    live_saved = False
+    enclosing_outcomes: list[str] = []
+    observed_bools: set[bool] = set()
+    for mapping in enclosing_maps:
+        if (
+            "recovery_required" in mapping
+            and mapping["recovery_required"] is not None
+            and type(mapping["recovery_required"]) is not bool
+        ):
+            enclosing_valid = False
+        if "saved_observed" in mapping:
+            if type(mapping["saved_observed"]) is bool:
+                observed_bools.add(mapping["saved_observed"])
+                if mapping["saved_observed"]:
+                    live_saved = True
             else:
-                payload_valid = False
-        if "outcome" in payload:
-            p_out = payload["outcome"]
+                enclosing_valid = False
+        if "outcome" in mapping:
+            p_out = mapping["outcome"]
             if type(p_out) is str and p_out in valid_outcomes:
-                payload_outcome = p_out
+                enclosing_outcomes.append(p_out)
+                if p_out in SAVED:
+                    live_saved = True
             else:
-                payload_valid = False
+                enclosing_valid = False
+    if (
+        len(observed_bools) > 1
+        or len(set(enclosing_outcomes)) > 1
+        or (True in observed_bools and any(o not in SAVED for o in enclosing_outcomes))
+        or (False in observed_bools and any(o in SAVED for o in enclosing_outcomes))
+    ):
+        enclosing_valid = False
 
     attempts_outcomes = _parse_attempt_outcomes(record.get("attempts"), valid_outcomes)
     any_attempt_saved = bool(
         attempts_outcomes is not None and (SAVED & set(attempts_outcomes))
     )
     any_saved = (
-        outcome in SAVED
-        or payload_outcome in SAVED
-        or saved_observed
-        or any_attempt_saved
+        outcome in SAVED or live_saved or record_saved_observed or any_attempt_saved
     )
-    cleanup_failed = (
-        outcome == "saved_cleanup_failed"
-        or payload_outcome == "saved_cleanup_failed"
-        or (
-            attempts_outcomes is not None
-            and "saved_cleanup_failed" in attempts_outcomes
-        )
-    )
-    if cleanup_failed or (any_saved and recovery_required is True):
+    if any_saved and recovery_required is True:
         return _SAVED_CLEANUP_FAILED_FIX
 
     write_id = safe_identifier(record.get("write_id"))
@@ -1479,8 +1497,8 @@ def render_preset_write_next_step(
         write_id is None
         or state is None
         or not outcome_valid
-        or not payload_valid
-        or not _consistent_single_slot(record, payload)
+        or not enclosing_valid
+        or not _consistent_single_slot(record, enclosing_maps)
         or attempts_outcomes is None
     ):
         return fallback
@@ -1505,8 +1523,21 @@ def render_preset_write_next_step(
     if len(counted) != attempts_used:
         return fallback
 
+    if state == "superseded":
+        if (
+            recovery_required is True
+            or live_saved
+            or record_saved_observed
+            or enclosing_maps
+            or outcome is not None
+            or retry_allowed is not False
+            or remaining != 0
+        ):
+            return fallback
+        return NEXT_STEPS["superseded"]
+
     if state == "saved":
-        if retry_allowed is not False or remaining != 0 or not any_saved:
+        if retry_allowed is not False or remaining != 0 or not any_attempt_saved:
             return fallback
         return NEXT_STEPS["saved"].format(write_id=write_id)
 
@@ -1554,6 +1585,8 @@ def render_preset_write_next_step(
                 and outcome not in RETRYABLE
                 and outcome != "refused"
             )
+            or any(out not in RETRYABLE for out in enclosing_outcomes)
+            or (isinstance(enclosing, Mapping) and enclosing.get("status") != "failed")
         ):
             return fallback
         step = NEXT_STEPS["retryable"].format(
@@ -1563,21 +1596,18 @@ def render_preset_write_next_step(
             step += NO_PRESET_FRAME
         return step
 
-    if state == "not_sent":
-        if (
-            recovery_required is True
-            or retry_allowed is not True
-            or attempts_used != 0
-            or remaining != max_attempts
-            or (outcome is not None and outcome != "refused")
-        ):
-            return fallback
-        return NEXT_STEPS["not_sent"]
-
-    # state == "superseded"
-    if recovery_required is True or retry_allowed is not False or remaining != 0:
+    # state == "not_sent"
+    if (
+        recovery_required is True
+        or retry_allowed is not True
+        or attempts_used != 0
+        or remaining != max_attempts
+        or (outcome is not None and outcome != "refused")
+        or bool(enclosing_outcomes)
+        or (isinstance(enclosing, Mapping) and enclosing.get("status") != "failed")
+    ):
         return fallback
-    return NEXT_STEPS["superseded"]
+    return NEXT_STEPS["not_sent"]
 
 
 def _preset_write_fix(
@@ -1636,7 +1666,22 @@ def preset_write_diagnostic(
     location: dict[str, Any] = {}
     summary_bits: list[str] = []
     source = attempt if isinstance(attempt, Mapping) else payload
-    slot = _extract_preset_slot(source) or _extract_preset_slot(payload)
+    source_slot = _extract_preset_slot(source)
+    payload_slot = _extract_preset_slot(payload)
+    payload_has_slot = isinstance(payload, Mapping) and (
+        "slot" in payload or "requested_slots" in payload
+    )
+    slot = (
+        source_slot
+        if source_slot
+        and (
+            (not payload_has_slot and payload_slot is None)
+            or payload_slot == source_slot
+        )
+        else payload_slot
+        if source_slot is None
+        else None
+    )
     if slot:
         location["kind"] = "slot"
         location["slot"] = slot
@@ -1652,8 +1697,18 @@ def preset_write_diagnostic(
     state: str | None = None
     retry_allowed: bool | None = None
     local_next_step: str | None = None
+    payload_outcome = (
+        payload["outcome"]
+        if isinstance(payload, Mapping)
+        and isinstance(payload.get("outcome"), str)
+        and payload["outcome"].strip()
+        else None
+    )
     saved_observed = bool(
-        isinstance(payload, Mapping) and payload.get("saved_observed") is True
+        isinstance(payload, Mapping)
+        and (
+            payload.get("saved_observed") is True or payload_outcome in _SAVED_OUTCOMES
+        )
     )
 
     if isinstance(source, Mapping):
@@ -1677,11 +1732,11 @@ def preset_write_diagnostic(
             summary_bits.append(f"retry_allowed={str(retry_allowed).lower()}")
         if isinstance(source.get("next_step"), str) and source["next_step"].strip():
             local_next_step = source["next_step"]
-    if outcome is None and isinstance(payload, Mapping):
-        raw_out = payload.get("outcome")
-        if isinstance(raw_out, str) and raw_out.strip():
-            outcome = raw_out
-            summary_bits.append(f"outcome={outcome}")
+    if outcome is None and payload_outcome is not None:
+        outcome = payload_outcome
+        summary_bits.append(f"outcome={outcome}")
+    elif payload_outcome == "saved_cleanup_failed":
+        outcome = payload_outcome
     if recovery_required is True:
         summary_bits.append("recovery_required=true")
 
@@ -2073,7 +2128,10 @@ def sanitize_remote_result(
                 if strict and type(attempt["next_step"]) is not str:
                     raise ValueError("Remote preset attempt next_step must be a string")
                 attempt["next_step"] = render_preset_write_next_step(
-                    attempt, payload=payload, recovery_required=rec_req
+                    attempt,
+                    payload=payload,
+                    enclosing=cleaned,
+                    recovery_required=rec_req,
                 )
             cleaned["attempt"] = attempt
         if cleaned.get("status") == "failed":

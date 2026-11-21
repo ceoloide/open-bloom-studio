@@ -743,12 +743,14 @@ def _emit_human_operation_diagnostic(
     a: argparse.Namespace,
     result: Mapping[str, Any],
     tracker: _SourceTracker | None,
+    *,
+    expected_id: str | None = None,
 ) -> None:
     if _effective_error_format(getattr(a, "error_format", "auto")) != "human":
         return
     raw_status = result.get("status")
     status = raw_status if raw_status in ("failed", "unknown") else "unknown"
-    raw_op_id = result.get("id")
+    raw_op_id = expected_id if expected_id is not None else result.get("id")
     safe_op_id = safe_identifier(raw_op_id)
     unsafe_raw_id = (
         raw_op_id.strip()
@@ -817,6 +819,53 @@ def _emit_human_operation_diagnostic(
     print(
         render_human_diagnostic(envelope, context=context, trusted_local=True),
         file=sys.stderr,
+    )
+
+
+def _emit_watch_mismatch(
+    a: argparse.Namespace,
+    expected_id: str | None,
+    tracker: _SourceTracker | None,
+) -> None:
+    safe_op_id = safe_identifier(expected_id)
+    context = _command_context(a, tracker)
+    location: dict[str, Any] = {"kind": "command", "command": _command_label(a)}
+    if tracker is not None and tracker.method:
+        location["method"] = tracker.method
+    if safe_op_id is not None:
+        location["operation_id"] = safe_op_id
+    cause = (
+        "Daemon returned a mismatched operation record while watching the "
+        "requested operation; its status is unverified."
+    )
+    fix = (
+        f"Inspect read-only `xbloom-studio history get {safe_op_id}`, "
+        f"`xbloom-studio history events {safe_op_id}`, `xbloom-studio machine "
+        "state`, and the physical machine. Never automatically replay a "
+        "start with a new idempotency key."
+        if safe_op_id is not None
+        else None
+    )
+    diag = build_diagnostic(
+        "XB_OPERATION_FAILED",
+        cause=cause,
+        fix=fix,
+        location=location,
+    )
+    envelope: dict[str, Any] = {
+        "type": "OperationWatchError",
+        "code": "operation_failed",
+        "message": cause,
+        "details": {"operation_id": safe_op_id} if safe_op_id is not None else {},
+        "next_step": diag["fix"],
+        "retryable": False,
+        "diagnostic": diag,
+    }
+    _emit_cli_error(
+        getattr(a, "error_format", "auto"),
+        envelope,
+        context,
+        trusted_local=True,
     )
 
 
@@ -1264,6 +1313,14 @@ async def _execute(
             params["after"] = result[-1]["id"]
             result = await invoke(method, params)
         return 0
+    started = method in ("operation_start", "recipe_start_uploaded")
+    watching_cmd = a.command == "operation" and a.action == "watch"
+    watch = (started and (not remote or getattr(a, "wait", False))) or watching_cmd
+    if watching_cmd:
+        expected_id = params["ident"]
+        if not isinstance(result, Mapping) or result.get("id") != expected_id:
+            _emit_watch_mismatch(a, expected_id, tracker)
+            return 2
     output(result)
     if method in ("recipe_validate", "recipe_tea_validate"):
         if not result["valid"]:
@@ -1287,28 +1344,36 @@ async def _execute(
             remote=remote,
         )
         return 2
-    started = method in ("operation_start", "recipe_start_uploaded")
-    watch = (started and (not remote or getattr(a, "wait", False))) or (
-        a.command == "operation" and a.action == "watch"
-    )
     if not watch:
         return 0
-    ident, last = result["id"], None
-    while result["status"] in ACTIVE:
+    if watching_cmd:
+        ident = params["ident"]
+    else:
+        raw_ident = result.get("id") if isinstance(result, Mapping) else None
+        if not isinstance(raw_ident, str) or not raw_ident:
+            _emit_watch_mismatch(a, None, tracker)
+            return 2
+        ident = raw_ident
+    last = None
+    while result.get("status") in ACTIVE:
         if result["status"] == "waiting_for_user" and not remote:
             raise ValueError(
                 "Host preparation gates require a daemon caller to acknowledge "
                 "their exact tokens"
             )
         await asyncio.sleep(1 if a.ssh is not None else 0.1)
-        result = await invoke("history_get", {"ident": ident})
+        polled = await invoke("history_get", {"ident": ident})
+        if not isinstance(polled, Mapping) or polled.get("id") != ident:
+            _emit_watch_mismatch(a, ident, tracker)
+            return 2
+        result = polled
         text = dumps(result)
         if text != last:
             output(result)
             last = text
-    if result["status"] in ("failed", "unknown"):
-        _emit_human_operation_diagnostic(a, result, tracker)
-    return 0 if result["status"] == "completed" else 2
+    if result.get("status") in ("failed", "unknown"):
+        _emit_human_operation_diagnostic(a, result, tracker, expected_id=ident)
+    return 0 if result.get("status") == "completed" else 2
 
 
 def _emit_cli_error(

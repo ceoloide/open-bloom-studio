@@ -148,23 +148,36 @@ def _sanitize_remote_preset_write_details(filtered: dict[str, Any]) -> None:
     details = filtered.get("details")
     if not isinstance(details, dict):
         return
-    raw_pw = details.get("preset_write")
-    if not isinstance(raw_pw, dict):
-        return
-    pw_copy = dict(raw_pw)
+    details_copy = dict(details)
     changed = False
-    if "next_step" in pw_copy:
-        pw_copy["next_step"] = render_preset_write_next_step(pw_copy)
-        changed = True
-    raw_attempt = pw_copy.get("attempt")
-    if isinstance(raw_attempt, dict) and "next_step" in raw_attempt:
-        att_copy = dict(raw_attempt)
-        att_copy["next_step"] = render_preset_write_next_step(att_copy, payload=pw_copy)
-        pw_copy["attempt"] = att_copy
+    raw_pw = details.get("preset_write")
+    if isinstance(raw_pw, dict):
+        pw_copy = dict(raw_pw)
+        pw_changed = False
+        if "next_step" in pw_copy:
+            pw_copy["next_step"] = render_preset_write_next_step(pw_copy)
+            pw_changed = True
+        raw_attempt = pw_copy.get("attempt")
+        if isinstance(raw_attempt, dict) and "next_step" in raw_attempt:
+            att_copy = dict(raw_attempt)
+            att_copy["next_step"] = render_preset_write_next_step(
+                att_copy, payload=pw_copy
+            )
+            pw_copy["attempt"] = att_copy
+            pw_changed = True
+        if pw_changed:
+            details_copy["preset_write"] = pw_copy
+            changed = True
+    raw_top_attempt = details.get("attempt")
+    if isinstance(raw_top_attempt, dict) and "next_step" in raw_top_attempt:
+        att_copy = dict(raw_top_attempt)
+        att_copy["next_step"] = render_preset_write_next_step(
+            att_copy,
+            payload=details,
+        )
+        details_copy["attempt"] = att_copy
         changed = True
     if changed:
-        details_copy = dict(details)
-        details_copy["preset_write"] = pw_copy
         filtered["details"] = details_copy
 
 
