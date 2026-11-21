@@ -52,21 +52,22 @@ def bases(
     if chosen:
         if not os.path.isdir(chosen):
             raise RuntimeError(f"{TMPBASE}={chosen!r} is not a directory")
-        # Before Python 3.12 mkdtemp keeps a relative dir relative, and the
-        # owner's cleanup would then follow a later chdir.
-        return [os.path.abspath(chosen)]
+        # Resolve symlinks before "..", as the kernel does.
+        return [os.path.realpath(chosen)]
     return [*(path for path in BASES if usable(path, statvfs)), None]
 
 
 def create(environ: Mapping[str, str], prefix: str = PREFIX) -> Path:
     """Make a new, empty, private root under the first base that accepts it."""
+    # Before Python 3.12 mkdtemp can return a relative path, and the owner's
+    # cleanup would then follow a later chdir; hence abspath.
     *fallbacks, last = bases(environ)
     for directory in fallbacks:
         try:
-            return Path(tempfile.mkdtemp(prefix=prefix, dir=directory))
+            return Path(os.path.abspath(tempfile.mkdtemp(prefix=prefix, dir=directory)))
         except OSError:
             pass  # os.access misses sandbox rules, such as Landlock; try the next.
-    return Path(tempfile.mkdtemp(prefix=prefix, dir=last))
+    return Path(os.path.abspath(tempfile.mkdtemp(prefix=prefix, dir=last)))
 
 
 def environment(root: Path) -> dict[str, str]:

@@ -15,6 +15,9 @@ from scripts import testroot
 
 MIB = 1024 * 1024
 
+# A known flag, so the tests do not depend on this platform's os.ST_NOEXEC.
+NOEXEC = 1 << 20
+
 
 def statvfs(*, flag=0, free=testroot.MIN_FREE, missing=()):
     """A fake ``os.statvfs``: ``free`` bytes in 4 KiB blocks, given mount flags."""
@@ -33,11 +36,14 @@ class BaseTests(unittest.TestCase):
         access = mock.patch.object(testroot.os, "access", return_value=True)
         self.access = access.start()
         self.addCleanup(access.stop)
+        noexec = mock.patch.object(testroot.os, "ST_NOEXEC", NOEXEC, create=True)
+        noexec.start()
+        self.addCleanup(noexec.stop)
 
     def test_usable_needs_exec_space_and_access(self):
         self.assertTrue(testroot.usable("/dev/shm", statvfs()))
         cases = {
-            "no-exec": statvfs(flag=os.ST_NOEXEC),
+            "no-exec": statvfs(flag=NOEXEC),
             "under 64 MiB": statvfs(free=64 * MIB - 4096),
             "missing": statvfs(missing=("/dev/shm",)),
         }
@@ -49,11 +55,17 @@ class BaseTests(unittest.TestCase):
         self.assertFalse(testroot.usable("/dev/shm", statvfs()))
         self.access.assert_called_once_with("/dev/shm", os.W_OK | os.X_OK)
 
+    def test_usable_without_a_no_exec_constant_ignores_mount_flags(self):
+        del testroot.os.ST_NOEXEC
+        # Runs before the patch stops, which expects the attribute back.
+        self.addCleanup(setattr, testroot.os, "ST_NOEXEC", NOEXEC)
+        self.assertTrue(testroot.usable("/dev/shm", statvfs(flag=NOEXEC)))
+
     def test_bases_lists_usable_candidates_then_the_default(self):
         self.assertEqual(testroot.bases({}, statvfs()), ["/dev/shm", "/tmp", None])
         shm_missing = statvfs(missing=("/dev/shm",))
         self.assertEqual(testroot.bases({}, shm_missing), ["/tmp", None])
-        self.assertEqual(testroot.bases({}, statvfs(flag=os.ST_NOEXEC)), [None])
+        self.assertEqual(testroot.bases({}, statvfs(flag=NOEXEC)), [None])
 
     def test_set_base_variable_wins_and_must_be_a_directory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -64,6 +76,15 @@ class BaseTests(unittest.TestCase):
                 testroot.bases({testroot.TMPBASE: f"{directory}/missing"})
         empty = {testroot.TMPBASE: ""}
         self.assertEqual(testroot.bases(empty, statvfs()), ["/dev/shm", "/tmp", None])
+
+    def test_base_variable_resolves_symlinks_before_parent_steps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory, "target")
+            (target / "child").mkdir(parents=True)
+            link = Path(directory, "link")
+            link.symlink_to(target / "child")
+            root = testroot.create({testroot.TMPBASE: f"{link}/.."})
+            self.assertTrue(root.parent.samefile(target))
 
     def test_relative_base_variable_becomes_absolute(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -122,10 +143,22 @@ class TestRootTests(unittest.TestCase):
         with (
             mock.patch.object(
                 testroot.tempfile, "mkdtemp", side_effect=PermissionError("denied")
-            ),
+            ) as mkdtemp,
             self.assertRaises(PermissionError),
         ):
             testroot.create(self.environ)
+        mkdtemp.assert_called_once_with(prefix=testroot.PREFIX, dir=self.base)
+
+    def test_relative_mkdtemp_result_becomes_absolute(self):
+        # Python 3.10 and 3.11 return a relative path when the default is ".".
+        for bases in ([None], ["/unused", None]):
+            with (
+                self.subTest(bases=bases),
+                mock.patch.object(testroot, "bases", return_value=bases),
+                mock.patch.object(testroot.tempfile, "mkdtemp", return_value="xbs-rel"),
+            ):
+                root = testroot.create({})
+            self.assertEqual(root, Path.cwd() / "xbs-rel")
 
     def test_environment_makes_and_names_the_layout(self):
         variables = testroot.environment(self.root)
