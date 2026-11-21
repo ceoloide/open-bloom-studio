@@ -60,7 +60,7 @@ _REDACT_VALUE = re.compile(
     r"|\bpypi-AgEI[A-Za-z0-9_-]{20,}"
     r"|\bAIza[0-9A-Za-z_-]{20,}"
     r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"
-    r"|\bbasic\s+(?P<basic_tok>[A-Za-z0-9+/=]+)"
+    r"|\bbasic\s+(?P<basic_tok>[A-Za-z0-9+/_-]+={0,2})"
     r"|https?://[^/\s:@]+:[^/\s@]+@"
     r")"
 )
@@ -68,6 +68,11 @@ _JWT_PAYLOAD_DOT = re.compile(r"(?i)\.eyJ[A-Za-z0-9_-]{8,}")
 _JWT_HEADER_PREFIX = re.compile(r"(?i)(?<![A-Za-z0-9_])eyJ")
 _JWT_CHAR_SET = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+)
+_MAX_BASIC_DECODE_LEN = 512
+_BASIC_URLSAFE_TRANS = str.maketrans("-_", "+/")
+_BASIC_HARD_CONT_CHAR_SET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
 )
 _BASIC_CONT_CHAR_SET = frozenset("_-~")
 _BASIC_DOT_CONT_CHAR_SET = frozenset(
@@ -767,10 +772,34 @@ FALLBACK_BY_ERROR_CODE: dict[str, str] = {
 }
 
 
-def _is_basic_secret(token: str) -> bool:
-    """Return whether a token after ``Basic`` looks like a base64 credential."""
+def _is_decoded_basic_credential(token: str) -> bool:
+    """Return whether a bounded Basic token decodes to printable ``user:pass``."""
     n = len(token)
-    if n < 4:
+    if n < 4 or n > _MAX_BASIC_DECODE_LEN:
+        return False
+    stripped = token.rstrip("=")
+    pad_len = n - len(stripped)
+    rem = len(stripped) % 4
+    needed_pad = (4 - rem) % 4
+    if rem == 1 or pad_len > needed_pad or "=" in stripped:
+        return False
+    has_std = "+" in stripped or "/" in stripped
+    has_url = "-" in stripped or "_" in stripped
+    if has_std and has_url:
+        return False
+    normalized = stripped.translate(_BASIC_URLSAFE_TRANS) if has_url else stripped
+    padded = normalized + ("=" * needed_pad)
+    try:
+        decoded = base64.b64decode(padded, validate=True)
+    except Exception:
+        return False
+    return b":" in decoded and all(32 <= byte <= 126 for byte in decoded)
+
+
+def _is_opaque_basic_secret(token: str) -> bool:
+    """Return whether a standard Base64 token looks like an opaque Basic secret."""
+    n = len(token)
+    if n < 4 or "-" in token or "_" in token:
         return False
     stripped = token
     if "=" in token:
@@ -788,20 +817,11 @@ def _is_basic_secret(token: str) -> bool:
         or not (stripped.islower() or stripped.isupper() or stripped.istitle())
     ):
         return True
-    if (
+    return (
         ("/" in stripped or "+" in stripped)
         and not stripped.islower()
         and not stripped.isupper()
-    ):
-        return True
-    if n % 4 == 1:
-        return False
-    padded = token if "=" in token else token + ("=" * ((4 - n % 4) % 4))
-    try:
-        decoded = base64.b64decode(padded, validate=True)
-    except Exception:
-        return False
-    return b":" in decoded and all(32 <= byte <= 126 for byte in decoded)
+    )
 
 
 def _has_basic_token_continuation(text: str, end: int) -> bool:
@@ -813,6 +833,26 @@ def _has_basic_token_continuation(text: str, end: int) -> bool:
     if ch in _BASIC_CONT_CHAR_SET:
         return True
     return ch == "." and end + 1 < length and text[end + 1] in _BASIC_DOT_CONT_CHAR_SET
+
+
+def _is_basic_secret_match(text: str, token: str, end: int) -> bool:
+    """Return whether a ``Basic`` regex match is a real credential span."""
+    length = len(text)
+    if end < length and text[end] in _BASIC_HARD_CONT_CHAR_SET:
+        return False
+    if _is_decoded_basic_credential(token):
+        if (
+            not token.endswith("=")
+            and token[:3].lower() == "eyj"
+            and end + 1 < length
+            and text[end] == "."
+            and text[end + 1] in _BASIC_DOT_CONT_CHAR_SET
+        ):
+            return False
+        return True
+    return not _has_basic_token_continuation(text, end) and _is_opaque_basic_secret(
+        token
+    )
 
 
 def _redact_pem(text: str) -> str:
@@ -845,9 +885,8 @@ def _iter_non_jwt_sensitive_spans(text: str) -> Iterator[tuple[int, int]]:
         if match is None:
             return
         basic_tok = match.group("basic_tok")
-        if basic_tok is not None and (
-            not _is_basic_secret(basic_tok)
-            or _has_basic_token_continuation(text, match.end())
+        if basic_tok is not None and not _is_basic_secret_match(
+            text, basic_tok, match.end()
         ):
             pos = match.start("basic_tok")
             continue

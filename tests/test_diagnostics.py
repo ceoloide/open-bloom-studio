@@ -6054,5 +6054,298 @@ class CouncilR4RedactionTests(unittest.TestCase):
         self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", sanitized["diagnostic"]["cause"])
 
 
+class CouncilR5BasicRedactionTests(unittest.TestCase):
+    """Focused regression probes for council R5 Basic credential variants."""
+
+    def test_c7f_basic_padded_continuations_missing_pad_and_urlsafe_variants(self):
+        jwt_std = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig12345"
+
+        cases = (
+            (
+                "dot_retry",
+                "Basic dXNlcjpwYXNzd29yZA==.Retry",
+                "<redacted>.Retry",
+                ("dXNlcjpwYXNzd29yZA",),
+            ),
+            (
+                "dash_proxy",
+                "Basic dXNlcjpwYXNzd29yZA==-proxy",
+                "<redacted>-proxy",
+                ("dXNlcjpwYXNzd29yZA",),
+            ),
+            (
+                "under_status",
+                "Basic dXNlcjpwYXNzd29yZA==_status=401",
+                "<redacted>_status=401",
+                ("dXNlcjpwYXNzd29yZA",),
+            ),
+            (
+                "one_missing_pad",
+                "Basic dXNlcjpwYXNzd29yZA=",
+                "<redacted>",
+                ("dXNlcjpwYXNzd29yZA",),
+            ),
+            (
+                "urlsafe_variant",
+                "Basic YWRtaW46cD8_c3N3MHJkPj4-",
+                "<redacted>",
+                ("YWRtaW46cD8", "c3N3MHJkPj4"),
+            ),
+            (
+                "contextual_dot_retry",
+                "Auth failed: Basic dXNlcjpwYXNzd29yZA==.Retry later",
+                "Auth failed: <redacted>.Retry later",
+                ("dXNlcjpwYXNzd29yZA",),
+            ),
+            (
+                "one_missing_pad_dot_retry",
+                "Basic dXNlcjpwYXNzd29yZA=.Retry",
+                "<redacted>.Retry",
+                ("dXNlcjpwYXNzd29yZA",),
+            ),
+            (
+                "one_missing_pad_dash_proxy",
+                "Basic dXNlcjpwYXNzd29yZA=-proxy",
+                "<redacted>-proxy",
+                ("dXNlcjpwYXNzd29yZA",),
+            ),
+            (
+                "one_missing_pad_under_status",
+                "Basic dXNlcjpwYXNzd29yZA=_status=401",
+                "<redacted>_status=401",
+                ("dXNlcjpwYXNzd29yZA",),
+            ),
+            (
+                "urlsafe_padded_dot_retry",
+                "Basic YWRtaW46cD8_c3N3MHJkPj4=.Retry",
+                "<redacted>.Retry",
+                ("YWRtaW46cD8", "c3N3MHJkPj4"),
+            ),
+            (
+                "urlsafe_padded_dash_proxy",
+                "Basic YWRtaW46cD8_c3N3MHJkPj4=-proxy",
+                "<redacted>-proxy",
+                ("YWRtaW46cD8", "c3N3MHJkPj4"),
+            ),
+            (
+                "urlsafe_padded_under_status",
+                "Basic YWRtaW46cD8_c3N3MHJkPj4=_status=401",
+                "<redacted>_status=401",
+                ("YWRtaW46cD8", "c3N3MHJkPj4"),
+            ),
+            (
+                "urlsafe_one_missing_pad",
+                "Basic YWRtaW46cD8_c3N3MHJkPg=",
+                "<redacted>",
+                ("YWRtaW46cD8", "c3N3MHJkPg"),
+            ),
+            (
+                "lowercase_urlsafe",
+                "basic YWRtaW46cD8_c3N3MHJkPj4-",
+                "<redacted>",
+                ("YWRtaW46cD8", "c3N3MHJkPj4"),
+            ),
+            (
+                "padded_basic_then_dash_jwt",
+                f"Basic dXNlcjpwYXNzd29yZA==-{jwt_std}",
+                "<redacted>-<redacted>",
+                ("dXNlcjpwYXNzd29yZA", "eyJhbGciOiJIUzI1NiJ9", "sig12345"),
+            ),
+        )
+        for label, raw, expected, forbidden in cases:
+            with self.subTest(case=label):
+                redacted = diagnostics._redact_text(raw)
+                self.assertEqual(redacted, expected)
+                self.assertEqual(diagnostics._redact_text(redacted), expected)
+                self.assertTrue(diagnostics._has_sensitive_value(raw))
+                self.assertFalse(diagnostics.is_safe_human_note(raw))
+                local_err = error_detail(ValueError(raw))
+                self.assertEqual(local_err["diagnostic"]["cause"], expected)
+                peer_err = error_detail(
+                    RemoteError(
+                        {
+                            "type": "ProviderError",
+                            "code": "provider_error",
+                            "message": raw,
+                        }
+                    )
+                )
+                self.assertEqual(peer_err["message"], expected)
+                self.assertEqual(peer_err["diagnostic"]["cause"], expected)
+                excerpt_doc = f'{{\n  "note": {json.dumps(raw)}\n}}\n'
+                excerpt = extract_json_excerpt(excerpt_doc, 2, 12)
+                assert excerpt is not None
+                excerpt_json = json.dumps(excerpt)
+                self.assertIn('"<redacted>"', excerpt_json)
+                for piece in forbidden:
+                    self.assertNotIn(piece, redacted)
+                    self.assertNotIn(piece, local_err["diagnostic"]["cause"])
+                    self.assertNotIn(piece, peer_err["message"])
+                    self.assertNotIn(piece, peer_err["diagnostic"]["cause"])
+                    self.assertNotIn(piece, excerpt_json)
+
+    def test_c7f_controls_and_no_partial_masking_of_jwt_api_or_assignments(self):
+        jwt_std = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig12345"
+        jwt_hdr_dash = "eyJhbGciOi-JIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig12345"
+        gh_tok = "gh" + "p_" + "1234567890abcdef123456"
+        sk_tok = "s" + "k-" + "1234567890abcdefghijkl"
+        aiza_dash = "AI" + "zaSyAbCdEf-GhIjKlMnOpQrStUvWxYz"
+        aiza_under = "AI" + "zaSyAbCdEf_GhIjKlMnOpQrStUvWxYz"
+
+        for benign in (
+            "Basic Profile1-v2",
+            "Basic RecipeV2.json",
+            "Basic key=value",
+            "Basic key==value",
+            "Basic token=plainvalue",
+            "Basic key=-1",
+            "Basic offset=-10",
+            "Basic dXNlcjpwYXNzd29yZA===",
+            "Basic dXNlcjpwYXNzd29yZA=value",
+            "Basic YWRtaW4+cD8_c3N3MHJkPj4-",
+            "Basic eyJhbGciOiJIUzI1NiJ9.notjwtpayload.sig",
+        ):
+            with self.subTest(benign=benign):
+                self.assertEqual(diagnostics._redact_text(benign), benign)
+                self.assertFalse(diagnostics._has_sensitive_value(benign))
+
+        for label, raw, expected in (
+            ("basic_jwt", f"Basic {jwt_std}", "Basic <redacted>"),
+            ("basic_jwt_hdr_dash", f"Basic {jwt_hdr_dash}", "Basic <redacted>"),
+            (
+                "basic_prefix_dash_jwt",
+                f"Basic myPrefix123-{jwt_std}",
+                "Basic myPrefix123-<redacted>",
+            ),
+            ("basic_token_eq_ghp", f"Basic token={gh_tok}", "Basic token=<redacted>"),
+            (
+                "basic_my_dash_token_eq_ghp",
+                f"Basic my-token={gh_tok}",
+                "Basic my-token=<redacted>",
+            ),
+            (
+                "basic_my_under_token_eq_ghp",
+                f"Basic my_token={gh_tok}",
+                "Basic my_token=<redacted>",
+            ),
+            ("basic_sk", f"Basic {sk_tok}", "Basic <redacted>"),
+            ("basic_aiza_dash", f"Basic {aiza_dash}", "Basic <redacted>"),
+            ("basic_aiza_under", f"Basic {aiza_under}", "Basic <redacted>"),
+        ):
+            with self.subTest(overlap=label):
+                self.assertEqual(diagnostics._redact_text(raw), expected)
+                self.assertTrue(diagnostics._has_sensitive_value(raw))
+
+    def test_c7f_scan_cap_and_bounded_large_input_linear_controls(self):
+        exact_tokens = (
+            ("dot_retry", "dXNlcjpwYXNzd29yZA==.Retry", ("dXNlcjpwYXNz", "d29yZA")),
+            ("dash_proxy", "dXNlcjpwYXNzd29yZA==-proxy", ("dXNlcjpwYXNz", "d29yZA")),
+            (
+                "under_status",
+                "dXNlcjpwYXNzd29yZA==_status=401",
+                ("dXNlcjpwYXNz", "d29yZA"),
+            ),
+            ("one_missing_pad", "dXNlcjpwYXNzd29yZA=", ("dXNlcjpwYXNz", "d29yZA")),
+            ("urlsafe", "YWRtaW46cD8_c3N3MHJkPj4-", ("YWRtaW46cD8", "c3N3MHJkPj4")),
+        )
+        for label, tok, forbidden in exact_tokens:
+            # 1. Variant just inside 4096 scan cap after a shrinking Bearer prefix.
+            inside_payload = (
+                "Bearer " + ("z" * 4040) + f" Basic {tok} done " + ("x" * 5000)
+            )
+            # 2. Variant straddling the 4096 scan cap cut point.
+            crossing_payload = (
+                "Bearer " + ("z" * 4076) + f" Basic {tok} " + ("x" * 5000)
+            )
+            for kind, payload in (
+                ("inside_cap", inside_payload),
+                ("crossing_cap", crossing_payload),
+            ):
+                with self.subTest(variant=label, position=kind):
+                    out = diagnostics._truncate(payload, 512)
+                    self.assertLessEqual(len(out), 512)
+                    self.assertIn("<redacted>", out)
+                    for piece in forbidden:
+                        self.assertNotIn(piece, out)
+                    peer = error_detail(
+                        RemoteError(
+                            {
+                                "type": "ProviderError",
+                                "code": "provider_error",
+                                "message": payload,
+                            }
+                        )
+                    )
+                    for piece in forbidden:
+                        self.assertNotIn(piece, peer["message"])
+                        self.assertNotIn(piece, peer["diagnostic"]["cause"])
+
+        # Bounded decode cap (> _MAX_BASIC_DECODE_LEN) skips decoding in O(1)
+        # and keeps large adversarial Basic inputs linear.
+        huge_urlsafe_non_cred = "Basic " + ("A1" * 50_000) + "-v2"
+        self.assertEqual(
+            diagnostics._redact_text(huge_urlsafe_non_cred), huge_urlsafe_non_cred
+        )
+        self.assertFalse(diagnostics._has_sensitive_value(huge_urlsafe_non_cred))
+
+        many_profile_controls = "Basic Profile1-v2 " * 10_000
+        self.assertEqual(
+            diagnostics._redact_text(many_profile_controls), many_profile_controls
+        )
+        self.assertFalse(diagnostics._has_sensitive_value(many_profile_controls))
+
+        many_key_eq_then_urlsafe = (
+            "Basic key=value " * 10_000
+        ) + "Basic YWRtaW46cD8_c3N3MHJkPj4-"
+        redacted_tail = diagnostics._redact_text(many_key_eq_then_urlsafe)
+        self.assertTrue(redacted_tail.endswith("<redacted>"))
+        self.assertNotIn("YWRtaW46cD8", redacted_tail)
+        self.assertTrue(diagnostics._has_sensitive_value(many_key_eq_then_urlsafe))
+
+        many_hyphen_basic = "Basic " + ("a-Basic" * 20_000) + " tail"
+        self.assertEqual(diagnostics._redact_text(many_hyphen_basic), many_hyphen_basic)
+        self.assertFalse(diagnostics._has_sensitive_value(many_hyphen_basic))
+
+        many_padded_retry = "Basic dXNlcjpwYXNzd29yZA==.Retry " * 5_000
+        redacted_many = diagnostics._redact_text(many_padded_retry)
+        self.assertEqual(redacted_many, "<redacted>.Retry " * 5_000)
+        self.assertNotIn("dXNlcjpwYXNzd29yZA", redacted_many)
+
+        # 32MB peer RemoteError with Basic variants stays bounded to _MAX_TRUNCATE_SCAN.
+        seen_lengths: list[int] = []
+        real_redact = diagnostics._redact_text
+
+        def spy_redact(value: str) -> str:
+            seen_lengths.append(len(value))
+            return real_redact(value)
+
+        huge_peer = (
+            "Basic YWRtaW46cD8_c3N3MHJkPj4- Basic dXNlcjpwYXNzd29yZA==_status=401 "
+            + ("Basic Profile1-v2 " * (32 * 1024 * 1024 // 18))
+        )
+        with patch("xbloom_studio.diagnostics._redact_text", side_effect=spy_redact):
+            sanitized = error_detail(
+                RemoteError(
+                    {
+                        "type": "ProviderError",
+                        "code": "provider_error",
+                        "message": huge_peer,
+                    }
+                )
+            )
+        self.assertTrue(seen_lengths)
+        self.assertTrue(
+            all(n <= diagnostics._MAX_TRUNCATE_SCAN for n in seen_lengths),
+            seen_lengths,
+        )
+        self.assertTrue(
+            sanitized["message"].startswith("<redacted> <redacted>_status=401 ")
+        )
+        self.assertNotIn("YWRtaW46cD8", sanitized["message"])
+        self.assertNotIn("dXNlcjpwYXNzd29yZA", sanitized["message"])
+        self.assertNotIn("YWRtaW46cD8", sanitized["diagnostic"]["cause"])
+        self.assertNotIn("dXNlcjpwYXNzd29yZA", sanitized["diagnostic"]["cause"])
+
+
 if __name__ == "__main__":
     unittest.main()
