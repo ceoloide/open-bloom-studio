@@ -24,7 +24,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from .diagnostics import DiagnosticContext, sanitize_remote_result
+from .diagnostics import request_context, sanitize_remote_result
 from .errors import error_detail
 from .rpc import call
 from .rpc_types import RemoteError
@@ -198,16 +198,15 @@ async def ssh_call(
                     "Invalid or incomplete SSH RPC response; inspect "
                     "operation_lookup/history before any new start"
                 ) from exc
+            req_ctx = request_context(method, params)
             if not result["ok"]:
                 raise RemoteError(
                     error_detail(
                         RemoteError(result["error"]),
-                        context=DiagnosticContext(method=method),
+                        context=req_ctx,
                     )
                 )
-            return sanitize_remote_result(
-                method, result["data"], context=DiagnosticContext(method=method)
-            )
+            return sanitize_remote_result(method, result["data"], context=req_ctx)
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise ConnectionError(
                 "SSH RPC connection closed; inspect operation_lookup/history before "
@@ -238,6 +237,7 @@ async def relay(socket_path: str | os.PathLike[str]) -> int:
     """Relay one request/response on stdio; the forced command fixes the socket."""
     transport = None
     method: str | None = None
+    req_params: dict[str, Any] | None = None
     try:
         reader = asyncio.StreamReader(limit=MAX_REQUEST)
         protocol = asyncio.StreamReaderProtocol(reader)
@@ -247,15 +247,17 @@ async def relay(socket_path: str | os.PathLike[str]) -> int:
         raw = await asyncio.wait_for(_bounded(reader, MAX_REQUEST), 10)
         envelope = request(raw)
         method = envelope["method"]
+        raw_params = envelope.get("params")
+        req_params = raw_params if isinstance(raw_params, dict) else None
         if method not in REMOTE_METHODS:
             raise ValueError(
                 "Method is not available through the SSH endpoint; backups require a "
                 "local operator"
             )
-        result = await call(socket_path, method, envelope.get("params"))
+        result = await call(socket_path, method, req_params)
         reply = {"ok": True, "data": result}
     except Exception as exc:
-        context = DiagnosticContext(method=method) if method is not None else None
+        context = request_context(method, req_params) if method is not None else None
         reply = {"ok": False, "error": error_detail(exc, context=context)}
     finally:
         if transport is not None:
@@ -263,7 +265,7 @@ async def relay(socket_path: str | os.PathLike[str]) -> int:
     try:
         encoded = frame(reply, MAX_RESPONSE)
     except ValueError:
-        context = DiagnosticContext(method=method) if method is not None else None
+        context = request_context(method, req_params) if method is not None else None
         encoded = frame(
             {
                 "ok": False,

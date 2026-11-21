@@ -126,6 +126,7 @@ def create_server(  # noqa: C901 - one registration per tool
     from .diagnostics import (
         DiagnosticContext,
         build_diagnostic,
+        request_context,
         safe_identifier,
         sanitize_remote_result,
     )
@@ -195,6 +196,7 @@ def create_server(  # noqa: C901 - one registration per tool
                     validate_command_params(
                         values["command"], values.get("params") or {}
                     )
+                tool_ctx = request_context(name, values, tool=name)
                 value = await fn(**values)
             except ValidationError as exc:
                 issues = [

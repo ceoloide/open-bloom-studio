@@ -20,8 +20,8 @@ from typing import TYPE_CHECKING, Any
 
 from ._cleanup import wait_cleanup
 from .diagnostics import (
-    DiagnosticContext,
     build_diagnostic,
+    request_context,
     sanitize_remote_result,
 )
 from .errors import error_detail
@@ -94,16 +94,15 @@ async def call(
                 raise ConnectionError(
                     "Invalid or incomplete local RPC response"
                 ) from exc
+            req_ctx = request_context(method, params)
             if not response["ok"]:
                 raise RemoteError(
                     error_detail(
                         RemoteError(response["error"]),
-                        context=DiagnosticContext(method=method),
+                        context=req_ctx,
                     )
                 )
-            return sanitize_remote_result(
-                method, response["data"], context=DiagnosticContext(method=method)
-            )
+            return sanitize_remote_result(method, response["data"], context=req_ctx)
         finally:
             writer.close()
             await writer.wait_closed()
@@ -256,8 +255,11 @@ class LocalServer:
                 response = {"ok": True, "data": result}
             except Exception as exc:
                 method = request.get("method")
+                raw_params = request.get("params")
                 context = (
-                    DiagnosticContext(method=method)
+                    request_context(
+                        method, raw_params if isinstance(raw_params, dict) else None
+                    )
                     if isinstance(method, str) and method.strip()
                     else None
                 )

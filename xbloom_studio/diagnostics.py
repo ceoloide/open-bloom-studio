@@ -196,6 +196,85 @@ class DiagnosticContext:
     source_text: str | None = None
     source_kind: str | None = None
     allow_excerpt: bool = False
+    requested_command: str | None = None
+    requested_preset: tuple[str, str, int] | None = None
+    requested_slot: str | None = None
+
+
+def _normalize_preset(value: Any) -> tuple[str, str, int] | None:
+    """Return canonical ``(slot, payload_hex_lower, flags)`` or None."""
+    if not isinstance(value, Mapping):
+        return None
+    slot = _single_slot(value.get("slot"))
+    raw_hex = value.get("payload_hex")
+    flags = value.get("flags")
+    if (
+        slot is None
+        or type(raw_hex) is not str
+        or not raw_hex
+        or type(flags) is not int
+        or not 0 <= flags <= 255
+    ):
+        return None
+    try:
+        canonical_hex = bytes.fromhex(raw_hex).hex()
+    except ValueError:
+        return None
+    if not canonical_hex:
+        return None
+    return (slot, canonical_hex, flags)
+
+
+def request_provenance(
+    method: str | None, params: Mapping[str, Any] | None
+) -> tuple[str | None, tuple[str, str, int] | None, str | None]:
+    """Extract truthful local request provenance for preset-write verification."""
+    if not isinstance(params, Mapping):
+        return None, None, None
+    if method == "machine_command":
+        raw_cmd = params.get("command")
+        req_cmd = raw_cmd if type(raw_cmd) is str and raw_cmd.strip() else None
+        if req_cmd == "write_preset":
+            cmd_params = params.get("params")
+            preset = (
+                _normalize_preset(cmd_params.get("preset"))
+                if isinstance(cmd_params, Mapping)
+                else None
+            )
+            return req_cmd, preset, (preset[0] if preset is not None else None)
+        return req_cmd, None, None
+    if method == "machine_preset_writes":
+        return None, None, _single_slot(params.get("slot"))
+    return None, None, None
+
+
+def request_context(
+    method: str | None,
+    params: Mapping[str, Any] | None = None,
+    *,
+    command: str | None = None,
+    tool: str | None = None,
+    parameter: str | None = None,
+    source_path: str | None = None,
+    source_text: str | None = None,
+    source_kind: str | None = None,
+    allow_excerpt: bool = False,
+) -> DiagnosticContext:
+    """Build a :class:`DiagnosticContext` with truthful local request provenance."""
+    req_cmd, req_preset, req_slot = request_provenance(method, params)
+    return DiagnosticContext(
+        command=command,
+        method=method,
+        tool=tool,
+        parameter=parameter,
+        source_path=source_path,
+        source_text=source_text,
+        source_kind=source_kind,
+        allow_excerpt=allow_excerpt,
+        requested_command=req_cmd,
+        requested_preset=req_preset,
+        requested_slot=req_slot,
+    )
 
 
 @dataclass(frozen=True)
@@ -1416,6 +1495,24 @@ def _inspect_slots(
     return True, single, display
 
 
+_PRESET_GUIDANCE_KEYS = (
+    "attempt",
+    "preset_write",
+    "next_step",
+    "retry_allowed",
+    "retryable",
+)
+_PRESET_RECORD_FIELDS = (
+    "state",
+    "attempts",
+    "attempts_used",
+    "remaining_attempts",
+    "retry_allowed",
+    "next_step",
+    "retryable",
+)
+
+
 @dataclass(frozen=True)
 class _PresetWritePolicy:
     """Single validated policy outcome for a preset write reply or error."""
@@ -1427,6 +1524,7 @@ class _PresetWritePolicy:
     recovery_required: bool
     saved: bool
     saved_cleanup_failed: bool
+    conflict: bool = False
     write_id: str | None = None
     state: str | None = None
     outcome: str | None = None
@@ -1434,10 +1532,19 @@ class _PresetWritePolicy:
     max_attempts: int | None = None
 
 
+def _validate_preset_guidance_types(container: Mapping[str, Any]) -> None:
+    if "next_step" in container and type(container["next_step"]) is not str:
+        raise ValueError("Remote preset next_step must be a string")
+    if "retry_allowed" in container and type(container["retry_allowed"]) is not bool:
+        raise ValueError("Remote preset retry_allowed must be a bool")
+    if "retryable" in container and type(container["retryable"]) is not bool:
+        raise ValueError("Remote preset retryable must be a bool")
+
+
 def _apply_preset_write_policy(
     target: dict[str, Any], policy: _PresetWritePolicy
 ) -> bool:
-    """Apply validated policy consistently to ``next_step`` and ``retry_allowed``."""
+    """Apply validated policy consistently to guidance and retry flags."""
     changed = False
     if "next_step" in target:
         target["next_step"] = policy.next_step
@@ -1445,7 +1552,197 @@ def _apply_preset_write_policy(
     if "retry_allowed" in target:
         target["retry_allowed"] = policy.retry_allowed
         changed = True
+    if "retryable" in target:
+        target["retryable"] = False
+        changed = True
     return changed
+
+
+def _extract_preset_write_layers(
+    root: Mapping[str, Any],
+    *,
+    prefer_top_attempt: bool = False,
+) -> tuple[Mapping[str, Any] | None, tuple[Mapping[str, Any], ...]]:
+    """Collect all recognized preset-write/attempt layers in priority order."""
+    raw_details = root.get("details")
+    details = (
+        raw_details if prefer_top_attempt and isinstance(raw_details, Mapping) else None
+    )
+    top_att = root.get("attempt") if isinstance(root.get("attempt"), Mapping) else None
+    top_pw = (
+        root.get("preset_write")
+        if isinstance(root.get("preset_write"), Mapping)
+        else None
+    )
+    top_pw_att = (
+        top_pw.get("attempt")
+        if top_pw is not None and isinstance(top_pw.get("attempt"), Mapping)
+        else None
+    )
+    det_att = (
+        details.get("attempt")
+        if details is not None and isinstance(details.get("attempt"), Mapping)
+        else None
+    )
+    det_pw = (
+        details.get("preset_write")
+        if details is not None and isinstance(details.get("preset_write"), Mapping)
+        else None
+    )
+    det_pw_att = (
+        det_pw.get("attempt")
+        if det_pw is not None and isinstance(det_pw.get("attempt"), Mapping)
+        else None
+    )
+    if prefer_top_attempt:
+        priority: tuple[Mapping[str, Any] | None, ...] = (
+            top_att,
+            det_pw_att,
+            det_att,
+            top_pw_att,
+            det_pw,
+            top_pw,
+            details,
+            root,
+        )
+        enclosing_order: tuple[Mapping[str, Any] | None, ...] = (
+            root,
+            details,
+            top_pw,
+            top_pw_att,
+            top_att,
+            det_pw,
+            det_pw_att,
+            det_att,
+        )
+    else:
+        priority = (top_pw_att, top_att, top_pw, root)
+        enclosing_order = (root, top_pw, top_pw_att, top_att)
+
+    record = next((item for item in priority if item is not None), None)
+    enclosing: list[Mapping[str, Any]] = []
+    seen_ids: set[int] = {id(record)} if record is not None else set()
+    for item in enclosing_order:
+        if item is not None and id(item) not in seen_ids:
+            seen_ids.add(id(item))
+            enclosing.append(item)
+    return record, tuple(enclosing)
+
+
+def _sanitize_preset_write_mapping(
+    mapping: Mapping[str, Any],
+    policy: _PresetWritePolicy,
+    *,
+    strict: bool = False,
+    include_details: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    """Sanitize guidance and retry flags across all recognized nested containers."""
+    if strict:
+        _validate_preset_guidance_types(mapping)
+    copy = dict(mapping)
+    changed = _apply_preset_write_policy(copy, policy)
+
+    raw_att = copy.get("attempt")
+    if isinstance(raw_att, Mapping):
+        if strict:
+            _validate_preset_guidance_types(raw_att)
+        att_copy = dict(raw_att)
+        if _apply_preset_write_policy(att_copy, policy):
+            copy["attempt"] = att_copy
+            changed = True
+
+    raw_pw = copy.get("preset_write")
+    if isinstance(raw_pw, Mapping):
+        pw_copy, pw_changed = _sanitize_preset_write_mapping(
+            raw_pw, policy, strict=strict, include_details=False
+        )
+        if pw_changed:
+            copy["preset_write"] = pw_copy
+            changed = True
+
+    if include_details:
+        raw_details = copy.get("details")
+        if isinstance(raw_details, Mapping):
+            det_copy, det_changed = _sanitize_preset_write_mapping(
+                raw_details, policy, strict=strict, include_details=False
+            )
+            if det_changed:
+                copy["details"] = det_copy
+                changed = True
+
+    return copy, changed
+
+
+def _untrusted_preset_write_cause(policy: _PresetWritePolicy, *, refused: bool) -> str:
+    """Return a locally generated descriptive cause for untrusted preset writes."""
+    if policy.saved_cleanup_failed:
+        return (
+            "Preset write observed a save event, but post-save cleanup failed; "
+            "session recovery is required."
+        )
+    if policy.conflict:
+        subject = "refusal" if refused else "reply"
+        if policy.recovery_required:
+            return (
+                f"Remote preset write {subject} contained conflicting or "
+                "unverified evidence; stored contents are unverified and "
+                "session recovery is required."
+            )
+        return (
+            f"Remote preset write {subject} contained conflicting or "
+            "unverified evidence; stored contents are unverified."
+        )
+    if not policy.valid:
+        return CATALOG[
+            "XB_PRESET_WRITE_REFUSED" if refused else "XB_PRESET_WRITE_INCOMPLETE"
+        ].default_cause
+    slot_label = f" for slot {policy.display_slot}" if policy.display_slot else ""
+    if refused:
+        if policy.state == "saved":
+            return (
+                f"Preset write{slot_label} was refused because a save event was "
+                "already observed; nothing was sent."
+            )
+        if policy.state == "retryable":
+            return (
+                f"Preset write{slot_label} was refused while an incomplete "
+                "retryable write remains recorded; nothing was sent."
+            )
+        if policy.state == "exhausted":
+            return (
+                f"Preset write{slot_label} was refused because all "
+                f"{policy.max_attempts} attempts were used; nothing was sent."
+            )
+        if policy.state == "cancelled":
+            return (
+                f"Preset write{slot_label} was refused because the recorded "
+                "write was cancelled; nothing was sent."
+            )
+        if policy.state == "in_progress":
+            return (
+                f"Preset write{slot_label} was refused because an attempt is "
+                "already in progress; nothing was sent."
+            )
+        return CATALOG["XB_PRESET_WRITE_REFUSED"].default_cause
+    if policy.state == "retryable":
+        detail = f" ({policy.outcome})" if policy.outcome else ""
+        return (
+            f"Preset write{slot_label} did not confirm completion{detail}; "
+            "stored contents are unverified."
+        )
+    if policy.state == "exhausted":
+        return (
+            f"Preset write{slot_label} did not confirm completion after "
+            f"{policy.attempts_used}/{policy.max_attempts} attempts; stored "
+            "contents are unverified."
+        )
+    if policy.state == "cancelled":
+        return (
+            f"Preset write{slot_label} was cancelled; stored contents are unverified."
+        )
+    if policy.state == "saved":
+        return f"Preset write{slot_label} observed a save event (not a readback)."
+    return CATALOG["XB_PRESET_WRITE_INCOMPLETE"].default_cause
 
 
 def _evaluate_preset_write(
@@ -1455,6 +1752,8 @@ def _evaluate_preset_write(
     recovery_required: bool | None = None,
     refused: bool = False,
     require_failed_status: bool = False,
+    require_request_match: bool = False,
+    context: DiagnosticContext | None = None,
 ) -> _PresetWritePolicy:
     """Validate preset-write evidence once across ``record`` and enclosing layers."""
     from .preset_writes import (
@@ -1473,6 +1772,15 @@ def _evaluate_preset_write(
     all_layers = ((record,) if isinstance(record, Mapping) else ()) + enclosing
 
     enclosing_valid = True
+    for layer in all_layers:
+        for subkey in ("attempt", "preset_write"):
+            if (
+                subkey in layer
+                and layer[subkey] is not None
+                and not isinstance(layer[subkey], Mapping)
+            ):
+                enclosing_valid = False
+
     rec_bools: set[bool] = set()
     if recovery_required is not None:
         if type(recovery_required) is bool:
@@ -1493,6 +1801,59 @@ def _evaluate_preset_write(
     if not slot_consistent:
         enclosing_valid = False
 
+    seen_presets: set[tuple[str, str, int]] = set()
+    preset_malformed = False
+    seen_write_ids: set[str] = set()
+    for layer in all_layers:
+        if "preset" in layer:
+            norm = _normalize_preset(layer["preset"])
+            if norm is None:
+                preset_malformed = True
+            else:
+                seen_presets.add(norm)
+        if "write_id" in layer:
+            wid = safe_identifier(layer["write_id"])
+            if wid is None:
+                enclosing_valid = False
+            else:
+                seen_write_ids.add(wid)
+    if len(seen_presets) > 1 or len(seen_write_ids) > 1:
+        enclosing_valid = False
+    record_preset = (
+        next(iter(seen_presets))
+        if len(seen_presets) == 1 and not preset_malformed
+        else None
+    )
+
+    req_cmd = context.requested_command if context is not None else None
+    req_preset = context.requested_preset if context is not None else None
+    req_slot = context.requested_slot if context is not None else None
+
+    request_mismatch = False
+    if req_preset is not None:
+        if (record_preset is not None and record_preset != req_preset) or (
+            display_slot is not None and display_slot != req_preset[0]
+        ):
+            request_mismatch = True
+    elif req_slot is not None:
+        if display_slot is not None and display_slot != req_slot:
+            request_mismatch = True
+
+    if request_mismatch:
+        enclosing_valid = False
+        display_slot = None
+
+    request_allows_resend = True
+    if require_request_match:
+        request_allows_resend = (
+            req_cmd == "write_preset"
+            and req_preset is not None
+            and record_preset == req_preset
+            and single_slot == req_preset[0]
+        )
+    elif req_slot is not None:
+        request_allows_resend = single_slot == req_slot
+
     rec_outcome: str | None = None
     outcome_valid = True
     record_saved_observed = False
@@ -1512,9 +1873,35 @@ def _evaluate_preset_write(
             else:
                 enclosing_valid = False
 
+    attempts_outcomes = (
+        _parse_attempt_outcomes(record.get("attempts"), valid_outcomes)
+        if isinstance(record, Mapping)
+        else None
+    )
+    all_attempt_lists: list[list[str]] = []
+    if attempts_outcomes is not None:
+        all_attempt_lists.append(attempts_outcomes)
+    elif isinstance(record, Mapping) and "attempts" in record:
+        enclosing_valid = False
+
     live_saved = False
     enclosing_outcomes: list[str] = []
     for layer in enclosing:
+        if "attempts" in layer:
+            layer_attempts = _parse_attempt_outcomes(layer["attempts"], valid_outcomes)
+            if layer_attempts is None:
+                enclosing_valid = False
+            else:
+                all_attempt_lists.append(layer_attempts)
+                if SAVED & set(layer_attempts):
+                    live_saved = True
+                if "saved_cleanup_failed" in layer_attempts:
+                    enclosing_outcomes.append("saved_cleanup_failed")
+                if (
+                    attempts_outcomes is not None
+                    and layer_attempts != attempts_outcomes
+                ):
+                    enclosing_valid = False
         if "saved_observed" in layer:
             if type(layer["saved_observed"]) is bool:
                 observed_bools.add(layer["saved_observed"])
@@ -1545,6 +1932,15 @@ def _evaluate_preset_write(
                 and record.get("retry_allowed") != layer["retry_allowed"]
             ):
                 enclosing_valid = False
+        for count_key in ("attempts_used", "max_attempts", "remaining_attempts"):
+            if count_key in layer:
+                val = layer[count_key]
+                if type(val) is not int or (
+                    isinstance(record, Mapping)
+                    and count_key in record
+                    and record.get(count_key) != val
+                ):
+                    enclosing_valid = False
 
     if (
         len(observed_bools) > 1
@@ -1554,20 +1950,17 @@ def _evaluate_preset_write(
     ):
         enclosing_valid = False
 
-    attempts_outcomes = (
-        _parse_attempt_outcomes(record.get("attempts"), valid_outcomes)
-        if isinstance(record, Mapping)
-        else None
-    )
-    any_attempt_saved = bool(
-        attempts_outcomes is not None and (SAVED & set(attempts_outcomes))
-    )
+    any_attempt_saved = any(bool(SAVED & set(items)) for items in all_attempt_lists)
     any_saved = (
         rec_outcome in SAVED or live_saved or record_saved_observed or any_attempt_saved
     )
-    record_contradicts_saved = isinstance(record, Mapping) and (
-        record.get("retry_allowed") is True
-        or record.get("state") in ("retryable", "not_sent")
+    any_layer_claims_retry = any(
+        layer.get("retry_allowed") is True
+        or layer.get("state") in ("retryable", "not_sent")
+        for layer in all_layers
+    )
+    has_record_fields = any(
+        key in layer for layer in all_layers for key in _PRESET_RECORD_FIELDS
     )
     write_id = (
         safe_identifier(record.get("write_id")) if isinstance(record, Mapping) else None
@@ -1585,7 +1978,7 @@ def _evaluate_preset_write(
         and eff_recovery
         and enclosing_valid
         and outcome_valid
-        and not record_contradicts_saved
+        and not any_layer_claims_retry
     )
     fallback = (
         _SAFE_PRESET_DISCONNECT_RECOVERY
@@ -1601,7 +1994,7 @@ def _evaluate_preset_write(
             any_saved
             and enclosing_valid
             and outcome_valid
-            and not record_contradicts_saved
+            and not any_layer_claims_retry
         ):
             step = (
                 "Nothing was sent. A save event was already observed (not a "
@@ -1612,6 +2005,12 @@ def _evaluate_preset_write(
                 "preset write. Inspect `machine_preset_writes` and `machine_state` "
                 "before any further control."
             )
+        is_conflict = not saved_cleanup_failed and (
+            not enclosing_valid
+            or not outcome_valid
+            or any_layer_claims_retry
+            or has_record_fields
+        )
         return _PresetWritePolicy(
             valid=False,
             next_step=step,
@@ -1620,6 +2019,7 @@ def _evaluate_preset_write(
             recovery_required=eff_recovery,
             saved=any_saved,
             saved_cleanup_failed=saved_cleanup_failed,
+            conflict=is_conflict,
             write_id=write_id if saved_cleanup_failed else None,
             state=state if saved_cleanup_failed else None,
             outcome=resolved_outcome if saved_cleanup_failed else None,
@@ -1684,6 +2084,7 @@ def _evaluate_preset_write(
             recovery_required=eff_recovery,
             saved=any_saved,
             saved_cleanup_failed=False,
+            conflict=False,
             write_id=write_id,
             state=state,
             outcome=resolved_outcome,
@@ -1750,7 +2151,8 @@ def _evaluate_preset_write(
 
     if state == "retryable":
         if (
-            retry_allowed is not True
+            not request_allows_resend
+            or retry_allowed is not True
             or attempts_used < 1
             or attempts_used >= max_attempts
             or remaining != max_attempts - attempts_used
@@ -1774,7 +2176,8 @@ def _evaluate_preset_write(
 
     # state == "not_sent"
     if (
-        eff_recovery
+        not request_allows_resend
+        or eff_recovery
         or retry_allowed is not True
         or attempts_used != 0
         or remaining != max_attempts
@@ -1871,19 +2274,41 @@ def preset_write_diagnostic(
 
     if not trusted or policy is not None:
         if policy is None:
-            record = attempt if isinstance(attempt, Mapping) else payload
-            layers: list[Mapping[str, Any]] = []
             if isinstance(enclosing, Mapping):
-                layers.append(enclosing)
-            if isinstance(payload, Mapping) and payload is not record:
-                layers.append(payload)
-            policy = _evaluate_preset_write(
-                record,
-                enclosing_layers=layers,
-                recovery_required=recovery_required,
-                refused=refused,
-                require_failed_status=isinstance(enclosing, Mapping),
-            )
+                record, base_layers = _extract_preset_write_layers(
+                    enclosing, prefer_top_attempt=True
+                )
+                layers = list(base_layers)
+                seen_ids = {id(layer) for layer in layers}
+                if record is not None:
+                    seen_ids.add(id(record))
+                for extra in (payload, attempt):
+                    if isinstance(extra, Mapping) and id(extra) not in seen_ids:
+                        seen_ids.add(id(extra))
+                        layers.append(extra)
+                policy = _evaluate_preset_write(
+                    record,
+                    enclosing_layers=layers,
+                    recovery_required=recovery_required,
+                    refused=refused,
+                    require_failed_status=True,
+                    require_request_match=True,
+                    context=context,
+                )
+            else:
+                record = attempt if isinstance(attempt, Mapping) else payload
+                layers = []
+                if isinstance(payload, Mapping) and payload is not record:
+                    layers.append(payload)
+                policy = _evaluate_preset_write(
+                    record,
+                    enclosing_layers=layers,
+                    recovery_required=recovery_required,
+                    refused=refused,
+                    require_failed_status=False,
+                    require_request_match=True,
+                    context=context,
+                )
         if policy.display_slot:
             location["kind"] = "slot"
             location["slot"] = policy.display_slot
@@ -1915,12 +2340,7 @@ def preset_write_diagnostic(
         elif policy.valid and not policy.retry_allowed and policy.recovery_required:
             fix = _SAFE_PRESET_DISCONNECT_RECOVERY
 
-        resolved_cause = cause
-        if not refused and policy.saved_cleanup_failed and "save" not in cause.lower():
-            resolved_cause = (
-                f"{cause} (save event observed, but post-save cleanup failed; "
-                "session recovery required)"
-            )
+        resolved_cause = _untrusted_preset_write_cause(policy, refused=refused)
         return build_diagnostic(
             code,
             cause=resolved_cause,
@@ -2160,41 +2580,21 @@ def _preset_write_error_policy(
     details: Mapping[str, Any] | None,
     *,
     refused: bool,
+    context: DiagnosticContext | None = None,
 ) -> _PresetWritePolicy:
     """Evaluate a remote error's preset-write details once across all layers."""
     if not isinstance(details, Mapping):
-        return _evaluate_preset_write(None, refused=refused)
-    pw = (
-        details.get("preset_write")
-        if isinstance(details.get("preset_write"), Mapping)
-        else None
-    )
-    pw_attempt = (
-        pw.get("attempt")
-        if pw is not None and isinstance(pw.get("attempt"), Mapping)
-        else None
-    )
-    top_attempt = (
-        details.get("attempt") if isinstance(details.get("attempt"), Mapping) else None
-    )
-    if pw is not None and pw_attempt is not None:
-        layers: tuple[Mapping[str, Any], ...] = (
-            (details, pw, top_attempt) if top_attempt is not None else (details, pw)
-        )
         return _evaluate_preset_write(
-            pw_attempt, enclosing_layers=layers, refused=refused
+            None, refused=refused, require_request_match=True, context=context
         )
-    if pw is not None and top_attempt is not None:
-        return _evaluate_preset_write(
-            top_attempt, enclosing_layers=(details, pw), refused=refused
-        )
-    if pw is not None:
-        return _evaluate_preset_write(pw, enclosing_layers=(details,), refused=refused)
-    if top_attempt is not None:
-        return _evaluate_preset_write(
-            top_attempt, enclosing_layers=(details,), refused=refused
-        )
-    return _evaluate_preset_write(details, refused=refused)
+    record, layers = _extract_preset_write_layers(details, prefer_top_attempt=False)
+    return _evaluate_preset_write(
+        record,
+        enclosing_layers=layers,
+        refused=refused,
+        require_request_match=True,
+        context=context,
+    )
 
 
 def _rebuild_remote_diagnostic(
@@ -2271,7 +2671,7 @@ def _rebuild_remote_diagnostic(
 
     if diag_code in ("XB_PRESET_WRITE_REFUSED", "XB_PRESET_WRITE_INCOMPLETE"):
         refused = diag_code == "XB_PRESET_WRITE_REFUSED"
-        policy = _preset_write_error_policy(details, refused=refused)
+        policy = _preset_write_error_policy(details, refused=refused, context=context)
         return (
             preset_write_diagnostic(
                 refused=refused,
@@ -2358,39 +2758,38 @@ def sanitize_remote_error(
 ) -> dict[str, Any]:
     """Sanitize a validated remote error envelope across outer and nested fields."""
     rebuilt, policy = _rebuild_remote_diagnostic(filtered, context=context)
+    if "retryable" in filtered:
+        filtered["retryable"] = False
+    details = filtered.get("details")
+    if isinstance(details, Mapping):
+        has_embedded = any(key in details for key in _PRESET_GUIDANCE_KEYS)
+        if policy is None and has_embedded:
+            policy = _preset_write_error_policy(details, refused=False, context=context)
+        if policy is not None:
+            details_copy, changed = _sanitize_preset_write_mapping(
+                details, policy, strict=False, include_details=False
+            )
+            if changed:
+                filtered["details"] = details_copy
+    if policy is not None:
+        is_preset_diag = rebuilt["code"] in (
+            "XB_PRESET_WRITE_REFUSED",
+            "XB_PRESET_WRITE_INCOMPLETE",
+        )
+        if policy.conflict or policy.saved_cleanup_failed or is_preset_diag:
+            local_cause = (
+                rebuilt["cause"]
+                if is_preset_diag
+                else _untrusted_preset_write_cause(policy, refused=False)
+            )
+            if "message" in filtered:
+                filtered["message"] = local_cause
+            if not is_preset_diag:
+                rebuilt = dict(rebuilt, cause=local_cause)
     if "diagnostic" in filtered:
         filtered["diagnostic"] = rebuilt
     if "next_step" in filtered:
         filtered["next_step"] = rebuilt["fix"]
-    details = filtered.get("details")
-    if isinstance(details, Mapping):
-        has_embedded = "preset_write" in details or "attempt" in details
-        if policy is None and has_embedded:
-            policy = _preset_write_error_policy(details, refused=False)
-        if policy is not None:
-            details_copy = dict(details)
-            changed = _apply_preset_write_policy(details_copy, policy)
-            raw_pw = details_copy.get("preset_write")
-            if isinstance(raw_pw, Mapping):
-                pw_copy = dict(raw_pw)
-                pw_changed = _apply_preset_write_policy(pw_copy, policy)
-                raw_pw_att = pw_copy.get("attempt")
-                if isinstance(raw_pw_att, Mapping):
-                    att_copy = dict(raw_pw_att)
-                    if _apply_preset_write_policy(att_copy, policy):
-                        pw_copy["attempt"] = att_copy
-                        pw_changed = True
-                if pw_changed:
-                    details_copy["preset_write"] = pw_copy
-                    changed = True
-            raw_top_att = details_copy.get("attempt")
-            if isinstance(raw_top_att, Mapping):
-                att_copy = dict(raw_top_att)
-                if _apply_preset_write_policy(att_copy, policy):
-                    details_copy["attempt"] = att_copy
-                    changed = True
-            if changed:
-                filtered["details"] = details_copy
     return filtered
 
 
@@ -2440,49 +2839,34 @@ def sanitize_remote_result(
             if isinstance(cleaned.get("details"), Mapping)
             else None
         )
-        raw_attempt = cleaned.get("attempt")
-        attempt: dict[str, Any] | None = None
-        if isinstance(raw_attempt, Mapping):
-            attempt = dict(raw_attempt)
-            if (
-                strict
-                and "next_step" in attempt
-                and type(attempt["next_step"]) is not str
-            ):
-                raise ValueError("Remote preset attempt next_step must be a string")
-            if (
-                strict
-                and "retry_allowed" in attempt
-                and type(attempt["retry_allowed"]) is not bool
-            ):
-                raise ValueError("Remote preset attempt retry_allowed must be a bool")
-        nested_payload_attempt = (
-            payload.get("attempt")
-            if payload is not None and isinstance(payload.get("attempt"), Mapping)
-            else None
-        )
         is_failed = cleaned.get("status") == "failed"
-        enclosing_list: list[Mapping[str, Any]] = [cleaned]
-        if payload is not None:
-            enclosing_list.append(payload)
-        if attempt is not None and nested_payload_attempt is not None:
-            enclosing_list.append(nested_payload_attempt)
-        policy: _PresetWritePolicy | None = None
-        if attempt is not None or nested_payload_attempt is not None or is_failed:
-            policy = _evaluate_preset_write(
-                attempt if attempt is not None else nested_payload_attempt,
-                enclosing_layers=enclosing_list,
-                require_failed_status=True,
+        has_preset_fields = (
+            is_failed
+            or any(key in cleaned for key in _PRESET_GUIDANCE_KEYS)
+            or (
+                payload is not None
+                and any(key in payload for key in _PRESET_GUIDANCE_KEYS)
             )
-            if attempt is not None:
-                _apply_preset_write_policy(attempt, policy)
-                cleaned["attempt"] = attempt
-            if payload is not None and nested_payload_attempt is not None:
-                payload_copy = dict(payload)
-                nested_att = dict(nested_payload_attempt)
-                if _apply_preset_write_policy(nested_att, policy):
-                    payload_copy["attempt"] = nested_att
-                    cleaned["details"] = payload_copy
+        )
+        policy: _PresetWritePolicy | None = None
+        if has_preset_fields:
+            record, enclosing_layers = _extract_preset_write_layers(
+                cleaned, prefer_top_attempt=True
+            )
+            policy = _evaluate_preset_write(
+                record,
+                enclosing_layers=enclosing_layers,
+                require_failed_status=True,
+                require_request_match=True,
+                context=context,
+            )
+            cleaned, _ = _sanitize_preset_write_mapping(
+                cleaned, policy, strict=strict, include_details=True
+            )
+            if "error" in cleaned and (
+                policy.conflict or policy.saved_cleanup_failed or policy.valid
+            ):
+                cleaned["error"] = _untrusted_preset_write_cause(policy, refused=False)
         if is_failed:
             if has_diag:
                 raw_error = cleaned.get("error")
@@ -2503,21 +2887,24 @@ def sanitize_remote_result(
         return cleaned
     if method == "machine_preset_writes":
         cleaned = dict(data)
+        if any(key in cleaned for key in ("next_step", "retry_allowed", "retryable")):
+            if strict:
+                _validate_preset_guidance_types(cleaned)
+            top_policy = _evaluate_preset_write(None, context=context)
+            _apply_preset_write_policy(cleaned, top_policy)
         raw_writes = cleaned.get("writes")
         if isinstance(raw_writes, list):
             sanitized_writes: list[Any] = []
             for item in raw_writes:
                 if isinstance(item, Mapping):
                     item_copy = dict(item)
-                    if (
-                        strict
-                        and "next_step" in item_copy
-                        and type(item_copy["next_step"]) is not str
-                    ):
-                        raise ValueError(
-                            "Remote preset write next_step must be a string"
-                        )
-                    item_policy = _evaluate_preset_write(item_copy)
+                    if strict:
+                        _validate_preset_guidance_types(item_copy)
+                    item_policy = _evaluate_preset_write(
+                        item_copy,
+                        context=context,
+                        require_request_match=False,
+                    )
                     _apply_preset_write_policy(item_copy, item_policy)
                     sanitized_writes.append(item_copy)
                 else:

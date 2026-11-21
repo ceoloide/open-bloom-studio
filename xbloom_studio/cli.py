@@ -32,6 +32,7 @@ from .diagnostics import (
     is_safe_human_note,
     preset_write_diagnostic,
     render_human_diagnostic,
+    request_context,
     safe_identifier,
 )
 from .errors import error_detail
@@ -398,6 +399,7 @@ class _SourceTracker:
 
     def __init__(self) -> None:
         self.method: str | None = None
+        self.params: Mapping[str, Any] | None = None
         self.path: str | None = None
         self.text: str | None = None
         self.parameter: str | None = None
@@ -667,9 +669,10 @@ def _command_context(
         if use_file and tracker is not None and tracker.parameter is not None
         else _command_parameter(a)
     )
-    return DiagnosticContext(
+    return request_context(
+        tracker.method if tracker is not None else None,
+        tracker.params if tracker is not None else None,
         command=_command_label(a),
-        method=tracker.method if tracker is not None else None,
         parameter=parameter,
         source_path=tracker.path if use_file and tracker is not None else None,
         source_text=tracker.text if use_file and tracker is not None else None,
@@ -1198,6 +1201,7 @@ async def run(a: argparse.Namespace, *, _tracker: _SourceTracker | None = None) 
         method, params = route(a, _tracker)
         if _tracker is not None:
             _tracker.method = method
+            _tracker.params = params
         fn, _ = PURE_METHODS[method]
         result = fn(**bind_parameters(fn, params))
         output(result)
@@ -1223,6 +1227,7 @@ async def run(a: argparse.Namespace, *, _tracker: _SourceTracker | None = None) 
         method, params = route(a, _tracker)
         if _tracker is not None:
             _tracker.method = method
+            _tracker.params = params
         if not remote and method in RETAINED_CONNECTION_METHODS:
             raise ValueError(
                 "Retained connections require a daemon; start xbloom-studio serve first"
