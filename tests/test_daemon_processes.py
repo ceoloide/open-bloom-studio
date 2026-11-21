@@ -22,7 +22,7 @@ WAIT = {"kind": "recipe", "document": {"name": "Wait", "steps": []}}
 class DaemonProcessTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         quiet_asyncio(self)
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.db = self.root / "xbloom-studio.sqlite3"
         self.socket = self.root / "run" / "daemon.sock"

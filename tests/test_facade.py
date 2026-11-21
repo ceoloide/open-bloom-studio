@@ -64,7 +64,7 @@ def run_cli(*args):
 
 class ParityTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.db = self.root / "xbloom-studio.sqlite3"
         self.store = Store(self.db)

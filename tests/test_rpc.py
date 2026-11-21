@@ -170,7 +170,7 @@ class ErrorContractTests(unittest.TestCase):
 
 class ServerCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.store = Store(self.root / "xbloom-studio.sqlite3")
         self.app = Application(self.store, "00:00:5E:00:53:01")
