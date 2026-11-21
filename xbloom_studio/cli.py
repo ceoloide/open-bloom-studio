@@ -109,6 +109,10 @@ _ARGPARSE_CHOICE = re.compile(
     r"): invalid choice:"
 )
 _ARGPARSE_POS_CHOICE = re.compile(r"^invalid choice:")
+_ARGPARSE_MUTEX = re.compile(
+    r"^argument (--?[A-Za-z0-9_-]+(?:/--?[A-Za-z0-9_-]+)*): "
+    r"not allowed with argument (--?[A-Za-z0-9_-]+(?:/--?[A-Za-z0-9_-]+)*)$"
+)
 
 
 class _CliParseError(ValueError):
@@ -510,12 +514,11 @@ def _scan_cli_args(
     return error_format, known_cmd, trailing_global
 
 
-def _parser_choices(
-    p: argparse.ArgumentParser | None, known_cmd: str | None, arg_name: str | None
-) -> tuple[str, ...] | None:
-    """Derive permitted option or subcommand choices directly from ``p``."""
+def _target_parsers(
+    p: argparse.ArgumentParser | None, known_cmd: str | None
+) -> tuple[argparse.ArgumentParser, ...]:
     if p is None:
-        return None
+        return ()
     target: argparse.ArgumentParser = p
     if known_cmd:
         for part in known_cmd.split():
@@ -530,9 +533,14 @@ def _parser_choices(
             if found_sub is None:
                 break
             target = found_sub
+    return (target,) if target is p else (target, p)
 
-    parsers = (target,) if target is p else (target, p)
-    for candidate in parsers:
+
+def _parser_choices(
+    p: argparse.ArgumentParser | None, known_cmd: str | None, arg_name: str | None
+) -> tuple[str, ...] | None:
+    """Derive permitted option or subcommand choices directly from ``p``."""
+    for candidate in _target_parsers(p, known_cmd):
         for action in candidate._actions:
             if isinstance(action, argparse._SubParsersAction):
                 if arg_name is None or action.dest == arg_name:
@@ -546,6 +554,27 @@ def _parser_choices(
                 ):
                     return tuple(str(choice) for choice in action.choices)
     return None
+
+
+def _is_parser_mutex_conflict(
+    p: argparse.ArgumentParser | None,
+    known_cmd: str | None,
+    first: str,
+    second: str,
+) -> bool:
+    """Return whether ``first`` and ``second`` belong to one parser mutex group."""
+    if first == second:
+        return False
+    for candidate in _target_parsers(p, known_cmd):
+        for group in candidate._mutually_exclusive_groups:
+            labels = {
+                "/".join(action.option_strings)
+                for action in group._group_actions
+                if action.option_strings
+            }
+            if first in labels and second in labels:
+                return True
+    return False
 
 
 def _sanitize_argparse_message(
@@ -585,8 +614,14 @@ def _sanitize_argparse_message(
                 "--error-format must precede the subcommand."
             )
         return "Unrecognized command-line arguments."
-    if "not allowed with argument" in text:
-        return text
+    mutex_match = _ARGPARSE_MUTEX.fullmatch(text)
+    if mutex_match and _is_parser_mutex_conflict(
+        p, known_cmd, mutex_match.group(1), mutex_match.group(2)
+    ):
+        return (
+            f"argument {mutex_match.group(1)}: not allowed with argument "
+            f"{mutex_match.group(2)}"
+        )
     return "Invalid command-line arguments."
 
 

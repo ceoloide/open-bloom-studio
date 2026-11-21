@@ -8,6 +8,7 @@ retrying an uncertain physical machine action.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import unicodedata
@@ -27,6 +28,7 @@ MAX_JSON_LOCATE_DEPTH = 100
 MAX_EXCERPT_WIDTH = 120
 MAX_SUMMARY_WIDTH = 220
 MAX_SANITISED_TEXT = 512
+_MAX_TRUNCATE_SCAN = 4096
 
 _EXTRA_SENSITIVE_KEY_EXACT = frozenset(
     {"passwd", "pwd", "pin", "passphrase", "private", "cert", "certificate"}
@@ -45,39 +47,31 @@ _EXTRA_SENSITIVE_KEY_PARTS = (
     "passkey",
 )
 _SAFE_MALFORMED_KEY = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
-_SENSITIVE_VALUE = re.compile(
-    r"(?i)(?:"
-    r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"
-    r"|\b(?:gh[opsur]_[A-Za-z0-9]{16,}|github_pat_\w{20,})"
-    r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
-    r"|\bxox[abposr]-[A-Za-z0-9-]{10,}"
-    r"|\bsk-[A-Za-z0-9_-]{20,}"
-    r"|\bpypi-AgEI[A-Za-z0-9_-]{20,}"
-    r"|\bAIza[0-9A-Za-z_-]{20,}"
-    r"|\bbearer\s+[A-Za-z0-9._~+/-]{8,}"
-    r"|\bbasic\s+[A-Za-z0-9+/=]{8,}"
-    r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?"
-    r"|https?://[^/\s@]+:[^/\s@]+@"
-    r")"
+_PEM_BEGIN = re.compile(
+    r"(?i)-----BEGIN (?:[A-Z0-9]+ ){0,6}PRIVATE KEY(?: BLOCK)?-----"
 )
+_PEM_END = re.compile(r"(?i)-----END (?:[A-Z0-9]+ ){0,6}PRIVATE KEY(?: BLOCK)?-----")
 _REDACT_VALUE = re.compile(
     r"(?i)(?:"
-    r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"
-    r"[^-]*-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----"
-    r"|-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"
-    r"|\b(?:gh[opsur]_[A-Za-z0-9]{16,}|github_pat_\w{20,})"
+    r"\b(?:gh[opsur]_[A-Za-z0-9]{16,}|github_pat_\w{20,})"
     r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
     r"|\bxox[abposr]-[A-Za-z0-9-]{10,}"
     r"|\bsk-[A-Za-z0-9_-]{20,}"
     r"|\bpypi-AgEI[A-Za-z0-9_-]{20,}"
     r"|\bAIza[0-9A-Za-z_-]{20,}"
-    r"|\bbearer\s+[A-Za-z0-9._~+/-]{8,}"
-    r"|\bbasic\s+(?=[A-Za-z0-9+/=]{8,}\b)"
-    r"(?:[A-Za-z0-9+/]*[0-9+/=][A-Za-z0-9+/=]*"
-    r"|(?-i:[A-Za-z]*[A-Z][A-Za-z]*[a-z][A-Za-z]*"
-    r"|[A-Za-z]*[a-z][A-Za-z]*[A-Z][A-Za-z]*))\b"
+    r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"
+    r"|\bbasic\s+(?P<basic_tok>[A-Za-z0-9+/=]+)"
     r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+)?"
-    r"|https?://[^/\s@]+:[^/\s@]+@"
+    r"|https?://[^/\s:@]+:[^/\s@]+@"
+    r")"
+)
+_TRUNCATED_SECRET_TAIL = re.compile(
+    r"(?i)(?:"
+    r"https?://[^/\s:@]+:[^/\s@]*$"
+    r"|-----+(?:[A-Z0-9 ]{0,60}-{0,5})?$"
+    r"|\b(?:gh[opsur]_|github_pat_|AKIA|ASIA|xox[abposr]-|sk-|pypi-AgEI|AIza|eyJ)"
+    r"[A-Za-z0-9._~+/=-]*$"
+    r"|\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]*$"
     r")"
 )
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -166,7 +160,7 @@ def is_safe_human_note(value: Any) -> bool:
     """Return whether ``value`` is plain text free of shell meta/controls/secrets."""
     if type(value) is not str or not value.strip():
         return False
-    if _SHELL_META.search(value) or _SENSITIVE_VALUE.search(value):
+    if _SHELL_META.search(value) or _has_sensitive_value(value):
         return False
     return not any(_is_unsafe_char(ch) for ch in value)
 
@@ -220,6 +214,7 @@ class DiagnosticContext:
     requested_preset: tuple[str, str, int] | None = None
     requested_slot: str | None = None
     requested_slots: frozenset[str] | None = None
+    requested_acknowledge: str | None = None
 
 
 def _normalize_preset(value: Any) -> tuple[str, str, int] | None:
@@ -305,6 +300,17 @@ def request_context(
 ) -> DiagnosticContext:
     """Build a :class:`DiagnosticContext` with truthful local request provenance."""
     req_cmd, req_preset, req_slot, req_slots = request_provenance(method, params)
+    req_ack: str | None = None
+    if (
+        method == "machine_command"
+        and req_cmd == "write_preset"
+        and isinstance(params, Mapping)
+    ):
+        cmd_params = params.get("params")
+        if isinstance(cmd_params, Mapping):
+            raw_ack = cmd_params.get("acknowledge_incomplete")
+            if type(raw_ack) is str and raw_ack.strip():
+                req_ack = raw_ack
     return DiagnosticContext(
         command=command,
         method=method,
@@ -318,6 +324,7 @@ def request_context(
         requested_preset=req_preset,
         requested_slot=req_slot,
         requested_slots=req_slots,
+        requested_acknowledge=req_ack,
     )
 
 
@@ -749,14 +756,89 @@ FALLBACK_BY_ERROR_CODE: dict[str, str] = {
 }
 
 
+def _is_basic_secret(token: str) -> bool:
+    """Return whether a token after ``Basic`` looks like a base64 credential."""
+    n = len(token)
+    if n < 4:
+        return False
+    if token.endswith("="):
+        stripped = token.rstrip("=")
+        pad_len = n - len(stripped)
+        if 1 <= pad_len <= 2 and len(stripped) >= 2 and "=" not in stripped:
+            return True
+    if n >= 8:
+        if token.isalpha():
+            return not (token.islower() or token.isupper() or token.istitle())
+        return True
+    if "=" in token:
+        return False
+    if ("/" in token or "+" in token) and not token.islower() and not token.isupper():
+        return True
+    if n % 4 == 1:
+        return False
+    padded = token + ("=" * ((4 - n % 4) % 4))
+    try:
+        decoded = base64.b64decode(padded, validate=True)
+    except Exception:
+        return False
+    return b":" in decoded and all(32 <= byte <= 126 for byte in decoded)
+
+
+def _redact_pem(text: str) -> str:
+    """Redact complete or truncated/unclosed PEM private-key blocks in O(n)."""
+    if "-----" not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    length = len(text)
+    while pos < length:
+        begin = _PEM_BEGIN.search(text, pos)
+        if begin is None:
+            out.append(text[pos:])
+            break
+        out.append(text[pos : begin.start()])
+        out.append("<redacted>")
+        end = _PEM_END.search(text, begin.end())
+        if end is None:
+            break
+        pos = end.end()
+    return "".join(out)
+
+
+def _redact_match(match: re.Match[str]) -> str:
+    basic_tok = match.group("basic_tok")
+    if basic_tok is not None and not _is_basic_secret(basic_tok):
+        return match.group(0)
+    return "<redacted>"
+
+
+def _has_sensitive_value(text: str) -> bool:
+    if "-----" in text and _PEM_BEGIN.search(text):
+        return True
+    for match in _REDACT_VALUE.finditer(text):
+        basic_tok = match.group("basic_tok")
+        if basic_tok is None or _is_basic_secret(basic_tok):
+            return True
+    return False
+
+
 def _redact_text(text: str) -> str:
-    return _REDACT_VALUE.sub("<redacted>", text)
+    return _REDACT_VALUE.sub(_redact_match, _redact_pem(text))
 
 
 def _truncate(text: str, limit: int) -> str:
-    cleaned = _redact_text(
-        "".join(" " if _is_unsafe_char(ch) else ch for ch in text).strip()
-    )
+    trimmed = text.lstrip()
+    scan_limit = max(limit * 8, _MAX_TRUNCATE_SCAN)
+    cropped = len(trimmed) > scan_limit
+    sample = trimmed[:scan_limit] if cropped else trimmed
+    normalized = "".join(" " if _is_unsafe_char(ch) else ch for ch in sample).strip()
+    cleaned = _redact_text(normalized)
+    if cropped:
+        cleaned = _TRUNCATED_SECRET_TAIL.sub("<redacted>", cleaned)
+        if len(cleaned) <= limit:
+            if cleaned.endswith("..."):
+                return cleaned
+            return cleaned[: max(0, limit - 3)].rstrip() + "..."
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 3].rstrip() + "..."
@@ -848,7 +930,7 @@ def _parse_json_structure(
                 decoded = json.loads(raw)
             except json.JSONDecodeError:
                 return False, 0, None
-            if isinstance(decoded, str) and _SENSITIVE_VALUE.search(decoded):
+            if isinstance(decoded, str) and _has_sensitive_value(decoded):
                 sensitive_spans.append((start, end))
             index += 1
             return True, end, self_match
@@ -876,9 +958,7 @@ def _parse_json_structure(
                 if not any(_is_unsafe_char(ch) for ch in key):
                     key_indices.add(key_idx)
                 key_sensitive = (
-                    _is_sensitive_key(key)
-                    or bool(_SENSITIVE_VALUE.search(key))
-                    or len(key) > 64
+                    _is_sensitive_key(key) or _has_sensitive_value(key) or len(key) > 64
                 )
                 index += 1
                 if index >= len(tokens) or tokens[index][1] != ":":
@@ -1135,7 +1215,7 @@ def extract_json_excerpt(
                 return None
             if not isinstance(decoded, str):
                 return None
-            if _is_sensitive_key(decoded) or _SENSITIVE_VALUE.search(decoded):
+            if _is_sensitive_key(decoded) or _has_sensitive_value(decoded):
                 return None
             decoded_strings[idx] = decoded
         sensitive_spans = []
@@ -1498,6 +1578,11 @@ def sanitize_diagnostic(
         return None
     cause = raw.get("cause")
     # Derive fix, docs_url, and repair_guide strictly from the local catalog.
+    if spec.code == "XB_INTERNAL_ERROR":
+        return attach_local_context(
+            build_diagnostic("XB_INTERNAL_ERROR", cause=spec.default_cause),
+            context,
+        )
     result: dict[str, Any] = {
         "code": spec.code,
         "cause": _truncate(
@@ -1722,6 +1807,14 @@ def _refusal_next_step(
         if write_id
         else "`acknowledge_incomplete`"
     )
+    if state == "superseded":
+        return (
+            f"Nothing was sent. Historical{write_part}{slot_part} was already "
+            "superseded by a batch, so its `acknowledge_incomplete` value is "
+            "obsolete. Inspect `machine_preset_writes` (read-only) and "
+            "`machine_state`, do not resend automatically, and omit "
+            "`acknowledge_incomplete` if the user explicitly directs a new write."
+        )
     if state == "saved":
         return (
             f"Nothing was sent. A save event was already observed{slot_part}"
@@ -1953,6 +2046,12 @@ def _untrusted_preset_write_cause(policy: _PresetWritePolicy, *, refused: bool) 
                 "different contents; nothing was sent. Ask the user before "
                 "acknowledging it."
             )
+        if policy.state == "superseded":
+            lead = f"Write {wid}{slot_label}" if wid else f"Preset write{slot_label}"
+            return (
+                f"{lead} was already superseded by a batch; the "
+                "`acknowledge_incomplete` value is stale and nothing was sent."
+            )
         if policy.state == "saved":
             lead = f"Write {wid}{slot_label}" if wid else f"Preset write{slot_label}"
             return f"{lead} already observed a save; nothing was sent."
@@ -2084,16 +2183,27 @@ def _evaluate_preset_write(
         else None
     )
 
+    req_method = context.method if context is not None else None
     req_cmd = context.requested_command if context is not None else None
     req_preset = context.requested_preset if context is not None else None
     req_slot = context.requested_slot if context is not None else None
     req_slots = context.requested_slots if context is not None else None
+    req_ack = context.requested_acknowledge if context is not None else None
 
     request_mismatch = False
     different_contents = False
     batch_refused = False
     if refused:
-        if req_cmd is not None and req_cmd not in ("write_preset", "write_presets"):
+        if req_method is not None and req_method not in (
+            "machine_command",
+            "machine_preset_writes",
+        ):
+            request_mismatch = True
+        elif req_method == "machine_preset_writes" and (
+            display_slot is not None or bool(seen_write_ids) or bool(seen_presets)
+        ):
+            request_mismatch = True
+        elif req_cmd is not None and req_cmd not in ("write_preset", "write_presets"):
             request_mismatch = True
         elif req_preset is not None:
             if display_slot is not None and display_slot != req_preset[0]:
@@ -2118,7 +2228,12 @@ def _evaluate_preset_write(
             if display_slot is not None and display_slot != req_slot:
                 request_mismatch = True
     else:
-        if req_preset is not None:
+        if req_method is not None and req_method not in (
+            "machine_command",
+            "machine_preset_writes",
+        ):
+            request_mismatch = True
+        elif req_preset is not None:
             if (record_preset is not None and record_preset != req_preset) or (
                 display_slot is not None and display_slot != req_preset[0]
             ):
@@ -2241,9 +2356,19 @@ def _evaluate_preset_write(
     ):
         enclosing_valid = False
 
+    write_id = (
+        safe_identifier(record.get("write_id")) if isinstance(record, Mapping) else None
+    )
+    raw_state = record.get("state") if isinstance(record, Mapping) else None
+    state = raw_state if type(raw_state) is str and raw_state in NEXT_STEPS else None
     any_attempt_saved = any(bool(SAVED & set(items)) for items in all_attempt_lists)
+    # Historical saved attempts inside a batch-superseded write are not a new live save.
+    live_attempt_saved = any_attempt_saved and state != "superseded"
     any_saved = (
-        rec_outcome in SAVED or live_saved or record_saved_observed or any_attempt_saved
+        rec_outcome in SAVED
+        or live_saved
+        or record_saved_observed
+        or live_attempt_saved
     )
     any_layer_claims_retry = any(
         layer.get("retry_allowed") is True
@@ -2253,11 +2378,6 @@ def _evaluate_preset_write(
     has_record_fields = any(
         key in layer for layer in all_layers for key in _PRESET_RECORD_FIELDS
     )
-    write_id = (
-        safe_identifier(record.get("write_id")) if isinstance(record, Mapping) else None
-    )
-    raw_state = record.get("state") if isinstance(record, Mapping) else None
-    state = raw_state if type(raw_state) is str and raw_state in NEXT_STEPS else None
     resolved_outcome = (
         "saved_cleanup_failed"
         if rec_outcome == "saved_cleanup_failed"
@@ -2415,12 +2535,21 @@ def _evaluate_preset_write(
             eff_recovery
             or live_saved
             or record_saved_observed
-            or enclosing
+            or (not refused and bool(enclosing))
+            or (refused and batch_refused)
+            or (
+                refused
+                and req_cmd == "write_preset"
+                and req_preset is not None
+                and req_ack is None
+            )
             or rec_outcome is not None
             or retry_allowed is not False
             or remaining != 0
         ):
             return make_fallback()
+        if refused:
+            return make_valid_refusal()
         return make_valid(NEXT_STEPS["superseded"], False)
 
     if state == "saved":
@@ -3136,40 +3265,45 @@ def sanitize_remote_error(
         and safe_identifier(filtered["correlation_id"]) is None
     ):
         filtered.pop("correlation_id")
-    details = filtered.get("details")
-    if isinstance(details, Mapping):
-        has_embedded = any(key in details for key in _PRESET_GUIDANCE_KEYS)
-        if policy is None and has_embedded:
-            policy = _preset_write_error_policy(details, refused=False, context=context)
-        if policy is not None:
-            details_copy, changed = _sanitize_preset_write_mapping(
-                details, policy, strict=False, include_details=False
-            )
-            if changed:
-                filtered["details"] = details_copy
-    if policy is not None:
-        is_preset_diag = rebuilt["code"] in (
-            "XB_PRESET_WRITE_REFUSED",
-            "XB_PRESET_WRITE_INCOMPLETE",
-        )
-        if policy.conflict or policy.saved_cleanup_failed or is_preset_diag:
-            local_cause = (
-                rebuilt["cause"]
-                if is_preset_diag
-                else _untrusted_preset_write_cause(policy, refused=False)
-            )
-            if "message" in filtered:
-                filtered["message"] = local_cause
-            if not is_preset_diag:
-                rebuilt = dict(rebuilt, cause=local_cause)
-    if (
+    is_internal = (
         rebuilt["code"] == "XB_INTERNAL_ERROR"
         or filtered.get("code") == "internal_error"
-    ):
+    )
+    if is_internal:
         if "message" in filtered:
             filtered["message"] = rebuilt["cause"]
-    elif isinstance(filtered.get("message"), str):
-        filtered["message"] = _redact_text(filtered["message"])
+        filtered["details"] = {}
+    else:
+        details = filtered.get("details")
+        if isinstance(details, Mapping):
+            has_embedded = any(key in details for key in _PRESET_GUIDANCE_KEYS)
+            if policy is None and has_embedded:
+                policy = _preset_write_error_policy(
+                    details, refused=False, context=context
+                )
+            if policy is not None:
+                details_copy, changed = _sanitize_preset_write_mapping(
+                    details, policy, strict=False, include_details=False
+                )
+                if changed:
+                    filtered["details"] = details_copy
+        if policy is not None:
+            is_preset_diag = rebuilt["code"] in (
+                "XB_PRESET_WRITE_REFUSED",
+                "XB_PRESET_WRITE_INCOMPLETE",
+            )
+            if policy.conflict or policy.saved_cleanup_failed or is_preset_diag:
+                local_cause = (
+                    rebuilt["cause"]
+                    if is_preset_diag
+                    else _untrusted_preset_write_cause(policy, refused=False)
+                )
+                if "message" in filtered:
+                    filtered["message"] = local_cause
+                if not is_preset_diag:
+                    rebuilt = dict(rebuilt, cause=local_cause)
+        if isinstance(filtered.get("message"), str):
+            filtered["message"] = _redact_text(filtered["message"])
     filtered["diagnostic"] = rebuilt
     if "next_step" in filtered:
         filtered["next_step"] = rebuilt["fix"]
