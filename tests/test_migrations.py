@@ -13,6 +13,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
+import tests  # noqa: F401 - installs the test guards
 from xbloom_studio import migrations
 from xbloom_studio.storage import Store
 

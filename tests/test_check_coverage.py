@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import tests  # noqa: F401 - installs the test guards
 from scripts import check_coverage
 
 

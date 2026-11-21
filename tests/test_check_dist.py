@@ -14,6 +14,7 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
+import tests  # noqa: F401 - installs the test guards
 from scripts import check_dist
 
 VERSION = "1.2.3"

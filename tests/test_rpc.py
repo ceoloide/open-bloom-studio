@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from urllib.error import HTTPError, URLError
 
+import tests  # noqa: F401 - installs the test guards
 from xbloom_studio import rpc_wire
 from xbloom_studio._cleanup import wait_cleanup
 from xbloom_studio.client import ProtocolCommandError, SessionError

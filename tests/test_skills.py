@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+import tests  # noqa: F401 - installs the test guards
 from xbloom_studio import cli, mcp_server
 from xbloom_studio.mcp_server import READ_ONLY, create_server
 

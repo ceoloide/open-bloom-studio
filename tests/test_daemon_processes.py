@@ -41,6 +41,7 @@ class DaemonProcessTests(unittest.IsolatedAsyncioTestCase):
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
+            "tests.child",
             "xbloom_studio",
             *args,
             stdout=asyncio.subprocess.PIPE,
