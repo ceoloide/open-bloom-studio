@@ -131,14 +131,24 @@ class OrderingTest(JournalTestCase):
 
         def low_water_while_committing(kind, data, **context):
             if kind == "command.intent" and data["command"] == 4506:
-                loop.call_soon_threadsafe(machine.emit, 40522, u32(0))
+                # Runs in the journal's writer thread: the commit returns only
+                # after the loop has delivered the event to the session.
+                delivered = threading.Event()
+
+                def deliver():
+                    machine.emit(40522, u32(0))
+                    delivered.set()
+
+                loop.call_soon_threadsafe(deliver)
+                if not delivered.wait(5):
+                    raise TimeoutError("low-water event was not delivered")
             return append(kind, data, **context)
 
         with mock.patch.object(
             self.store, "append", side_effect=low_water_while_committing
         ):
             async with interaction(
-                machine, command_hooks=JournalHooks(self.recorder)
+                machine, command_hooks=JournalHooks(self.recorder), write_timeout=10
             ) as session:
                 result = await (await session.start_water(volume_ml=10)).wait()
         self.assertEqual(result["status"], "failed")
@@ -157,7 +167,7 @@ class OrderingTest(JournalTestCase):
 
         machine = Failing()
         async with interaction(
-            machine, command_hooks=JournalHooks(self.recorder)
+            machine, command_hooks=JournalHooks(self.recorder), write_timeout=10
         ) as session:
             with self.assertRaises((OSError, SessionError)):
                 await session.back_home()

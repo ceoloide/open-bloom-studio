@@ -62,7 +62,7 @@ def interaction(machine=None, **kwargs):
 async def until(predicate, timeout=1.0):
     async def wait():
         while not predicate():
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.001)
 
     await asyncio.wait_for(wait(), timeout)
 

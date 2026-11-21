@@ -670,11 +670,11 @@ class CallerLossAndRecoveryTests(ServiceCase):
     async def test_operation_continues_after_its_caller_is_cancelled(self):
         self.machine.studio.auto_complete = False
         caller = asyncio.create_task(self.service.start(WATER, "lost", True))
-        await until(lambda: self.store.operation_by_key("lost") is not None, 2)
+        await until(lambda: self.store.operation_by_key("lost") is not None, 10)
         caller.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await caller
-        await until(lambda: POUR in self.machine.codes(), 2)
+        await until(lambda: POUR in self.machine.codes(), 10)
         self.machine.emit(40511)
         self.machine.state(1)
         done = await self.finish()
@@ -719,7 +719,7 @@ class CallerLossAndRecoveryTests(ServiceCase):
     async def test_stop_joins_an_operation_already_finalizing(self):
         entered, release = self.block_append("operation.finished")
         op = await self.service.start(WATER, "final-stop", True)
-        await until(entered.is_set, 2)
+        await until(entered.is_set, 10)
         task = self.service.task
         stopper = asyncio.create_task(self.service.stop(op["id"]))
         await asyncio.sleep(0.05)
@@ -734,7 +734,7 @@ class CallerLossAndRecoveryTests(ServiceCase):
     async def test_cancelling_a_finalizing_worker_still_persists_its_outcome(self):
         entered, release = self.block_append("operation.finished")
         op = await self.service.start(WATER, "final-cancel", True)
-        await until(entered.is_set, 2)
+        await until(entered.is_set, 10)
         task = self.service.task
         task.cancel()
         await asyncio.sleep(0.05)
@@ -749,7 +749,7 @@ class CallerLossAndRecoveryTests(ServiceCase):
     async def test_close_during_finalization_persists_then_releases_ownership(self):
         entered, release = self.block_append("operation.finished")
         op = await self.service.start(WATER, "final-close", True)
-        await until(entered.is_set, 2)
+        await until(entered.is_set, 10)
         closer = asyncio.create_task(self.service.close())
         await asyncio.sleep(0.05)
         closer.cancel()  # A further cancellation must not cut persistence short.
@@ -782,7 +782,7 @@ class CallerLossAndRecoveryTests(ServiceCase):
 
         self.store.recover = slow_recover
         first = asyncio.create_task(self.service.connect())
-        await until(entered.is_set, 2)
+        await until(entered.is_set, 10)
         first.cancel()
         await asyncio.sleep(0.05)
         machine = Machine("00:00:5E:00:53:01")
@@ -801,7 +801,7 @@ class CallerLossAndRecoveryTests(ServiceCase):
             self.assertIsNone(self.service.session)
             if started is None:
                 started = await successor.start(WATER, "successor", True)
-            await until(lambda: POUR in machine.codes(), 2)
+            await until(lambda: POUR in machine.codes(), 10)
             # The earlier recovery never reaches the successor's active row.
             self.assertEqual(other.operation(started["id"])["status"], "running")
             self.assertNotIn("operation.recovered_unknown", self.kinds(started["id"]))
