@@ -682,10 +682,12 @@ class CallerLossAndRecoveryTests(ServiceCase):
 
         with patch.object(self.store, "create_operation", side_effect=held):
             caller = asyncio.create_task(self.service.start(WATER, "lost", True))
-            self.assertTrue(await asyncio.to_thread(committed.wait, 10))
-            self.assertIsNotNone(self.store.operation_by_key("lost"))
-            caller.cancel()
-            release.set()
+            try:
+                await until(committed.is_set, 10)
+                self.assertIsNotNone(self.store.operation_by_key("lost"))
+                caller.cancel()
+            finally:
+                release.set()
         with self.assertRaises(asyncio.CancelledError):
             await caller
         await until(lambda: POUR in self.machine.codes(), 10)
