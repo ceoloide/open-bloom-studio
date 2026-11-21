@@ -669,9 +669,23 @@ class UncertaintyTests(ServiceCase):
 class CallerLossAndRecoveryTests(ServiceCase):
     async def test_operation_continues_after_its_caller_is_cancelled(self):
         self.machine.studio.auto_complete = False
-        caller = asyncio.create_task(self.service.start(WATER, "lost", True))
-        await until(lambda: self.store.operation_by_key("lost") is not None, 10)
-        caller.cancel()
+        committed, release = threading.Event(), threading.Event()
+        create = self.store.create_operation
+
+        def held(*args, **kwargs):
+            # Hold the committed acceptance so the cancel cannot miss the caller.
+            result = create(*args, **kwargs)
+            committed.set()
+            if not release.wait(5):
+                raise TimeoutError("acceptance was not released")
+            return result
+
+        with patch.object(self.store, "create_operation", side_effect=held):
+            caller = asyncio.create_task(self.service.start(WATER, "lost", True))
+            self.assertTrue(await asyncio.to_thread(committed.wait, 10))
+            self.assertIsNotNone(self.store.operation_by_key("lost"))
+            caller.cancel()
+            release.set()
         with self.assertRaises(asyncio.CancelledError):
             await caller
         await until(lambda: POUR in self.machine.codes(), 10)
